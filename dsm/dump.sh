@@ -8,6 +8,10 @@ fi
 app=$1
 client=$2
 
+cd ~/${app}
+sudo ./${app} 2 &
+
+sleep 3
 
 #sudo kill -9 $(pidof sh /root/criu/dsm/dump.sh dsm_write dsm_client) ;
 #sudo kill -9 $(pidof cat /tmp/pipe_scp) ;

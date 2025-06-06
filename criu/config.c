@@ -619,6 +619,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 
 	static const char short_opts[] = "dSsRt:hD:o:v::x::Vr:jJ:lW:L:M:";
 	static struct option long_opts[] = {
+		{ "dsm_server", no_argument, 0, 2001 },
+    	{ "dsm_client", required_argument, 0, 2002 },
+
 		{ "tree", required_argument, 0, 't' },
 		{ "leave-stopped", no_argument, 0, 's' },
 		{ "leave-running", no_argument, 0, 'R' },
@@ -1051,6 +1054,14 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 'h':
 			*usage_error = false;
 			return 2;
+
+		case 2001:
+			opts.is_dsm_server = true;
+			break;
+		case 2002:
+			SET_CHAR_OPTS(dsm_server_ip, optarg);
+			break;
+
 		default:
 			return 2;
 		}

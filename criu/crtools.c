@@ -47,6 +47,10 @@
 #include "setproctitle.h"
 #include "sysctl.h"
 
+void start_dsm_server(void);  // Declare at top
+void start_dsm_client(const char *server_ip);
+
+
 void flush_early_log_to_stderr(void) __attribute__((destructor));
 
 void flush_early_log_to_stderr(void)
@@ -305,12 +309,25 @@ int main(int argc, char *argv[], char *envp[])
 		if (opts.tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
 
+		if (opts.is_dsm_server || opts.dsm_server_ip){
+			opts.final_state = TASK_STOPPED;
+			opts.pidfile = "/tmp/criu-restored.pid";
+		}
+
 		ret = cr_restore_tasks();
 		if (ret == 0 && opts.exec_cmd) {
 			close_pid_proc();
 			execvp(opts.exec_cmd[0], opts.exec_cmd);
 			pr_perror("Failed to exec command %s", opts.exec_cmd[0]);
 			ret = 1;
+		}
+
+		if (opts.is_dsm_server) {
+			pr_info("CRIU DSM server mode enabled\n");
+			start_dsm_server();  // Implement this
+		} else if (opts.dsm_server_ip) {
+			pr_info("Connecting to DSM server at %s\n", opts.dsm_server_ip);
+			start_dsm_client(opts.dsm_server_ip);  // Implement this
 		}
 
 		return ret != 0;

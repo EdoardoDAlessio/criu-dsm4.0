@@ -120,9 +120,13 @@ enum criu_mode {
 	CR_CPUINFO,
 	CR_EXEC_DEPRECATED,
 	CR_SHOW_DEPRECATED,
+	CR_DSM_SERVER,
+	CR_DSM_CLIENT,
 };
 
 struct cr_options {
+	bool is_dsm_server;
+	char* dsm_server_ip;
 	int final_state;
 	int check_extra_features;
 	int check_experimental_features;
