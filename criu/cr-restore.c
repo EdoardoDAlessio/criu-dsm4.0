@@ -2276,9 +2276,10 @@ skip_ns_bouncing:
 	if (ret != 0)
 		pr_err("Post-resume script ret code %d\n", ret);
 
-	if (!opts.restore_detach && !opts.exec_cmd) {
+	if (!opts.restore_detach && !opts.exec_cmd && (!opts.is_dsm_server && !opts.dsm_server_ip) ) {
 		reap_zombies();
 	}
+	
 
 	return 0;
 

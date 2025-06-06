@@ -308,7 +308,7 @@ int main(int argc, char *argv[], char *envp[])
 	if (opts.mode == CR_RESTORE) {
 		if (opts.tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
-
+		
 		if (opts.is_dsm_server || opts.dsm_server_ip){
 			opts.final_state = TASK_STOPPED;
 			opts.pidfile = "/tmp/criu-restored.pid";
