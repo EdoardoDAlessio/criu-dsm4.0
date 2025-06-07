@@ -47,8 +47,8 @@
 #include "setproctitle.h"
 #include "sysctl.h"
 
-void start_dsm_server(void);  // Declare at top
-void start_dsm_client(const char *server_ip);
+void start_dsm_server(struct pstree_item *item);  // Declare at top
+void start_dsm_client(const char *server_ip, struct pstree_item *item);
 
 
 void flush_early_log_to_stderr(void) __attribute__((destructor));
@@ -114,6 +114,8 @@ static int parse_criu_mode(char *mode)
 
 int main(int argc, char *argv[], char *envp[])
 {
+	struct pstree_item *dsm_item = NULL; //DSM 
+
 	int ret = -1;
 	bool usage_error = true;
 	bool has_exec_cmd = false;
@@ -314,7 +316,7 @@ int main(int argc, char *argv[], char *envp[])
 			opts.pidfile = "/tmp/criu-restored.pid";
 		}
 
-		ret = cr_restore_tasks();
+		ret = cr_restore_tasks( &dsm_item );
 		if (ret == 0 && opts.exec_cmd) {
 			close_pid_proc();
 			execvp(opts.exec_cmd[0], opts.exec_cmd);
@@ -324,10 +326,10 @@ int main(int argc, char *argv[], char *envp[])
 
 		if (opts.is_dsm_server) {
 			pr_info("CRIU DSM server mode enabled\n");
-			start_dsm_server();  // Implement this
+			start_dsm_server( dsm_item );  // Implement this
 		} else if (opts.dsm_server_ip) {
 			pr_info("Connecting to DSM server at %s\n", opts.dsm_server_ip);
-			start_dsm_client(opts.dsm_server_ip);  // Implement this
+			start_dsm_client(opts.dsm_server_ip, dsm_item);  // Implement this
 		}
 
 		return ret != 0;

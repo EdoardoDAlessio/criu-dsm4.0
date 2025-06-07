@@ -10,7 +10,6 @@ client=$2
 
 cd ~/${app}
 sudo ./${app} 2 &
-
 sleep 3
 
 #sudo kill -9 $(pidof sh /root/criu/dsm/dump.sh dsm_write dsm_client) ;
@@ -21,5 +20,5 @@ sleep 3
 
 sudo ~/criu/criu/criu  dump -t `pidof $app` --images-dir  ~/${app}/images --shell-job -v #vv -o dump_log.txt
 
-scp -r ~/${app}/images dsm_client:~/${app}/
+scp -r ~/${app} dsm_client:~/
  

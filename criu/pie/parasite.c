@@ -68,6 +68,64 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 	return ret;
 }
 
+static int runMadvise(void *args) {
+    long addr = *(long *)args;
+    long ret;
+
+    pr_warn("madvise at 0x%lx\n", addr);
+
+    /* Issue the syscall and capture its return value. */
+    ret = sys_madvise(addr, 4096, MADV_DONTNEED);
+    if (ret < 0) {
+        /* Print the errno (as a positive number) and a short description. */
+        pr_err("madvise failed at 0x%lx: %ld\n",
+               addr, -ret);
+    } else {
+        pr_info("madvise succeeded at 0x%lx\n", addr);
+    }
+
+    return 0;
+}
+
+static int createAndSendUFFD(void) {
+        int uffd, ret,tsock;
+        if((uffd = sys_userfaultfd( O_CLOEXEC | O_NONBLOCK)) == -1) {
+                pr_err("could not create userfaultfd descriptor %d\n",uffd);
+                return -1;
+        }
+        pr_warn("initialized uffd %d\n", uffd);
+
+	tsock = parasite_get_rpc_sock();
+	ret = send_fd(tsock, NULL, 0, uffd);
+        //ret = fds_send_fd(uffd);
+        if(ret == 0) {
+                pr_warn("sent uffd\n");
+        }
+        else
+                pr_warn("could not send uffd\n");
+        sys_close(uffd);
+        return ret;
+}
+
+static int dump_single_page(void *args){
+
+	int p, ret, tsock;
+	int nr_segs =1;
+	struct iovec miov;
+	tsock = parasite_get_rpc_sock();
+
+	p = recv_fd(tsock);
+
+
+	miov.iov_base =(void *)(long *)args;
+	miov.iov_len = 4096;
+	pr_err("vmsplice at = %p\n",miov.iov_base);
+	ret = sys_vmsplice(p, &miov, nr_segs,	 SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
+	pr_err("vmsplice ret = %d\n",ret);
+	return 0;
+
+}
+
 static int dump_pages(struct parasite_dump_pages_args *args)
 {
 	int p, ret, tsock;
@@ -854,6 +912,18 @@ int parasite_daemon_cmd(int cmd, void *args)
 	int ret;
 
 	switch (cmd) {
+	case PARASITE_CMD_DUMP_SINGLE:
+		pr_warn("---dump_single\n");
+		ret = dump_single_page(args);
+		break;
+	case PARASITE_CMD_STEAL_UFFD:
+		pr_warn("---steal_uffd\n");
+		ret = createAndSendUFFD();
+		break;
+	case PARASITE_CMD_RUN_MADVISE:
+		pr_warn("---run madvise\n");
+		ret = runMadvise(args);
+		break;
 	case PARASITE_CMD_DUMPPAGES:
 		ret = dump_pages(args);
 		break;

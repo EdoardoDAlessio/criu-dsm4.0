@@ -2347,7 +2347,7 @@ int prepare_dummy_task_state(struct pstree_item *pi)
 	return 0;
 }
 
-int cr_restore_tasks(void)
+int cr_restore_tasks(struct pstree_item **dsm_pstree_item) //DSM server and client need pstree_item
 {
 	int ret = -1;
 
@@ -2411,6 +2411,8 @@ clean_cgroup:
 	fini_cgroup();
 err:
 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+
+	if (dsm_pstree_item) *dsm_pstree_item = root_item; //DSM 
 	return ret;
 }
 

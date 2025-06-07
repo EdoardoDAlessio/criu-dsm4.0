@@ -858,7 +858,7 @@ static int restore_using_req(int sk, CriuOpts *req)
 
 	__setproctitle("restore --rpc -D %s", images_dir);
 
-	if (cr_restore_tasks())
+	if (cr_restore_tasks(NULL)) //dsm null workaround
 		goto exit;
 
 	success = true;
