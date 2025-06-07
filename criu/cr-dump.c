@@ -1548,6 +1548,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
 
+	FILE *f; //DSM file for saving vmas
+
 	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
@@ -1768,6 +1770,17 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 err:
 	close_cr_imgset(&cr_imgset);
 	close_pid_proc();
+
+	pr_info("CRIU DSM: save vma mappaings into /tmp/vma_list.bin\n");
+	f = fopen("/tmp/vma_list.bin", "wb");
+	if (f) {
+		fwrite(&vmas, sizeof(struct vm_area_list), 1, f);
+		fclose(f);
+	} else {
+		perror("fopen vma_list.bin");
+	}
+
+
 	free_mappings(&vmas);
 	xfree(dfds);
 	return exit_code;

@@ -83,9 +83,10 @@ $(obj)/Makefile.packages: ;
 $(obj)/%: pie
 	$(Q) $(MAKE) $(call build-as,Makefile.crtools,criu) $@
 
+#DSM: added -lpthread
 $(obj)/criu: $(PROGRAM-BUILTINS)
 	$(call msg-link, $@)
-	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@ -lpthread 
 
 UNIT-BUILTINS		+= $(obj)/util.o
 UNIT-BUILTINS		+= $(obj)/config.o
