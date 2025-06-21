@@ -442,7 +442,7 @@ static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_in
 	struct sockaddr_un addr;
 
 	pr_info("Putting tsock into pid %d\n", pid);
-	args->h_addr_len = gen_parasite_saddr(&args->h_addr, getpid());
+	args->h_addr_len = gen_parasite_saddr(&args->h_addr, getpid() + rand());
 
 	ssock = ctl->ictx.sock;
 	sk_len = sizeof(addr);
@@ -459,9 +459,12 @@ static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_in
 
 	if (sk_len == sizeof(addr.sun_family)) {
 		if (bind(ssock, (struct sockaddr *)&args->h_addr, args->h_addr_len) < 0) {
+			printf("Socket:%d\n", ssock);
 			pr_perror("Can't bind socket");
 			goto err;
 		}
+		printf("Socket:%d\n", ssock);
+
 
 		if (listen(ssock, 1)) {
 			pr_perror("Can't listen on transport socket");
@@ -471,7 +474,7 @@ static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_in
 
 	/* Check a case when parasite can't initialize a command socket */
 	if (ctl->ictx.flags & INFECT_FAIL_CONNECT)
-		args->h_addr_len = gen_parasite_saddr(&args->h_addr, getpid() + 1);
+		args->h_addr_len = gen_parasite_saddr(&args->h_addr, getpid());
 
 	/*
 	 * Set to -1 to prevent any accidental misuse. The
