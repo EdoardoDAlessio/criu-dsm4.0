@@ -8,6 +8,10 @@
 
 #include "images/inventory.pb-c.h"
 
+//DSM
+#include "vma.h"    // defines struct vm_area_list
+
+
 #define CR_FD_PERM (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 
 extern int check_img_inventory(bool restore);
@@ -23,8 +27,7 @@ extern void add_post_prepare_cb(struct pprep_head *);
 extern bool deprecated_ok(char *what);
 extern int cr_dump_tasks(pid_t pid);
 extern int cr_pre_dump_tasks(pid_t pid);
-//extern int cr_restore_tasks(void);
-extern int cr_restore_tasks(struct pstree_item **dsm_pstree_item);
+extern int cr_restore_tasks(void);
 extern int convert_to_elf(char *elf_path, int fd_core);
 extern int cr_check(void);
 extern int check_caps(void);
