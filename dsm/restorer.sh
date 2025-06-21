@@ -1,6 +1,6 @@
 node_id=$1
 
-cd ~/dsm_write/images
+cd ~/demo/images
 
 python3 ~/criu/dsm/thread_filter.py $node_id ;
 rm -f /tmp/criu-restored.pid
