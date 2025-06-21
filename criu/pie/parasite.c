@@ -68,6 +68,15 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 	return ret;
 }
 
+
+int parasite_cmd_invalidate_page(void *args) {
+	unsigned long addr = *(unsigned long *)args;
+	int ret = sys_mprotect((void *)addr, 4096, PROT_NONE);
+	pr_info("Invalidate page: mprotect(%p) -> %d\n", (void *)addr, ret);
+	return ret;
+}
+
+
 static int runMadvise(void *args) {
     long addr = *(long *)args;
     long ret;
@@ -78,8 +87,7 @@ static int runMadvise(void *args) {
     ret = sys_madvise(addr, 4096, MADV_DONTNEED);
     if (ret < 0) {
         /* Print the errno (as a positive number) and a short description. */
-        pr_err("madvise failed at 0x%lx: %ld\n",
-               addr, -ret);
+        pr_err("madvise failed at 0x%lx: %ld\n", addr, -ret);
     } else {
         pr_info("madvise succeeded at 0x%lx\n", addr);
     }
@@ -87,24 +95,38 @@ static int runMadvise(void *args) {
     return 0;
 }
 
+static int g_uffd = -1;
+static int sock = 0;
 static int createAndSendUFFD(void) {
-        int uffd, ret,tsock;
-        if((uffd = sys_userfaultfd( O_CLOEXEC | O_NONBLOCK)) == -1) {
-                pr_err("could not create userfaultfd descriptor %d\n",uffd);
-                return -1;
-        }
-        pr_warn("initialized uffd %d\n", uffd);
+	int ret;
+	long bin;
+	(void) bin;
 
-	tsock = parasite_get_rpc_sock();
-	ret = send_fd(tsock, NULL, 0, uffd);
-        //ret = fds_send_fd(uffd);
-        if(ret == 0) {
-                pr_warn("sent uffd\n");
-        }
-        else
-                pr_warn("could not send uffd\n");
-        sys_close(uffd);
-        return ret;
+	if (g_uffd == -1) {
+		g_uffd = sys_userfaultfd(O_CLOEXEC | O_NONBLOCK);
+		if( g_uffd == -1) {
+			pr_err("could not create userfaultfd descriptor %d\n",g_uffd);
+			return -1;
+		}
+
+	}	
+	pr_warn("Initialized uffd %d\n", g_uffd);
+	if( !sock ) sock = parasite_get_rpc_sock();
+	ret = send_fd(sock, NULL, 0, g_uffd);
+
+	if(ret == 0)
+		pr_warn("sent uffd\n");
+	else
+		pr_warn("could not send uffd\n");
+
+	//bin = sys_close(sock);
+
+    /*if (bin == 0)
+        pr_info("✅ Successfully closed fd %d\n", sock);
+    else
+        pr_err("❌ Failed to close fd %d\n", sock);*/
+
+	return ret;
 }
 
 static int dump_single_page(void *args){
@@ -116,9 +138,10 @@ static int dump_single_page(void *args){
 
 	p = recv_fd(tsock);
 
-
-	miov.iov_base =(void *)(long *)args;
+	miov.iov_base = *(void **)args;
 	miov.iov_len = 4096;
+	pr_err("args = %p, deref = %p\n", args, *(void **)args);
+
 	pr_err("vmsplice at = %p\n",miov.iov_base);
 	ret = sys_vmsplice(p, &miov, nr_segs,	 SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
 	pr_err("vmsplice ret = %d\n",ret);
@@ -910,8 +933,15 @@ void parasite_cleanup(void)
 int parasite_daemon_cmd(int cmd, void *args)
 {
 	int ret;
-
 	switch (cmd) {
+	case PARASITE_CMD_INVALIDATE_PAGE:
+		pr_info("Parasite: invalidate page for have pagefaults on pages \n");
+		ret = parasite_cmd_invalidate_page(args); 
+		break;
+	case PARASITE_CMD_TEST_PRINT:
+		pr_info("DSM parasite received test print command\n");
+		ret = 0;
+		break;
 	case PARASITE_CMD_DUMP_SINGLE:
 		pr_warn("---dump_single\n");
 		ret = dump_single_page(args);
