@@ -14,9 +14,10 @@
 #include "pstree.h"
 
 #define DGB 0
-#define COMMAND_LOOP 0
+#define COMMAND_LOOP 1
+#define COMMAND_THREAD 1 & COMMAND_LOOP
 #define ENABLE_SERVER 1
-#define BACKLOG 1
+#define VMA_REC 1
 #define SIGMAX 64
 
 #define err_and_ret(msg) do { fprintf(stderr, msg);  return -1; } while (0)
@@ -39,11 +40,9 @@
 //#undef uffdio_range
 #include "user.h"
 
-#include "parsemap.h"
+//#include "parsemap.h"
 #define HANDSHAKE_MSG "READY"
 
-#define PORT_HANDLER 7777
-#define PORT_COMMAND 7778
 
 //INFECTION
 #include "pie/parasite-blob.h"
@@ -51,7 +50,6 @@
 #include "parasite.h"
 extern pid_t dsm_pid;
 extern struct parasite_ctl *dsm_ctl;
-int dsm_ready = 0;
 extern volatile bool g_vma_list_ready;
 struct vm_area_list* my_vm_area_list;
 
@@ -59,45 +57,19 @@ struct vm_area_list* my_vm_area_list;
 #include "page.h" //this takes the page size
 
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
-#define GLOBAL_PAGE 0x7fffffffe000  // page-aligned address of `global`
+
 
 // Setup global variable address 
-unsigned long global_addr = 0x7fffffffe5dc;
-unsigned long aligned = 0x7fffffffe5dc & ~(PAGE_SIZE - 1);
+extern unsigned long global_addr;
+extern unsigned long aligned;
 
 int restored_pid;
 int uffd;
-struct msg_info{
-	int msg_type;
-	long page_addr;
-	int page_size;
-	long msg_id;
-};
 
-
-enum msg_type{
-	MSG_GET_PAGE_LIST,
-	MSG_GET_PAGE_DATA,
-	MSG_INVALIDATE_PAGE,
-	MSG_INVALIDATE_ACK,
-	MSG_GET_PAGE_DATA_INVALID,
-	MSG_SEND_INVALIDATE,
-	MSG_WAKE_THREAD,
-	MSG_STOP_THREAD,
-	MSG_HANDSHAKE,
-	MSG_ACK,
-};
-
-
-struct thread_param {
-    int uffd;
-    int server_pipe;      // read end for handler
-    int uffd_pipe;  // write end for handler
-	int fd_handler;
-};
+#include "dsm.h"
 
 /*********************************** VMA RECONSTRUCTION ********************* */
-#define VMA_REC 0
+
 #include "vma.h"
 #include "mem.h"       // Required for xmalloc()
 #include "cr_options.h"
@@ -201,544 +173,6 @@ void read_proc_maps(void) {
 
 /***********************************END VMA RECONSTRUCTION ********************* */
 
-
-/******************************** USERFAULT ****************************/
-int init_userfaultfd_api(int uffd) {
-	struct uffdio_api uffdio_api;
-	uffdio_api.api = UFFD_API;
-	uffdio_api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
-
-	if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1) {
-		perror("ioctl/UFFDIO_API");
-		return -1;
-	}
-
-	if (uffdio_api.api != UFFD_API) {
-		fprintf(stderr, "Unsupported userfaultfd API version (got %llu, expected %llu)\n",
-		        uffdio_api.api, UFFD_API);
-		return -1;
-	}
-
-	if (!(uffdio_api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
-		fprintf(stderr, "UFFDIO_WRITEPROTECT feature not supported by kernel\n");
-		return -1;
-	}
-
-	printf("✅ userfaultfd API initialized with WP support\n");
-	return 0;
-}	
-
-void register_page(void *addr) {
-	struct uffdio_register reg = {
-		.range.start = (unsigned long)addr,
-		.range.len = PAGE_SIZE,
-		.mode =  UFFDIO_REGISTER_MODE_WP | UFFDIO_REGISTER_MODE_MISSING
-	};
-
-	unsigned char test;
-	test = *((unsigned char *)addr);
-	printf("Read test byte: %02x\n", test);
-
-
-	printf("Registering addr = %p (aligned = %ld)\n", addr, (unsigned long)addr % PAGE_SIZE);
-	printf("UFFD REGISTER: %d\n", uffd);
-
-	if (ioctl(uffd, UFFDIO_REGISTER, &reg) == -1) {
-		perror("UFFDIO_REGISTER");
-		exit(1);
-	}
-}
-
-void enable_wp(void *addr)
-{
-	struct uffdio_writeprotect wp = {
-		.range.start = (unsigned long)addr,
-		.range.len = PAGE_SIZE,
-		.mode = UFFDIO_WRITEPROTECT_MODE_WP
-	};
-
-	printf("UFFD enable: %d\n", uffd);
-
-	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1)
-		perror("UFFDIO_WRITEPROTECT (enable)");
-	else
-		printf("Successfully protected global page at %p\n", addr);
-}	
-
-void disable_wp(void *addr)
-{
-	struct uffdio_writeprotect wp = {
-		.range.start = (unsigned long)addr,
-		.range.len = PAGE_SIZE,
-		.mode = 0  // no WP flag
-	};
-
-	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1)
-		perror("UFFDIO_WRITEPROTECT (disable)");
-	else
-		printf("Successfully disabled write protection on page at %p\n", addr);
-}
-
-/******************************** END USERFAULT ****************************/
-
-
-/********************************INFECTION CODE*******************************/
-static struct parasite_ctl *g_ctl = NULL;
-int g_state;
-int start_infection(pid_t pid) {
-	int state = compel_stop_task(pid);
-	struct infect_ctx *ictx;
-	if (!(g_ctl = compel_prepare(pid))) return -1;
-
-	parasite_setup_c_header(g_ctl);
-	ictx = compel_infect_ctx(g_ctl);
-	ictx->log_fd = STDERR_FILENO;
-
-	if (compel_infect(g_ctl, 1, sizeof(long)) < 0) {
-		xfree(g_ctl);
-		return -1;
-	}
-
-	return state;
-}
-
-void stop_infection(pid_t pid, int state) {
-	if (compel_stop_daemon(g_ctl)) pr_err("Can't stop daemon\n");
-	if (compel_cure(g_ctl)) pr_err("Can't cure\n");
-	if (compel_resume_task(pid, state, state)) pr_err("Can't resume\n");
-	xfree(g_ctl);
-	g_ctl = NULL;
-}
-
-
-#if 1
-
-int infection_test(void)
-{
-	struct parasite_ctl *ctl = NULL;
-	struct infect_ctx *ictx;
-	int state;
-
-	printf("\n=== [TEST] Single Infection Test ===\n");
-
-	// Stop the target task
-	state = compel_stop_task(restored_pid);
-	printf("Stopped task, state=%d\n", state);
-
-	// Prepare parasite control context
-	ctl = compel_prepare(restored_pid);
-	if (!ctl) {
-		fprintf(stderr, "❌ compel_prepare failed\n");
-		return -1;
-	}
-
-	// Set up the RPC interface
-	parasite_setup_c_header(ctl);
-	ictx = compel_infect_ctx(ctl);
-	ictx->log_fd = STDERR_FILENO;
-
-	// Inject the parasite
-	if (compel_infect(ctl, 1, 0) < 0) {
-		fprintf(stderr, "❌ compel_infect failed\n");
-		goto fail;
-	}
-
-	// Run a test RPC command
-	if (compel_rpc_call_sync(PARASITE_CMD_TEST_PRINT, ctl) < 0) {
-		fprintf(stderr, "❌ RPC TEST_PRINT failed\n");
-		goto fail;
-	}
-
-	printf("✅ Infection and RPC successful\n");
-
-	// Clean up parasite and resume target
-	if (compel_stop_daemon(ctl))
-		fprintf(stderr, "⚠️ Failed to stop daemon\n");
-
-	if (compel_cure(ctl))
-		fprintf(stderr, "⚠️ Failed to cure\n");
-
-	if (compel_resume_task(restored_pid, state, state))
-		fprintf(stderr, "⚠️ Failed to resume task\n");
-
-	//xfree(ctl);
-	return 0;
-
-fail:
-	if (ctl) {
-		if (compel_stop_daemon(ctl)) fprintf(stderr, "⚠️ Failed to stop daemon\n");
-		if (compel_cure(ctl)) fprintf(stderr, "⚠️ Failed to cure\n");
-		//xfree(ctl);
-	}
-	compel_resume_task(restored_pid, state, state);
-	return -1;
-}
-
-int stealUFFD(void)
-{
-	int state, uffd = -1;
-	struct parasite_ctl *ctl;
-	struct infect_ctx *ictx;
-	(void) state;
-
-	state = compel_stop_task(restored_pid);
-	if (!(ctl = compel_prepare(restored_pid))){
-		printf("Can't prepare for infection\n");
-		return -1;
-	} 
-	/*
-	 * First -- the infection context. Most of the stuff
-	 * is already filled by compel_prepare(), just set the
-	 * log descriptor for parasite side, library cannot
-	 * live w/o it.
-	 */
-	ictx = compel_infect_ctx(ctl);
-	ictx->log_fd = STDERR_FILENO;
-	parasite_setup_c_header(ctl);
-
-	if (compel_infect(ctl, 1, sizeof(int)) < 0) {
-		printf("Failed infection steal UFFD\n");
-		xfree(ctl);
-		return -1;
-	}	
-	if (compel_rpc_call(PARASITE_CMD_STEAL_UFFD, ctl) < 0) {
-		pr_err("❌ RPC call to steal UFFD failed\n");
-		goto fail;
-	}
-	if (compel_util_recv_fd(ctl, &uffd) < 0) {
-		pr_err("❌ Failed to receive UFFD from parasite\n");
-		goto fail;
-	}
-	if (compel_rpc_sync(PARASITE_CMD_STEAL_UFFD, ctl) < 0) {
-		pr_err("❌ Failed to sync\n");
-		goto fail;
-	}
-	pr_info("✅ UFFD = %d\n", uffd);
-
-	if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
-	else printf("Daemon stopped (stealUFFD)\n");
-	if (compel_cure(ctl)) pr_err("Can't cure\n");
-	else printf("Cured! (stealUFFD)\n");
-	if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
-	else printf("Resumed post stealUFFD\n");
-
-	return uffd;
-fail:
-	state = compel_stop_daemon(ctl);
-	state = compel_cure(ctl);
-	state = compel_resume_task(restored_pid, state, state);
-	return -1;
-}
-
-int read_invalidate(void *addr)
-{
-	int state, uffd = -1;
-	struct parasite_ctl *ctl;
-	struct infect_ctx *ictx;
-	long *args;
-	(void) state;
-	(void) args;
-
-	state = compel_stop_task(restored_pid);
-	if (!(ctl = compel_prepare(restored_pid))) return -1;
-
-	parasite_setup_c_header(ctl);
-	ictx = compel_infect_ctx(ctl);
-	ictx->log_fd = STDERR_FILENO;
-
-	if (compel_infect(ctl, 1, sizeof(int)) < 0) {
-		xfree(ctl);
-		return -1;
-	}
-
-	//test
-	if (compel_rpc_call_sync(PARASITE_CMD_TEST_PRINT, ctl) < 0)	pr_err("RPC test failed\n");
-	
-	
-	//Prepare the addr to pass
-	args = compel_parasite_args(ctl, long);
-	*args = (long)addr;
-
-	if (compel_rpc_call(PARASITE_CMD_INVALIDATE_PAGE, ctl) < 0) {
-		pr_err("❌ RPC call to READ INVALIDATE failed\n");
-		goto fail;
-	}
-
-	if (compel_rpc_sync(PARASITE_CMD_INVALIDATE_PAGE, ctl) < 0) {
-		pr_err("❌ Failed to sync on read invalidate\n");
-		goto fail;
-	}
-
-	//ioctl_test
-	//if (compel_rpc_call_sync(PARASITE_CMD_REGISTER_GLOBAL, ctl) < 0)	pr_err("parasite register global failed\n");
-
-
-	if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
-	else printf("Daemon stopped (stealUFFD)\n");
-
-	if (compel_cure(ctl)) pr_err("Can't cure\n");
-	else printf("Cured! (stealUFFD)\n");
-
-
-	if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
-	else printf("Resumed post stealUFFD\n");
-
-	xfree(ctl); //freeing to be able to reinfect!
-	printf("ctl freed post stealUFFD\n");
-
-	return uffd;
-fail:
-	state = compel_stop_daemon(ctl);
-	state = compel_cure(ctl);
-	state = compel_resume_task(restored_pid, state, state);
-	xfree(ctl);
-	return -1;
-}
-
-int runMADVISE(void *addr){
-	int state;
-	struct parasite_ctl *ctl;
-	struct infect_ctx *ictx;
-	long *args;
-	(void) state;
-	(void) args;
-
-	printf("[DSM] Sending remote madvise(MADV_DONTNEED) request...\n");
-
-	state = compel_stop_task(restored_pid);
-	if (!(ctl = compel_prepare(restored_pid))){
-		pr_err("❌ Compel prepare failed\n");
-		return -1;
-	} 
-
-	parasite_setup_c_header(ctl);
-	ictx = compel_infect_ctx(ctl);
-	ictx->log_fd = STDERR_FILENO;
-
-	if (compel_infect(ctl, 1, sizeof(long)) < 0) {
-		xfree(ctl);
-		return -1;
-	}
-
-	//Prepare the addr to pass
-	args = compel_parasite_args(ctl, long);
-	*args = (long)addr;
-
-	
-	if (compel_rpc_call(PARASITE_CMD_RUN_MADVISE, ctl) < 0) {
-		pr_err("❌ RPC call to run MADVISE failed\n");
-		goto fail;
-	}
-	
-	if (compel_rpc_sync(PARASITE_CMD_RUN_MADVISE, ctl) < 0) {
-		pr_err("❌ Failed to sync back from MADVISE\n");
-		goto fail;
-	}
-	
-	if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
-	if (compel_cure(ctl)) pr_err("Can't cure\n");
-	if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
-	
-
-	return 0;
-fail:
-	state = compel_stop_daemon(ctl);
-	state = compel_cure(ctl);
-	state = compel_resume_task(restored_pid, state, state);
-	
-	return -1;
-}
-#if 1
-int handle_page_data_request(int sk, struct msg_info *dsm_msg) {
-    int state, value, p[2];
-    long *args;
-    unsigned char page_content[4096];
-    size_t offset;
-    struct parasite_ctl *ctl;
-    struct infect_ctx *ictx;
-
-    printf("[DSM] Sending get page to rpc daemon (DUMP_SINGLE) request...\n");
-
-    state = compel_stop_task(restored_pid);
-    if (!(ctl = compel_prepare(restored_pid))) {
-        pr_err("❌ Compel prepare failed\n");
-        return -1;
-    }
-
-    parasite_setup_c_header(ctl);
-    ictx = compel_infect_ctx(ctl);
-    ictx->log_fd = STDERR_FILENO;
-
-    if (compel_infect(ctl, 1, sizeof(long)) < 0) {
-        xfree(ctl);
-        return -1;
-    }
-
-    args = compel_parasite_args(ctl, long);
-    *args = dsm_msg->page_addr;
-
-    if (pipe(p) < 0) {
-        perror("pipe");
-        return -1;
-    }
-
-    if (compel_rpc_call(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        fprintf(stderr, "RPC DUMP_SINGLE call failed\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (compel_util_send_fd(ctl, p[1]) != 0) {
-        fprintf(stderr, "Failed to send pipe fd\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (compel_rpc_sync(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        fprintf(stderr, "RPC DUMP_SINGLE sync failed\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (read(p[0], page_content, 4096) != 4096) {
-        perror("read from parasite pipe");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    // Send page to requesting client
-    send(sk, page_content, 4096, 0);
-    printf("✅ Page_transfer_complete to client\n");
-
-    // Show value at global_addr for debugging
-    offset = global_addr - GLOBAL_PAGE;
-    if (offset >= 4096 - sizeof(int)) {
-        fprintf(stderr, "Offset out of bounds\n");
-    } else {
-        memcpy(&value, &page_content[offset], sizeof(int));
-        printf("[DSM] Value at GLOBAL_ADDR (0x%lx): %d (0x%x)\n", global_addr, value, value);
-    }
-
-    // Handle invalidation or write protection
-    if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
-        printf("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
-        if (compel_rpc_call_sync(PARASITE_CMD_RUN_MADVISE, ctl) < 0) {
-            fprintf(stderr, "❌ MADV_DONTNEED failed\n");
-        }
-    } else {
-        printf("Message is GET_PAGE → Enable WP to SHARED\n");
-        enable_wp((void *)dsm_msg->page_addr);
-    }
-
-    if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
-    if (compel_cure(ctl)) pr_err("Can't cure\n");
-    if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
-
-    close(p[0]);
-    close(p[1]);
-
-    return 0;
-}
-#endif
-int test_page_content(struct msg_info *dsm_msg) {
-    int state, value, p[2];
-    long *args;
-    unsigned char page_content[4096];
-	size_t offset;
-    struct parasite_ctl *ctl;
-    struct infect_ctx *ictx;
-
-    printf("[DSM] Sending get page to rpc daemon (DUMP_SINGLE) request...\n");
-
-    state = compel_stop_task(restored_pid);
-    if (!(ctl = compel_prepare(restored_pid))) {
-        pr_err("❌ Compel prepare failed\n");
-        return -1;
-    }
-
-    parasite_setup_c_header(ctl);
-    ictx = compel_infect_ctx(ctl);
-    ictx->log_fd = STDERR_FILENO;
-
-    if (compel_infect(ctl, 1, sizeof(long)) < 0) {
-        xfree(ctl);
-        return -1;
-    }
-
-    // Set the page address for the parasite
-    args = compel_parasite_args(ctl, long);
-    *args = dsm_msg->page_addr;
-
-    if (pipe(p) < 0) {
-        perror("pipe");
-        return -1;
-    }
-
-	 if (compel_rpc_call(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        fprintf(stderr, "RPC DUMP_SINGLE call failed\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (compel_util_send_fd(ctl, p[1]) != 0) {
-        fprintf(stderr, "Failed to send pipe fd\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (compel_rpc_sync(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        fprintf(stderr, "RPC DUMP_SINGLE sync failed\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (read(p[0], page_content, 4096) != 4096) {
-        perror("read from parasite pipe");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    // ✅ Extract and print the value at GLOBAL_ADDR
-    offset = global_addr - GLOBAL_PAGE;
-	if (offset >= 4096 - sizeof(int)) {
-		fprintf(stderr, "Offset out of bounds\n");
-	} else {
-		memcpy(&value, &page_content[offset], sizeof(int));
-		printf("[DSM] Value at GLOBAL_ADDR (0x%lx): %d (0x%x)\n", global_addr, value, value);
-	}
-
-   
-    // Handle invalidation or WP
-    if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
-        printf("Message is GET_PAGE_INVALIDATE -> Drop the page to INVALIDATE\n");
-        if (compel_rpc_call_sync(PARASITE_CMD_TEST_PRINT, ctl) < 0) {
-            fprintf(stderr, "❌ MADV_DONTNEED failed\n");
-        }
-    } else {
-		printf("Message is GET_PAGE -> Enable wp to SHARED \n");
-		enable_wp((void *)dsm_msg->page_addr);
-    }
-
-    if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
-    if (compel_cure(ctl)) pr_err("Can't cure\n");
-    if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
-
-    close(p[0]);
-    close(p[1]);
-
-    return 0;
-}
-#endif
-/********************************END INFECTION CODE*******************************/
-
 int save_page_to_file(void *addr, const char *filepath) {
 	ssize_t written;
 	int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -763,6 +197,7 @@ int save_page_to_file(void *addr, const char *filepath) {
 static void *handler(void *arg) {
     struct thread_param *p = arg;
     struct uffd_msg msg;
+	struct msg_info dsm_msg;
     struct pollfd pollfd[1] = {
         { .fd = p->uffd, .events = POLLIN }
     };
@@ -770,6 +205,7 @@ static void *handler(void *arg) {
 	unsigned char ack = 0;
 	unsigned char page_data[PAGE_SIZE] = {0}; 
 	struct uffdio_copy copy;
+	size_t n;
 
     printf("[handler] started, uffd = %d\n", p->uffd);
 
@@ -799,40 +235,59 @@ static void *handler(void *arg) {
 
         if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
             printf("[handler] WRITE-PROTECT fault on global page\n");
+			//When I get WP fault it means we were in SHARED so MSG_SEND_INVALIDATE 
+			// to make SERVER issue the drop page to all 
+			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
+			dsm_msg.page_addr = GLOBAL_PAGE;  // or any test address
+			dsm_msg.page_size = 4096;
+			dsm_msg.msg_id = 1001;
 
-            // Notify remote to invalidate or update data
-            //send_page_invalidate_msg(addr, p->);
+			// Send invalidate request
+			if (send(p->fd_handler, &dsm_msg, sizeof(dsm_msg), 0) != sizeof(dsm_msg)) {
+				perror("[CLIENT] Failed to send MSG_SEND_INVALIDATE");
+				return NULL;
+			}
+			printf("[CLIENT] Sent MSG_SEND_INVALIDATE to server.\n");
 
-			printf("Simulating sending GET_PAGE, wainting for ack\n");
-            //ack = 0;
-			ack = ACK_WRITE_PROTECT_EXPIRED;
-            //read(p->server_pipe, &ack, 1);
-            printf("[handler] ACK received: 0x%x\n", ack);
+			n = recv(p->fd_handler, &ack, 1, MSG_WAITALL);
+			if (n != 1) {
+				fprintf(stderr, "[CLIENT] Failed to receive ACK (got %zd bytes)\n", n);
+				return NULL;
+			}
+			if (ack != MSG_INVALIDATE_ACK) {
+				fprintf(stderr, "[CLIENT] Unexpected ACK value: 0x%x\n", ack);
+				return NULL;
+			}
+			printf("[CLIENT] Received MSG_INVALIDATE_ACK on INVALIDATION\n");
 
-            if (ack == ACK_WRITE_PROTECT_EXPIRED) {
-				//DEMO Remove write protection
-				disable_wp( (void *) aligned);
-            } else {
-                struct uffdio_writeprotect wp = {
-                    .range = { .start = addr, .len = PAGE_SIZE },
-                    .mode = 0
-                };
-                ioctl(p->uffd, UFFDIO_WRITEPROTECT, &wp);
-            }
+			// Now you can safely disable WP
+    		disable_wp(uffd, (void *)GLOBAL_PAGE);
+			
         } else {
 			printf("[handler] MISSING fault on global page\n");
 
-			memset(page_data, 0, PAGE_SIZE); 
-			
-			copy.src = (unsigned long)page_data;
-			copy.dst = addr;
-			copy.len = PAGE_SIZE;
+			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
+			dsm_msg.page_addr = GLOBAL_PAGE;
+			dsm_msg.page_size = PAGE_SIZE;
+			dsm_msg.msg_id = 1001;
+
+			if (send_get_page(dsm_msg, p->fd_handler, page_data) == 0) {
+				print_global_value_from_page(page_data, sizeof(page_data));
+			}else if (send_get_page(dsm_msg, p->fd_handler, page_data) < 0) {
+				fprintf(stderr, "[handler] Failed to fetch page from remote\n");
+				continue;
+			}
+
+			copy.src  = (unsigned long)page_data;
+			copy.dst  = addr;
+			copy.len  = PAGE_SIZE;
 			copy.mode = UFFDIO_COPY_MODE_WP;
 
 			if (ioctl(p->uffd, UFFDIO_COPY, &copy) == -1)
 				perror("ioctl/copy (missing)");
-		}
 
+			printf("[handler] Page copied back to missing region\n");
+		}
         printf("[handler] done handling fault at 0x%lx\n", addr);
     }
 
@@ -840,116 +295,6 @@ static void *handler(void *arg) {
 }
 #endif
 
-void send_sigcont(void){
-	// Resume the stopped process
-	if (kill(restored_pid, SIGCONT) != 0) {
-		perror("kill(SIGCONT)");
-		exit(EXIT_FAILURE);
-	}
-	printf("[DSM Server] Sent SIGCONT to PID %d.\n", restored_pid);
-}
-
-void send_sigstop(void){
-	// Resume the stopped process
-	if (kill(restored_pid, SIGSTOP) != 0) {
-		perror("kill(SIGSTOP)");
-		exit(EXIT_FAILURE);
-	}
-	printf("[DSM Server] Sent SIGSTOP to PID %d.\n", restored_pid);
-}
-
-void kill_and_exit(void){
-	// Resume the stopped process
-	if (kill(restored_pid, 9) != 0) {
-		perror("kill(9)");
-		exit(EXIT_FAILURE);
-	}
-	printf("[DSM Server] Sent kill -9 to PID %d.\n", restored_pid);
-	// exit
-	exit(0);
-}
-
-void command_loop(void) {
-	long *args;
-	struct msg_info dsm_msg;
-	int bin;
-	(void) bin;
-	(void) args;	
-	(void) dsm_msg;
-    while (1) {
-        int choice;
-        printf("\n[DSM] Enter command:\n");
-        printf("  0 = reapply write-protection\n");
-        printf("  1 = remote madvise(MADV_DONTNEED)\n> ");
-		printf("  2 = restart process (send SIGCONT)\n> ");
-		printf("  3 = restart process (send compel cure)\n> ");
-		printf("  4 = exit\n> ");
-		printf("  5 = simple infection test\n> ");
-		printf("  6 = test vmsplice\n> ");
-        fflush(stdout);
-
-        if (scanf("%d", &choice) != 1) {
-            printf("Invalid input\n");
-            while (getchar() != '\n'); // flush
-            continue;
-        }
-
-        if (choice == 0) {
-        	printf("[DSM] Reapplying write-protection on global page...\n");
-        	enable_wp((void *) aligned);
-        } else if (choice == 1) {
-
-			// Save the page content before madvise removes it
-			unsigned char *page_ptr = (unsigned char *)GLOBAL_PAGE;
-			int fd = open("/tmp/global-page.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			if (fd < 0) {
-				perror("open /tmp/global-page.bin");
-			} else {
-				if (write(fd, page_ptr, PAGE_SIZE) != PAGE_SIZE) {
-					perror("write global page");
-				}
-				close(fd);
-				printf("[cmd] Global page content saved to /tmp/global-page.bin\n");
-			}
-			printf("[DSM] Sending remote madvise(MADV_DONTNEED) request...\n");
-		
-			if( runMADVISE( (void *) aligned) )
-				perror("runMADVISE command loop");
-			else
-				printf("Successfully run madvise on page at %p\n", (void *) aligned);
-
-            
-        } else if (choice == 2){
-			send_sigcont();
-		} else if( choice == 3 ) {
-			// Resume the stopped process
-			if (compel_resume_task(restored_pid, g_state, g_state)) pr_err("Can't resume\n");
-			printf("[DSM Server] Sent compel resume to PID %d.\n", restored_pid);
-		} else if( choice == 4 ) {
-			kill_and_exit();
-			
-		} else if( choice == 5 ) {
-			//Infection test
-			printf("Do infection test\n");
-			infection_test();			
-		} else if( choice == 6 ){
-			//vmsplice test
-			printf("Do vmsplice test at %p\n", (void *)aligned);
-			//Prepare dsm_msg
-			dsm_msg.msg_type = MSG_GET_PAGE_DATA;
-			dsm_msg.page_addr = aligned;
-			printf("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
-			dsm_msg.msg_id = 1;
-			test_page_content(&dsm_msg);
-		}
-		else {
-            printf("[DSM] Unknown command: %d\n", choice);
-        }
-    }
-}
-
-
-procmaps_iterator* maps;
 struct params {
     int uffd;
     long page_size;
@@ -960,86 +305,11 @@ static volatile int stop;
 int page_size = 4096;
 
 
-struct dsm_connection {
-    int fd_handler;  // used by page fault handler thread
-    int fd_command;  // used by listener thread
-};
-
-
-
-int create_server_socket(int port) {
-    int fd, opt = 1;
-    struct sockaddr_in addr;
-
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return -1;
-    }
-
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(fd);
-        return -1;
-    }
-
-    if (listen(fd, BACKLOG) < 0) {
-        perror("listen");
-        close(fd);
-        return -1;
-    }
-
-    return fd;
-}
-
-
-int wait_for_connection(int listen_fd) {
-    struct sockaddr_in client_addr;
-    socklen_t addrlen = sizeof(client_addr);
-    int conn_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addrlen);
-    if (conn_fd < 0) {
-        perror("accept");
-        return -1;
-    }
-    return conn_fd;
-}
-
-
-int dsm_setup_dual_connections(struct dsm_connection *conn) {
-    int fd_handler_listen = create_server_socket(PORT_HANDLER);
-    int fd_command_listen = create_server_socket(PORT_COMMAND);
-
-    if (fd_handler_listen < 0 || fd_command_listen < 0)
-        return -1;
-
-    printf("[DSM Server] Waiting for handler thread connection on port %d...\n", PORT_HANDLER);
-    conn->fd_handler = wait_for_connection(fd_handler_listen);
-    if (conn->fd_handler < 0) return -1;
-
-    printf("[DSM Server] Waiting for command thread connection on port %d...\n", PORT_COMMAND);
-    conn->fd_command = wait_for_connection(fd_command_listen);
-    if (conn->fd_command < 0) return -1;
-
-    close(fd_handler_listen);
-    close(fd_command_listen);
-
-    printf("[DSM Server] Connections established:\n");
-    printf("  fd_handler = %d\n", conn->fd_handler);
-    printf("  fd_command = %d\n", conn->fd_command);
-
-    return 0;
-}
 
 void dsm_command_main_loop(int fd_command) {
     struct msg_info msg;
     ssize_t n;
+	unsigned char ack;
 
     while (1) {
         printf("[DSM Server] (fd=%d) Waiting for command message...\n", fd_command);
@@ -1058,24 +328,33 @@ void dsm_command_main_loop(int fd_command) {
 
         switch (msg.msg_type) {
 			case MSG_WAKE_THREAD:
-				send_sigcont();
+				send_sigcont(restored_pid);
 				break;
 			case MSG_STOP_THREAD:
-				send_sigstop();
+				send_sigstop(restored_pid);
 				break;
 			case MSG_GET_PAGE_DATA:
             case MSG_GET_PAGE_DATA_INVALID:
                 printf("→ Handling GET_PAGE_DATA/GET_PAGE_DATA_INVALID\n");
-                handle_page_data_request(fd_command, &msg);
+                handle_page_data_request(restored_pid, uffd, fd_command, &msg);
                 break;
             case MSG_SEND_INVALIDATE:
-                printf("→ Handling SEND_INVALIDATE\n");
-                printf("[DSM] Sending madvise(MADV_DONTNEED) request...\n");
-                if (runMADVISE((void *) msg.page_addr))
-                    perror("runMADVISE command loop");
-                else
-                    printf("Successfully ran madvise on page at %p\n", (void *) msg.page_addr);
-                break;
+				printf("→ Handling SEND_INVALIDATE\n");
+				printf("[DSM] Sending madvise(MADV_DONTNEED) request...\n");
+
+				if (runMADVISE(restored_pid, (void *)msg.page_addr)) {
+					perror("runMADVISE command loop");
+				} else {
+					printf("Successfully ran madvise on page at %p\n", (void *)msg.page_addr);
+
+					ack = MSG_INVALIDATE_ACK;
+					if (send(fd_command, &ack, 1, 0) != 1) {
+						perror("send MSG_INVALIDATE_ACK");
+					} else {
+						printf("[SERVER] Sent MSG_INVALIDATE_ACK to client.\n");
+					}
+				}
+				break;
 
             case MSG_HANDSHAKE:
                 printf("[DSM Server] Test handshake message received, ignoring.\n");
@@ -1083,89 +362,27 @@ void dsm_command_main_loop(int fd_command) {
 
             default:
                 fprintf(stderr, "⚠️ Unknown message type: %d\n", msg.msg_type);
-                kill_and_exit();  // shutdown the server on protocol error
+                kill_and_exit(restored_pid);  // shutdown the server on protocol error
                 break;
         }
     }
 }
 
+#if COMMAND_THREAD
+struct command_thread_args {
+    int restored_pid;
+    int uffd;
+    struct dsm_connection conn;
+};
 
-void read_pid(void)
-{
-	FILE *f = fopen("/tmp/criu-restored.pid", "r");
-	// 4. Read PID and send SIGCONT
-	if (!f || fscanf(f, "%d", &restored_pid) != 1) {
-		perror("fscanf");
-		//close(sockfd);
-		exit(EXIT_FAILURE);
-	}
-	fclose(f);
+void* command_thread_func_server(void* arg) {
+    struct command_thread_args* args = arg;
+    command_loop(args->restored_pid, args->uffd, &args->conn);
+    return NULL;
 }
 
-int perform_struct_handshake(int send_fd, int recv_fd, bool is_sender) {
-    struct msg_info msg_in, msg_out;
-    ssize_t sent, received;
+#endif
 
-    if (is_sender) {
-        // 1. Send handshake message
-        msg_out.msg_type = MSG_HANDSHAKE;
-        msg_out.page_addr = 0xdeadbeef;
-        msg_out.page_size = 4096;
-        msg_out.msg_id = 12345;
-
-        sent = send(send_fd, &msg_out, sizeof(msg_out), 0);
-        if (sent != sizeof(msg_out)) {
-            perror("[HANDSHAKE] Failed to send handshake");
-            return -1;
-        }
-
-        printf("[HANDSHAKE] Sent MSG_HANDSHAKE on fd %d\n", send_fd);
-
-        // 2. Receive ACK
-        received = recv(recv_fd, &msg_in, sizeof(msg_in), 0);
-        if (received != sizeof(msg_in)) {
-            perror("[HANDSHAKE] Failed to receive ACK");
-            return -1;
-        }
-
-        if (msg_in.msg_type != MSG_ACK) {
-            fprintf(stderr, "[HANDSHAKE] Invalid ACK type: %d\n", msg_in.msg_type);
-            return -1;
-        }
-
-        printf("[HANDSHAKE] Received MSG_ACK from fd %d\n", recv_fd);
-    } else {
-        // 1. Receive handshake
-        received = recv(recv_fd, &msg_in, sizeof(msg_in), 0);
-        if (received != sizeof(msg_in)) {
-            perror("[HANDSHAKE] Failed to receive handshake");
-            return -1;
-        }
-
-        if (msg_in.msg_type != MSG_HANDSHAKE) {
-            fprintf(stderr, "[HANDSHAKE] Unexpected message type: %d\n", msg_in.msg_type);
-            return -1;
-        }
-
-        printf("[HANDSHAKE] Received MSG_HANDSHAKE from fd %d\n", recv_fd);
-
-        // 2. Send ACK
-        msg_out.msg_type = MSG_ACK;
-        msg_out.page_addr = 0;
-        msg_out.page_size = 0;
-        msg_out.msg_id = 0;
-
-        sent = send(send_fd, &msg_out, sizeof(msg_out), 0);
-        if (sent != sizeof(msg_out)) {
-            perror("[HANDSHAKE] Failed to send ACK");
-            return -1;
-        }
-
-        printf("[HANDSHAKE] Sent MSG_ACK to fd %d\n", send_fd);
-    }
-
-    return 0; // success
-}
 
 void start_dsm_server(void)
 {
@@ -1175,12 +392,14 @@ void start_dsm_server(void)
 	struct dsm_connection conn;
 	pthread_t uffd_thread;
 	struct thread_param param;
-	
-	//struct uffdio_register uffdio_register;
-#if 0
-	struct uffdio_writeprotect wp;
-	struct uffdio_api uffdio_api;
+
+#if COMMAND_THREAD
+
+	pthread_attr_t attr;
+	pthread_t command_thread;
+	struct command_thread_args* args;
 #endif
+
 	int fds[2], custom_fd_local, custom_fd_remote; //server-parasite pipes
 	int server_pipe[2], uffd_pipe[2]; 
 	// server writes server_pipe[1], reads from uffd_pipe[0]
@@ -1219,31 +438,25 @@ void start_dsm_server(void)
 #endif 
 
 
-	read_pid();
+	read_pid(&restored_pid);
 
 #if VMA_REC	
 	read_proc_maps();
 
     reconstruct_vm_area_list(&vmas);
-    //print_vm_area_list(&vmas);
+    print_vm_area_list(&vmas);
 #endif
 	//Start infection
 	uffd = 0;
-	uffd = stealUFFD();
-	//runMADVISE( (void *) aligned );
+	uffd = stealUFFD(restored_pid);
 	
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
 		exit(EXIT_FAILURE);
 	}
 
-	register_page( (void *) aligned );/*
-	enable_wp( (void *) aligned);
-	disable_wp( (void *) aligned);
-	enable_wp( (void *) aligned);*/
-
-	//read_invalidate( (void *) aligned);
-
+	register_page( uffd, (void *) aligned );
+	enable_wp( uffd, (void *) aligned );
 	//Creating pipes 
 	if (pipe(server_pipe) == -1 || pipe(uffd_pipe) == -1) {
 		perror("pipe");
@@ -1260,16 +473,48 @@ void start_dsm_server(void)
 	
 
 
-#if COMMAND_LOOP
-	command_loop();
+#if COMMAND_THREAD
+	printf("[DSM Server] Connections established. Creating thread for command loop\n");
+
+	args = malloc(sizeof(struct command_thread_args));
+	if (!args) {
+		perror("malloc");
+		exit(EXIT_FAILURE);
+	}
+
+	args->restored_pid = restored_pid;
+	args->uffd = uffd;
+	args->conn = conn;  // shallow copy is OK here
+
+
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+	if (pthread_create(&command_thread, &attr, command_thread_func_server, args) != 0) {
+		perror("pthread_create (command loop)");
+		free(args);
+		exit(EXIT_FAILURE);
+	}
+
+	pthread_attr_destroy(&attr);
+
+	printf("[DSM Server] After creating thread. Entering main loop...\n");
+    dsm_command_main_loop(conn.fd_command);
+
+#elif COMMAND_LOOP
+	printf("[DSM Server] Connections established. Entering command loop\n");
+	command_loop(restored_pid, uffd, &conn);
 #else
 	printf("[DSM Server] Connections established. Entering main loop...\n");
     dsm_command_main_loop(conn.fd_command);
 #endif
+
+
+	
+
 	if( client_fd )	close(client_fd);
 	if( server_fd ) close(server_fd);
 	
-
 	//Freeing vmas
 	free_mappings(&vmas); 
 }
