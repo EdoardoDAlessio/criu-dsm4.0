@@ -68,7 +68,6 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 	return ret;
 }
 
-
 int parasite_cmd_invalidate_page(void *args) {
 	unsigned long addr = *(unsigned long *)args;
 	int ret = sys_mprotect((void *)addr, 4096, PROT_NONE);
@@ -929,11 +928,68 @@ void parasite_cleanup(void)
 		mprotect_vmas(mprotect_args);
 	}
 }
+static int parasite_cmd_remap_preserve(void *args_raw) {
+    long addr = *(long *)args_raw;
+    void *buf, *res;
+
+    // 1. Save original content
+    buf = (void *)sys_mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        pr_err("Failed to mmap temp buffer\n");
+        return -1;
+    }
+
+    memcpy(buf, (void *)addr, PAGE_SIZE); // Copy from old page
+
+    // 2. Remap with anonymous page
+    res = (void *)sys_mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+
+    if (res == MAP_FAILED) {
+        pr_err("Failed to remap as anon\n");
+        return -1;
+    }
+
+    // 3. Restore data
+    memcpy((void *)addr, buf, PAGE_SIZE);
+
+    pr_info("✅ Remapped page at 0x%lx and restored old data\n", addr);
+    return 0;
+}
+static int parasite_cmd_leak_global_page(void *arg)
+{
+    unsigned long offset = *(unsigned long *)arg;
+    unsigned long pie_base, runtime_addr;
+
+	pr_err("args = %p, deref = %p\n", arg, *(void **)arg);
+
+    pie_base = (unsigned long)&parasite_cmd_leak_global_page & ~(PAGE_SIZE - 1);
+    runtime_addr = pie_base + offset;
+
+    pr_info("Leaked runtime address: 0x%lx (aligned: 0x%lx)\n",
+            runtime_addr, runtime_addr & ~(PAGE_SIZE - 1));
+
+    // Write result back to where host expects it
+    *(unsigned long *)arg = runtime_addr;
+
+    return 0;
+}
+
+
 
 int parasite_daemon_cmd(int cmd, void *args)
 {
 	int ret;
 	switch (cmd) {
+	case PARASITE_CMD_LEAK_GLOBAL_PAGE:
+		pr_info("Parasite: leaking global page\n");
+		ret = parasite_cmd_leak_global_page(args);
+    	break; 
+	case PARASITE_CMD_REMAP_ANON:
+		pr_info("Parasite: remapping shared page with anon \n");
+		ret = parasite_cmd_remap_preserve(args);
+    	break;
 	case PARASITE_CMD_INVALIDATE_PAGE:
 		pr_info("Parasite: invalidate page for have pagefaults on pages \n");
 		ret = parasite_cmd_invalidate_page(args); 
