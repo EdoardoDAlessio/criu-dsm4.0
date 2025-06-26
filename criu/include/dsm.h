@@ -4,16 +4,25 @@
 #include <stddef.h>  // for size_t
 #include <stdint.h>  // for uint8_t, uint64_t
 #include <sys/types.h> // for pid_t
-
+#include "vma.h" 
 /****************** Constants ******************/
 
 #include "page.h" //this takes the page size #define PAGE_SIZE 4096
 #define HANDSHAKE_MSG "READY"
 #define PORT_COMMAND 7777
 #define PORT_HANDLER 7778
-#define GLOBAL_PAGE 0x7fffffffe000
-
+#define NUM_THREADS 1
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
+#define BACKLOG 1
+#define ENABLE_LOGGING 1
+
+#if ENABLE_LOGGING
+#define PRINT(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define PRINT(...) do {} while (0)
+#endif
+
+#define MAX_PAGE_COUNT 100000
 
 /****************** Global Variables (defined in dsm.c) ******************/
 
@@ -60,11 +69,28 @@ struct thread_param {
     int uffd;
     int server_pipe;      // read end for handler
     int uffd_pipe;        // write end for handler
-    int fd_handler;
+    int fd_handler[NUM_THREADS];
 };
 
+struct page_list {
+    unsigned long saddr;
+    int owner;
+    int state;
+};
+
+/****************** Extern Variables ******************/
+
+extern struct page_list page_list_data[MAX_PAGE_COUNT];
+extern int total_pages;
 
 /****************** Function Declarations ******************/
+
+//vma setup
+void register_and_write_protect_coalesced(int uffd);
+void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list);
+struct vma_area *vma_area_alloc(void);
+void print_vm_area_list(struct vm_area_list *list);
+void read_proc_maps(int restored_pid);
 
 //connection setup
 int create_server_socket(int port);
@@ -81,6 +107,8 @@ void enable_wp(int uffd, void *addr);
 void disable_wp(int uffd, void *addr);
 
 // DSM helpers
+unsigned long leakGlobalPage(int restored_pid, unsigned long offset);
+int replaceGlobalWithAnonPage(int restored_pid, void *addr);
 int print_global_value_from_page(void *page_buf, size_t page_len) ;
 int send_get_page(struct msg_info dsm_msg, int fd_handler, void *page_out);
 int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg);

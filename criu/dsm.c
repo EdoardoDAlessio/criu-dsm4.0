@@ -8,11 +8,6 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#define HANDSHAKE_MSG "READY"
-#define PORT_HANDLER 7778
-#define PORT_COMMAND 7777
-#define BACKLOG 1
-
 /***************** INFECTION HEADERS ************************/
 #include "pie/parasite-blob.h"
 #include "parasite-syscall.h"
@@ -24,6 +19,8 @@
 #include "compel/include/uapi/infect-util.h"
 struct vm_area_list* my_vm_area_list;
 /***************** END INFECTION HEADERS ************************/
+
+#include "dsm.h"
 
 /***************** USERFAULTFD HEADERS ************************/
 #include <sys/types.h>
@@ -37,43 +34,251 @@ struct vm_area_list* my_vm_area_list;
 #include "page.h" //this takes the page size
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 // Setup global variable address 
-#define GLOBAL_PAGE 0x7fffffffe000  // page-aligned address of `global`
+
+unsigned long global_addr = 0x801030;
+unsigned long aligned = 0x801030 & ~(PAGE_SIZE - 1);
+/*
+
+unsigned long global_addr = 0x555555558080;
+unsigned long aligned = 0x555555558080 & ~(PAGE_SIZE - 1);
 unsigned long global_addr = 0x7fffffffe5dc;
-unsigned long aligned = 0x7fffffffe5dc & ~(PAGE_SIZE - 1);
+unsigned long aligned = 0x7fffffffe5dc & ~(PAGE_SIZE - 1);*/
 /***************** END USERFAULTFD HEADERS ************************/
 
-/*DSM LOGIC*/
-struct thread_param {
-    int uffd;
-    int server_pipe;      // read end for handler
-    int uffd_pipe;  // write end for handler
-	int fd_handler;
-};
 
-struct msg_info{
-	int msg_type;
-	long page_addr;
-	int page_size;
-	long msg_id;
-};
 
-enum msg_type{
-	MSG_GET_PAGE_LIST,
-	MSG_GET_PAGE_DATA,
-	MSG_INVALIDATE_PAGE,
-	MSG_INVALIDATE_ACK,
-	MSG_GET_PAGE_DATA_INVALID,
-	MSG_SEND_INVALIDATE,
-	MSG_WAKE_THREAD,
-	MSG_STOP_THREAD,
-	MSG_HANDSHAKE,
-	MSG_ACK,
-};
+/*********************************** VMA RECONSTRUCTION ********************* */
 
-struct dsm_connection {
-    int fd_handler;  // used by page fault handler thread
-    int fd_command;  // used by listener thread
-};
+#include "vma.h"
+#include "mem.h"       // Required for xmalloc()
+#include "cr_options.h"
+
+void print_vm_area_list(struct vm_area_list *list) {
+    struct vma_area *vma;
+   list_for_each_entry(vma, &list->h, list) {
+		pr_info("VMA: 0x%lx-0x%lx prot=%x\n",
+			vma->e->start, vma->e->end, vma->e->prot);
+	}
+}
+
+struct vma_area *vma_area_alloc(void)
+{
+    struct vma_area *vma;
+    vma = xmalloc(sizeof(*vma));
+    if (!vma) return NULL;
+    INIT_LIST_HEAD(&vma->list);
+    vma->e = xmalloc(sizeof(VmaEntry));
+    if (!vma->e) {
+        xfree(vma);
+        return NULL;
+    }
+    memset(vma->e, 0, sizeof(VmaEntry));
+    return vma;
+}
+/*
+static void add_vma(struct vm_area_list *list, unsigned long start, unsigned long end)
+{
+    struct vma_area *vma = vma_area_alloc();
+    if (!vma) return;
+    vma->e->start = start;
+    vma->e->end = end;
+    list_add_tail(&vma->list, &list->h);  // Append to the vm_area_list
+    list->nr++;                           // Increment the count of VMAs
+}
+void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list) {
+    char path[64];
+    char line[512];
+	FILE *fp;
+	int prot = 0;
+    unsigned long start, end;
+	struct vma_area * vma;
+    snprintf(path, sizeof(path), "/proc/%d/maps", restored_pid);
+    fp = fopen(path, "r");
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
+	while (fgets(line, sizeof(line), fp)) {
+		char perms[5] = {0};
+		vma = vma_area_alloc();
+		if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
+			if (perms[0] == 'r') prot |= PROT_READ;
+			if (perms[1] == 'w') prot |= PROT_WRITE;
+			if (perms[2] == 'x') prot |= PROT_EXEC;
+			if (!vma)
+				continue;
+
+			vma->e->start = start;
+			vma->e->end = end;
+			vma->e->prot = prot;
+
+			list_add_tail(&vma->list, &list->h);
+			list->nr++;
+		}
+	}
+	//Save global vma for future infection
+	//g_vm_area_list = list;
+    fclose(fp);
+}*/
+
+struct page_list page_list_data[MAX_PAGE_COUNT];
+int total_pages = 0;
+
+void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list) {
+    char path[64];
+    char line[512];
+    FILE *fp;
+    unsigned long start, end;
+    char perms[5], dev[6], mapname[PATH_MAX];
+    unsigned long offset;
+    int inode, is_anon;
+    struct vma_area *vma;
+
+    snprintf(path, sizeof(path), "/proc/%d/maps", restored_pid);
+    fp = fopen(path, "r");
+    if (!fp) {
+        perror("fopen");
+        return;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        int prot = 0;
+        mapname[0] = '\0';  // Ensure mapname is cleared each line
+
+        if (sscanf(line, "%lx-%lx %4s %lx %5s %d %[^\n]",
+                   &start, &end, perms, &offset, dev, &inode, mapname) < 6)
+            continue;
+
+        if (perms[0] == 'r') prot |= PROT_READ;
+        if (perms[1] == 'w') prot |= PROT_WRITE;
+        if (perms[2] == 'x') prot |= PROT_EXEC;
+
+        // Only consider anonymous mappings (empty or space-only pathname)
+        is_anon = (strlen(mapname) == 0 || mapname[0] == '\0');
+
+        if (is_anon && (prot & PROT_READ) && (prot & PROT_WRITE)) {
+            size_t npages = (end - start) / PAGE_SIZE;
+            if (total_pages + npages > MAX_PAGE_COUNT) {
+                fprintf(stderr, "⚠️  Too many pages, increase MAX_PAGE_COUNT\n");
+                break;
+            }
+
+            for (size_t i = 0; i < npages; i++) {
+                page_list_data[total_pages + i].saddr = start + i * PAGE_SIZE;
+                page_list_data[total_pages + i].owner = 0;
+                page_list_data[total_pages + i].state = SHARED;
+            }
+            total_pages += npages;
+
+            printf("[TRACK] 0x%lx - 0x%lx (%zu pages)\n", start, end, npages);
+        }
+
+        // Fill vma list regardless of uffd track status (for infection, mapping etc.)
+        vma = vma_area_alloc();
+        if (!vma)
+            continue;
+
+        vma->e->start = start;
+        vma->e->end = end;
+        vma->e->prot = prot;
+        list_add_tail(&vma->list, &list->h);
+        list->nr++;
+    }
+
+    //g_vm_area_list = list;
+    fclose(fp);
+    printf("✅ Total trackable pages: %d\n", total_pages);
+}
+
+void register_and_write_protect_coalesced(int uffd) {
+	int i, j;
+	struct uffdio_register uffdio_register;
+	struct uffdio_writeprotect uf_wp;
+    struct uffdio_api uffdio_api = {
+        .api = UFFD_API,
+        .features = UFFD_FEATURE_PAGEFAULT_FLAG_WP
+    };
+
+    if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1) {
+        perror("ioctl/uffdio_api");
+        exit(EXIT_FAILURE);
+    }
+
+    if (uffdio_api.api != UFFD_API) {
+        fprintf(stderr, "❌ unsupported userfaultfd api\n");
+        exit(EXIT_FAILURE);
+    }
+
+    i = 0;
+    while (i < total_pages) {
+        unsigned long range_start = page_list_data[i].saddr;
+        size_t range_len = PAGE_SIZE, num_pages;
+        j = i + 1;
+
+        // Expand as long as pages are contiguous
+        while (j < total_pages && page_list_data[j].saddr == page_list_data[j - 1].saddr + PAGE_SIZE) {
+            range_len += PAGE_SIZE;
+            j++;
+        }
+
+		num_pages = range_len / PAGE_SIZE;
+
+        // Print the range and page count
+        printf("➡️  Registering range: 0x%lx - 0x%lx (%zu pages)\n", range_start, range_start + range_len, num_pages);
+
+        // Register contiguous range
+		uffdio_register.range.start = range_start;
+		uffdio_register.range.len   = range_len;
+		uffdio_register.mode        = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
+       
+
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1) {
+            perror("❌ ioctl/uffdio_register");
+            fprintf(stderr, "   at range 0x%lx - 0x%lx\n", range_start, range_start + range_len);
+        }
+
+        // Write-protect the range
+		uf_wp.range.start = range_start;
+		uf_wp.range.len   = range_len;
+		uf_wp.mode        = UFFDIO_WRITEPROTECT_MODE_WP;
+
+        if (ioctl(uffd, UFFDIO_WRITEPROTECT, &uf_wp) == -1) {
+            perror("❌ ioctl/write_protect");
+            fprintf(stderr, "   at range 0x%lx - 0x%lx\n", range_start, range_start + range_len);
+        }
+
+        // Set all involved pages as shared
+        for (int k = i; k < j; k++) {
+            page_list_data[k].state = SHARED;
+        }
+
+        i = j;  // move to the next non-contiguous page
+    }
+}
+
+
+void read_proc_maps(int restored_pid) {
+    char path[64];
+	FILE *fp;
+	char line[256];
+    snprintf(path, sizeof(path), "/proc/%d/maps", restored_pid);
+
+    fp = fopen(path, "r");
+    if (!fp) {
+        perror("Failed to open /proc/<pid>/maps");
+        return;
+    }
+
+    PRINT("=== Memory Map of PID %d ===\n", restored_pid);
+    
+    while (fgets(line, sizeof(line), fp)) {
+        PRINT("%s", line);
+    }
+
+    fclose(fp);
+}
+
+/***********************************END VMA RECONSTRUCTION ********************* */
 
 
 /********************************* CONNECTION FUNCTIONS ***************************************/
@@ -280,7 +485,6 @@ int perform_struct_handshake(int send_fd, int recv_fd, bool is_sender) {
 /********************************* END CONNECTION FUNCTIONS ***************************************/
 
 
-
 /******************************** USERFAULT FUNCTIONS ****************************/
 int init_userfaultfd_api(int uffd) {
 	struct uffdio_api uffdio_api;
@@ -308,16 +512,13 @@ int init_userfaultfd_api(int uffd) {
 }	
 
 void register_page(int uffd, void *addr) {
-	struct uffdio_register reg = {
-		.range.start = (unsigned long)addr,
-		.range.len = PAGE_SIZE,
-		.mode =  UFFDIO_REGISTER_MODE_WP | UFFDIO_REGISTER_MODE_MISSING
-	};
+	struct uffdio_register reg;
+	
+	printf("Address registering page %p\n", (void*) addr);
 
-	unsigned char test;
-	test = *((unsigned char *)addr);
-	printf("Read test byte: %02x\n", test);
-
+	reg.range.start = (unsigned long)addr;
+	reg.range.len = PAGE_SIZE;
+	reg.mode =  UFFDIO_REGISTER_MODE_WP | UFFDIO_REGISTER_MODE_MISSING;
 
 	printf("Registering addr = %p (aligned = %ld)\n", addr, (unsigned long)addr % PAGE_SIZE);
 	printf("UFFD REGISTER: %d\n", uffd);
@@ -326,6 +527,7 @@ void register_page(int uffd, void *addr) {
 		perror("UFFDIO_REGISTER");
 		exit(1);
 	}
+
 }
 
 void enable_wp(int uffd, void *addr)
@@ -361,6 +563,150 @@ void disable_wp(int uffd, void *addr)
 /******************************** END USERFAULT FUNCTIONS ****************************/
 
 /******************************** INFECTION FUNCTIONS *******************************/
+
+unsigned long leakGlobalPage(int restored_pid, unsigned long offset)
+{
+    int state, rc;
+    struct parasite_ctl *ctl;
+    struct infect_ctx *ictx;
+    unsigned long *args;
+    unsigned long result;
+
+    state = compel_stop_task(restored_pid);
+    if (!(ctl = compel_prepare(restored_pid))) {
+        pr_err("❌ Compel prepare failed\n");
+        return 0;
+    }
+
+    parasite_setup_c_header(ctl);
+    ictx = compel_infect_ctx(ctl);
+    ictx->log_fd = STDERR_FILENO;
+
+    if (compel_infect(ctl, 1, sizeof(unsigned long)) < 0) {
+        pr_err("❌ Infection failed\n");
+        goto fail;
+    }
+
+    args = compel_parasite_args(ctl, unsigned long);
+    //*args = offset;
+	*args = 0x4080; // Offset of `global` symbol from readelf
+
+	rc = compel_rpc_call(PARASITE_CMD_LEAK_GLOBAL_PAGE, ctl);
+    if (rc < 0) {
+        pr_err("❌ RPC call failed\n");
+        goto fail;
+    }
+
+	rc = compel_rpc_sync(PARASITE_CMD_LEAK_GLOBAL_PAGE, ctl);
+    if (rc < 0) {
+        pr_err("❌ RPC call failed\n");
+        goto fail;
+    }
+	
+
+	printf("✅ Leaked global page = 0x%lx\n", *args);
+
+    result = (unsigned long)*args;
+    printf("✅ Leaked global page = 0x%lx\n", result);
+
+    if (compel_stop_daemon(ctl))
+        pr_err("Failed to stop daemon\n");
+    else
+        printf("Daemon stopped (leak)\n");
+
+    if (compel_cure(ctl))
+        pr_err("Failed to cure\n");
+    else
+        printf("Cured! (leak)\n");
+
+    if (compel_resume_task(restored_pid, state, state))
+        pr_err("Failed to resume task\n");
+    else
+        printf("Resumed post leak\n");
+    return result;
+
+fail:
+    if (compel_stop_daemon(ctl))
+        pr_err("Failed to stop daemon\n");
+    else
+        printf("Daemon stopped (leak)\n");
+
+    if (compel_cure(ctl))
+        pr_err("Failed to cure\n");
+    else
+        printf("Cured! (leak)\n");
+
+    if (compel_resume_task(restored_pid, state, state))
+        pr_err("Failed to resume task\n");
+    else
+        printf("Resumed post leak\n");
+
+    return 0;
+}
+
+
+int replaceGlobalWithAnonPage(int restored_pid, void *addr){
+    int state;
+	struct parasite_ctl *ctl;
+	struct infect_ctx *ictx;
+	long *args;
+	(void) state;
+	(void) args;
+
+	printf("[DSM] replaceGlobalWithAnonPage request...\n");
+
+	state = compel_stop_task(restored_pid);
+	if (!(ctl = compel_prepare(restored_pid))){
+		pr_err("❌ Compel prepare failed\n");
+		return -1;
+	} 
+
+	parasite_setup_c_header(ctl);
+	ictx = compel_infect_ctx(ctl);
+	ictx->log_fd = STDERR_FILENO;
+
+	if (compel_infect(ctl, 1, sizeof(long)) < 0) {
+		xfree(ctl);
+		return -1;
+	}
+
+	//Prepare the addr to pass
+	args = compel_parasite_args(ctl, long);
+	*args = (long)addr;
+	if (compel_rpc_call(PARASITE_CMD_REMAP_ANON, ctl) < 0) {
+		pr_err("❌ RPC call to run replaceGlobalWithAnonPage failed\n");
+		goto fail;
+	}
+	if (compel_rpc_sync(PARASITE_CMD_REMAP_ANON, ctl) < 0) {
+		pr_err("❌ Failed to sync back from replaceGlobalWithAnonPage\n");
+		goto fail;
+	}
+	if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
+	if (compel_cure(ctl)) pr_err("Can't cure\n");
+	printf("State:%d\n", state);
+	if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
+	
+	return 0;
+
+fail:
+    if (compel_stop_daemon(ctl))
+        pr_err("Failed to stop daemon\n");
+    else
+        printf("Daemon stopped (remap)\n");
+
+    if (compel_cure(ctl))
+        pr_err("Failed to cure\n");
+    else
+        printf("Cured! (remap)\n");
+
+    if (compel_resume_task(restored_pid, state, state))
+        pr_err("Failed to resume task\n");
+    else
+        printf("Resumed post remap\n");
+
+    return -1   ;
+}
+
 
 int infection_test(int restored_pid)
 {
@@ -643,7 +989,7 @@ int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg) {
     }
 
     // ✅ Extract and print the value at GLOBAL_ADDR
-    offset = global_addr - GLOBAL_PAGE;
+    offset = global_addr - aligned;
 	if (offset >= 4096 - sizeof(int)) {
 		fprintf(stderr, "Offset out of bounds\n");
 	} else {
@@ -651,7 +997,7 @@ int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg) {
 		printf("[DSM] Value at GLOBAL_ADDR (0x%lx): %d (0x%x)\n", global_addr, value, value);
 	}
 
-   
+   /*
     // Handle invalidation or WP
     if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
         printf("Message is GET_PAGE_INVALIDATE -> Drop the page to INVALIDATE\n");
@@ -661,7 +1007,7 @@ int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg) {
     } else {
 		printf("Message is GET_PAGE -> Enable wp to SHARED \n");
 		enable_wp( uffd, (void *)dsm_msg->page_addr);
-    }
+    }*/
 
     if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
     if (compel_cure(ctl)) pr_err("Can't cure\n");
@@ -687,7 +1033,7 @@ int print_global_value_from_page(void *page_buf, size_t page_len) {
         return -1;
     }
 
-    offset = global_addr - GLOBAL_PAGE;
+    offset = global_addr - aligned;
     if (offset >= PAGE_SIZE - sizeof(int)) {
         fprintf(stderr, "[print_global_value_from_page] Offset out of bounds (offset=%zu)\n", offset);
         return -1;
@@ -786,7 +1132,7 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
     printf("✅ Page_transfer_complete to client\n");
 
     // Show value at global_addr for debugging
-    offset = global_addr - GLOBAL_PAGE;
+    offset = global_addr - aligned;
     if (offset >= 4096 - sizeof(int)) {
         fprintf(stderr, "Offset out of bounds\n");
     } else {
@@ -933,7 +1279,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 		}else if (choice == 7) {
 			// SIMULATE GET_PAGE_DATA
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA;
-			dsm_msg.page_addr = GLOBAL_PAGE;  // or any test address
+			dsm_msg.page_addr = aligned;  // or any test address
 			dsm_msg.page_size = 4096;
 			dsm_msg.msg_id = 1001;
             if (send_get_page(dsm_msg, conn->fd_handler, page_data) == 0) {
@@ -942,7 +1288,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 		} else if (choice == 8) {
 			// SIMULATE GET_PAGE_DATA_AND_INVALIDATE
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
-			dsm_msg.page_addr = GLOBAL_PAGE;  // or any test address
+			dsm_msg.page_addr = aligned;  // or any test address
 			dsm_msg.page_size = 4096;
 			dsm_msg.msg_id = 1001;
             if (send_get_page(dsm_msg, conn->fd_handler, page_data) == 0) {
@@ -952,7 +1298,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 		} else if (choice == 9) {
 			// SIMULATE INVALIDATE
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
-			dsm_msg.page_addr = GLOBAL_PAGE;  // or any test address
+			dsm_msg.page_addr = aligned;  // or any test address
 			dsm_msg.page_size = 4096;
 			dsm_msg.msg_id = 1001;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
