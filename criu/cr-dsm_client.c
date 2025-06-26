@@ -39,7 +39,6 @@ struct vm_area_list* my_vm_area_list;
 #include <linux/userfaultfd.h>	
 #include "user.h"
 #include "page.h" //this takes the page size
-#define ACK_WRITE_PROTECT_EXPIRED 0x11
 // Setup global variable address 
 extern unsigned long global_addr;
 extern unsigned long aligned;
@@ -79,33 +78,28 @@ static void *handler(void *arg) {
             continue;
         }
 
-        if (!(msg.event & UFFD_EVENT_PAGEFAULT)) continue;
+         if (!(msg.event & UFFD_EVENT_PAGEFAULT)) continue;
 
         addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
-        printf("[handler] page fault at 0x%lx (flags: %llx)\n", addr, msg.arg.pagefault.flags);
-
-        if (addr != GLOBAL_PAGE) {
-            printf("[handler] ignoring fault at non-target page\n");
-            continue;
-        }
+        printf("[handler] page fault at 0x%llx, page:0x%lx (flags: %llx)\n", msg.arg.pagefault.address, addr, msg.arg.pagefault.flags);
 
         if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
             printf("[handler] WRITE-PROTECT fault on global page\n");
 			//When I get WP fault it means we were in SHARED so MSG_SEND_INVALIDATE 
 			// to make SERVER issue the drop page to all 
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
-			dsm_msg.page_addr = GLOBAL_PAGE;  // or any test address
+			dsm_msg.page_addr = addr;  // or any test address
 			dsm_msg.page_size = 4096;
 			dsm_msg.msg_id = 1001;
 
-			 // Send invalidate request
-			if (send(p->fd_handler, &dsm_msg, sizeof(dsm_msg), 0) != sizeof(dsm_msg)) {
+			// Send invalidate request
+			if (send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0) != sizeof(dsm_msg)) {
 				perror("[CLIENT] Failed to send MSG_SEND_INVALIDATE");
 				return NULL;
 			}
-			printf("[CLIENT] Sent MSG_SEND_INVALIDATE to server.\n");
+			printf("[CLIENT] Sent MSG_SEND_INVALIDATE to server. With address:0x%lx\n", addr);
 
-			n = recv(p->fd_handler, &ack, 1, MSG_WAITALL);
+			n = recv(p->fd_handler[0], &ack, 1, MSG_WAITALL);
 			if (n != 1) {
 				fprintf(stderr, "[CLIENT] Failed to receive ACK (got %zd bytes)\n", n);
 				return NULL;
@@ -117,18 +111,18 @@ static void *handler(void *arg) {
 			printf("[CLIENT] Received MSG_INVALIDATE_ACK on INVALIDATION\n");
 
 			// Now you can safely disable WP
-    		disable_wp(uffd, (void *)GLOBAL_PAGE);
+    		disable_wp(uffd, (void *)addr);
         } else {
 			printf("[handler] MISSING fault on global page\n");
 
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
-			dsm_msg.page_addr = GLOBAL_PAGE;
+			dsm_msg.page_addr = addr;
 			dsm_msg.page_size = PAGE_SIZE;
 			dsm_msg.msg_id = 1001;
 
-			if (send_get_page(dsm_msg, p->fd_handler, page_data) == 0) {
+			if (send_get_page(dsm_msg, p->fd_handler[0], page_data) == 0) {
 				print_global_value_from_page(page_data, sizeof(page_data));
-			}else if (send_get_page(dsm_msg, p->fd_handler, page_data) < 0) {
+			}else if (send_get_page(dsm_msg, p->fd_handler[0], page_data) < 0) {
 				fprintf(stderr, "[handler] Failed to fetch page from remote\n");
 				continue;
 			}
@@ -234,6 +228,7 @@ void dsm_client_main_loop(int fd_command) {
 /********************************* MAIN ***************************************/
 void start_dsm_client(const char *server_ip)
 {
+	struct vm_area_list vmas = { .nr = 0};
 	struct dsm_connection conn;
 	pthread_t uffd_thread;
 	struct thread_param param;
@@ -246,6 +241,8 @@ void start_dsm_client(const char *server_ip)
 		struct command_thread_args* args;
 	#endif
 
+	
+	vm_area_list_init(&vmas); // CRIU macro
 
 	if (dsm_client_dual_connect(&conn, server_ip) < 0) {
 		fprintf(stderr, "DSM client connection failed\n");
@@ -258,14 +255,26 @@ void start_dsm_client(const char *server_ip)
 	perform_struct_handshake(conn.fd_handler, conn.fd_handler, false);
 
 	read_pid(&restored_pid);
+	read_proc_maps(restored_pid);
+
+    reconstruct_vm_area_list(restored_pid, &vmas);
+	printf("Aligned %p\n", (void*) aligned);
 
 	uffd = stealUFFD(restored_pid);
+
+
+	/*
+	replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
 
 	//Registerign page and setting wp (SHARED STATE FOR RESTARTING)
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
 		exit(EXIT_FAILURE);
-	}
+	}*/
+
+	
+	register_and_write_protect_coalesced(uffd);
+
 	register_page( uffd, (void *) aligned );
 	enable_wp(uffd, (void *) aligned );
 
@@ -278,7 +287,7 @@ void start_dsm_client(const char *server_ip)
 	param.uffd = uffd;               // from stealUFFD()
 	//param.server_pipe = server_pipe[0];    // read end for handler
 	//param.uffd_pipe = uffd_pipe[1];  // write end for handler
-	param.fd_handler = conn.fd_handler;
+	param.fd_handler[0] = conn.fd_handler;
 	//Spawn handler thread
 	pthread_create(&uffd_thread, NULL, handler, &param);
 
