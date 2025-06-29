@@ -13,9 +13,6 @@
 /*COMPILE ERRORS*/
 #include "pstree.h"
 
-#define COMMAND_LOOP 1
-#define COMMAND_THREAD 1 & COMMAND_LOOP
-#define ENABLE_SERVER 1
 #define VMA_REC 1
 #define SIGMAX 64
 
@@ -42,16 +39,12 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 #include "user.h"
 
 //#include "parsemap.h"
-#define HANDSHAKE_MSG "READY"
 
 
 //INFECTION
 #include "pie/parasite-blob.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
-extern pid_t dsm_pid;
-extern struct parasite_ctl *dsm_ctl;
-extern volatile bool g_vma_list_ready;
 struct vm_area_list* my_vm_area_list;
 
 //#define PAGE_SIZE 4096
@@ -84,6 +77,9 @@ static void *handler(void *arg) {
 	struct uffdio_copy copy;
 	size_t n;
     PRINT("[handler] started, uffd = %d\n", p->uffd);
+
+	sleep(5);
+	if(!DBG) send_sigcont(restored_pid);
 
     while (1) {
         int pollres = poll(pollfd, 1, -1);
@@ -135,7 +131,7 @@ static void *handler(void *arg) {
 			// Now you can safely disable WP
     		disable_wp(uffd, (void *)addr);
         } else {
-			PRINT("[handler] MISSING fault on global page\n");
+			PRINT("[handler] MISSING fault on tracked page\n");
 
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
 			dsm_msg.page_addr = addr;
@@ -308,12 +304,8 @@ void start_dsm_server(void)
 	
 #endif 
 
-
 	read_pid(&restored_pid);
 	
-	//replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
-
-
 #if VMA_REC	
 	read_proc_maps(restored_pid);
 
@@ -323,18 +315,20 @@ void start_dsm_server(void)
 	//Start infection
 	uffd = 0;
 	uffd = stealUFFD(restored_pid);
-	/*
+	
+#if DEMO
+	replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
 		exit(EXIT_FAILURE);
 	}
-	else PRINT("Success initialize userfaultfd API\n");*/
-
-	
-	register_and_write_protect_coalesced(uffd);
-
+	else PRINT("Success initialize userfaultfd API\n");
 	register_page( uffd, (void *) aligned );
-	enable_wp( uffd, (void *) aligned );
+	//enable_wp( uffd, (void *) aligned );
+#else
+	register_and_write_protect_coalesced(uffd, MODIFIED);
+#endif
+
 	//Creating pipes 
 	if (pipe(server_pipe) == -1 || pipe(uffd_pipe) == -1) {
 		perror("pipe");
@@ -376,14 +370,16 @@ void start_dsm_server(void)
 	pthread_attr_destroy(&attr);
 
 	PRINT("[DSM Server] After creating thread. Entering main loop...\n");
+	#if ENABLE_SERVER
     dsm_command_main_loop(conn[0].fd_command);
-
+	#endif
 #elif COMMAND_LOOP
 	PRINT("[DSM Server] Connections established. Entering command loop\n");
 	command_loop(restored_pid, uffd, &conn);
 #elif ENABLE_SERVER
 	PRINT("[DSM Server] Connections established. Entering main loop...\n");
-    dsm_command_main_loop(conn.fd_command);
+    dsm_command_main_loop(conn[0].fd_command);
+	if(!DBG) send_sigcont(restored_pid);
 #endif
 
 

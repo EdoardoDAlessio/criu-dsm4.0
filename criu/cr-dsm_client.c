@@ -11,10 +11,6 @@
 #define HANDSHAKE_MSG "READY"
 int restored_pid, uffd;
 
-#define DGB 0
-#define COMMAND_LOOP 1
-#define COMMAND_THREAD 1 & COMMAND_LOOP
-#define ENABLE_SERVER 1
 #define SIGMAX 64
 
 /***************** INFECTION HEADERS ************************/
@@ -62,7 +58,13 @@ static void *handler(void *arg) {
 	struct uffdio_copy copy;
 	size_t n;
 
-    printf("[handler] started, uffd = %d\n", p->uffd);
+    PRINT("[handler] started, uffd = %d\n", p->uffd);
+	
+	sleep(5);
+	//dsm_msg.msg_type = MSG_WAKE_THREAD;
+	//send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0);
+	//printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n");
+	if(!DBG) send_sigcont(restored_pid);
 
     while (1) {
         int pollres = poll(pollfd, 1, -1);
@@ -81,10 +83,10 @@ static void *handler(void *arg) {
          if (!(msg.event & UFFD_EVENT_PAGEFAULT)) continue;
 
         addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
-        printf("[handler] page fault at 0x%llx, page:0x%lx (flags: %llx)\n", msg.arg.pagefault.address, addr, msg.arg.pagefault.flags);
+        PRINT("[handler] page fault at 0x%llx, page:0x%lx (flags: %llx)\n", msg.arg.pagefault.address, addr, msg.arg.pagefault.flags);
 
         if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-            printf("[handler] WRITE-PROTECT fault on global page\n");
+            PRINT("[handler] WRITE-PROTECT fault on global page\n");
 			//When I get WP fault it means we were in SHARED so MSG_SEND_INVALIDATE 
 			// to make SERVER issue the drop page to all 
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
@@ -97,7 +99,7 @@ static void *handler(void *arg) {
 				perror("[CLIENT] Failed to send MSG_SEND_INVALIDATE");
 				return NULL;
 			}
-			printf("[CLIENT] Sent MSG_SEND_INVALIDATE to server. With address:0x%lx\n", addr);
+			PRINT("[CLIENT] Sent MSG_SEND_INVALIDATE to server. With address:0x%lx\n", addr);
 
 			n = recv(p->fd_handler[0], &ack, 1, MSG_WAITALL);
 			if (n != 1) {
@@ -108,12 +110,12 @@ static void *handler(void *arg) {
 				fprintf(stderr, "[CLIENT] Unexpected ACK value: 0x%x\n", ack);
 				return NULL;
 			}
-			printf("[CLIENT] Received MSG_INVALIDATE_ACK on INVALIDATION\n");
+			PRINT("[CLIENT] Received MSG_INVALIDATE_ACK on INVALIDATION\n");
 
 			// Now you can safely disable WP
     		disable_wp(uffd, (void *)addr);
         } else {
-			printf("[handler] MISSING fault on global page\n");
+			PRINT("[handler] MISSING fault on global page\n");
 
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
 			dsm_msg.page_addr = addr;
@@ -135,11 +137,11 @@ static void *handler(void *arg) {
 			if (ioctl(p->uffd, UFFDIO_COPY, &copy) == -1)
 				perror("ioctl/copy (missing)");
 
-			printf("[handler] Page copied back to missing region\n");
+			PRINT("[handler] Page copied back to missing region\n");
 		}
 
 	
-        printf("[handler] done handling fault at 0x%lx\n", addr);
+        PRINT("[handler] done handling fault at 0x%lx\n", addr);
     }
 
     return NULL;
@@ -168,7 +170,7 @@ void dsm_client_main_loop(int fd_command) {
     ssize_t n;
 	unsigned char ack;
     while (1) {
-        printf("[DSM Client] (fd=%d) Waiting for command message...\n", fd_command);
+        PRINT("[DSM Client] (fd=%d) Waiting for command message...\n", fd_command);
 
         n = recv(fd_command, &msg, sizeof(msg), 0);
         if (n <= 0) {
@@ -179,7 +181,7 @@ void dsm_client_main_loop(int fd_command) {
             continue;
         }
 
-        printf("[DSM Client] Received message: type=%d, addr=0x%lx, id=%ld\n",
+        PRINT("[DSM Client] Received message: type=%d, addr=0x%lx, id=%ld\n",
                msg.msg_type, msg.page_addr, msg.msg_id);
 
         switch (msg.msg_type) {
@@ -191,29 +193,29 @@ void dsm_client_main_loop(int fd_command) {
 				break;
 			case MSG_GET_PAGE_DATA:
             case MSG_GET_PAGE_DATA_INVALID:
-                printf("→ Handling GET_PAGE_DATA/GET_PAGE_DATA_INVALID\n");
+                PRINT("→ Handling GET_PAGE_DATA/GET_PAGE_DATA_INVALID\n");
                 handle_page_data_request(restored_pid, uffd, fd_command, &msg);
                 break;
             case MSG_SEND_INVALIDATE:
-				printf("→ Handling SEND_INVALIDATE\n");
-				printf("[DSM] Sending madvise(MADV_DONTNEED) request...\n");
+				PRINT("→ Handling SEND_INVALIDATE\n");
+				PRINT("[DSM] Sending madvise(MADV_DONTNEED) request...\n");
 
 				if (runMADVISE(restored_pid, (void *)msg.page_addr)) {
 					perror("runMADVISE command loop");
 				} else {
-					printf("Successfully ran madvise on page at %p\n", (void *)msg.page_addr);
+					PRINT("Successfully ran madvise on page at %p\n", (void *)msg.page_addr);
 
 					ack = MSG_INVALIDATE_ACK;
 					if (send(fd_command, &ack, 1, 0) != 1) {
 						perror("send MSG_INVALIDATE_ACK");
 					} else {
-						printf("[Client] Sent MSG_INVALIDATE_ACK to client.\n");
+						PRINT("[Client] Sent MSG_INVALIDATE_ACK to client.\n");
 					}
 				}
 				break;
 
             case MSG_HANDSHAKE:
-                printf("[DSM Client] Test handshake message received, ignoring.\n");
+                PRINT("[DSM Client] Test handshake message received, ignoring.\n");
                 continue;
 
             default:
@@ -223,6 +225,7 @@ void dsm_client_main_loop(int fd_command) {
         }
     }
 }
+
 
 
 /********************************* MAIN ***************************************/
@@ -249,35 +252,34 @@ void start_dsm_client(const char *server_ip)
 		exit(EXIT_FAILURE);
 	}
 
-	printf("Checking connection as SENDER on HANDLER\n");
+	PRINT("Checking connection as SENDER on HANDLER\n");
 	perform_struct_handshake(conn.fd_handler, conn.fd_handler, true);
-	printf("Checking connection as RECEIVER on HANDLER\n");
+	PRINT("Checking connection as RECEIVER on HANDLER\n");
 	perform_struct_handshake(conn.fd_handler, conn.fd_handler, false);
 
 	read_pid(&restored_pid);
 	read_proc_maps(restored_pid);
 
     reconstruct_vm_area_list(restored_pid, &vmas);
-	printf("Aligned %p\n", (void*) aligned);
+	PRINT("Aligned %p\n", (void*) aligned);
 
 	uffd = stealUFFD(restored_pid);
 
+#if DEMO
 
-	/*
 	replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
-
-	//Registerign page and setting wp (SHARED STATE FOR RESTARTING)
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
 		exit(EXIT_FAILURE);
-	}*/
-
-	
-	register_and_write_protect_coalesced(uffd);
-
+	}
+	else PRINT("Success initialize userfaultfd API\n");
 	register_page( uffd, (void *) aligned );
-	enable_wp(uffd, (void *) aligned );
-
+	runMADVISE(restored_pid, (void *) aligned);
+	//enable_wp( uffd, (void *) aligned );
+#else
+	register_and_write_protect_coalesced(uffd, INVALID);
+#endif
+	
 	//Creating pipes 
 	if (pipe(client_pipe) == -1 || pipe(uffd_pipe) == -1) {
 		perror("pipe");
@@ -292,7 +294,7 @@ void start_dsm_client(const char *server_ip)
 	pthread_create(&uffd_thread, NULL, handler, &param);
 
 #if COMMAND_THREAD
-	printf("[DSM Client] Connections established. Creating thread for command loop\n");
+	PRINT("[DSM Client] Connections established. Creating thread for command loop\n");
 
 	args = malloc(sizeof(struct command_thread_args));
 	if (!args) {
@@ -316,15 +318,16 @@ void start_dsm_client(const char *server_ip)
 
 	pthread_attr_destroy(&attr);
 
-	printf("[DSM Client] After creating thread. Entering main loop...\n");
+	PRINT("[DSM Client] After creating thread. Entering main loop...\n");
     dsm_client_main_loop(conn.fd_command);
 
 #elif COMMAND_LOOP
-	printf("[DSM Client] Connections established. Entering command loop\n");
+	PRINT("[DSM Client] Connections established. Entering command loop\n");
 	command_loop(restored_pid, uffd, &conn);
-#else
-	printf("[DSM Client] Connections established. Entering main loop...\n");
+#elif ENABLE_SERVER
+	PRINT("[DSM Client] Connections established. Entering main loop...\n");
     dsm_client_main_loop(conn.fd_command);
+	if(!DBG) send_sigcont(restored_pid);
 #endif
 
 
