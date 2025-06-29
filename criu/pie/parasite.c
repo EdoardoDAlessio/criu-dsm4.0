@@ -71,7 +71,7 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 int parasite_cmd_invalidate_page(void *args) {
 	unsigned long addr = *(unsigned long *)args;
 	int ret = sys_mprotect((void *)addr, 4096, PROT_NONE);
-	pr_info("Invalidate page: mprotect(%p) -> %d\n", (void *)addr, ret);
+	pr_debug("Invalidate page: mprotect(%p) -> %d\n", (void *)addr, ret);
 	return ret;
 }
 
@@ -80,7 +80,7 @@ static int runMadvise(void *args) {
     long addr = *(long *)args;
     long ret;
 
-    pr_warn("madvise at 0x%lx\n", addr);
+    pr_debug("madvise at 0x%lx\n", addr);
 
     /* Issue the syscall and capture its return value. */
     ret = sys_madvise(addr, 4096, MADV_DONTNEED);
@@ -88,7 +88,7 @@ static int runMadvise(void *args) {
         /* Print the errno (as a positive number) and a short description. */
         pr_err("madvise failed at 0x%lx: %ld\n", addr, -ret);
     } else {
-        pr_info("madvise succeeded at 0x%lx\n", addr);
+        pr_debug("madvise succeeded at 0x%lx\n", addr);
     }
 
     return 0;
@@ -109,19 +109,19 @@ static int createAndSendUFFD(void) {
 		}
 
 	}	
-	pr_warn("Initialized uffd %d\n", g_uffd);
+	pr_debug("Initialized uffd %d\n", g_uffd);
 	if( !sock ) sock = parasite_get_rpc_sock();
 	ret = send_fd(sock, NULL, 0, g_uffd);
 
 	if(ret == 0)
-		pr_warn("sent uffd\n");
+		pr_debug("sent uffd\n");
 	else
 		pr_warn("could not send uffd\n");
 
 	//bin = sys_close(sock);
 
     /*if (bin == 0)
-        pr_info("✅ Successfully closed fd %d\n", sock);
+        pr_debug("✅ Successfully closed fd %d\n", sock);
     else
         pr_err("❌ Failed to close fd %d\n", sock);*/
 
@@ -139,11 +139,11 @@ static int dump_single_page(void *args){
 
 	miov.iov_base = *(void **)args;
 	miov.iov_len = 4096;
-	pr_err("args = %p, deref = %p\n", args, *(void **)args);
+	pr_debug("args = %p, deref = %p\n", args, *(void **)args);
 
-	pr_err("vmsplice at = %p\n",miov.iov_base);
+	pr_debug("vmsplice at = %p\n",miov.iov_base);
 	ret = sys_vmsplice(p, &miov, nr_segs,	 SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
-	pr_err("vmsplice ret = %d\n",ret);
+	pr_debug("vmsplice ret = %d\n",ret);
 	return 0;
 
 }
@@ -954,7 +954,7 @@ static int parasite_cmd_remap_preserve(void *args_raw) {
     // 3. Restore data
     memcpy((void *)addr, buf, PAGE_SIZE);
 
-    pr_info("✅ Remapped page at 0x%lx and restored old data\n", addr);
+    pr_debug("✅ Remapped page at 0x%lx and restored old data\n", addr);
     return 0;
 }
 static int parasite_cmd_leak_global_page(void *arg)
@@ -967,7 +967,7 @@ static int parasite_cmd_leak_global_page(void *arg)
     pie_base = (unsigned long)&parasite_cmd_leak_global_page & ~(PAGE_SIZE - 1);
     runtime_addr = pie_base + offset;
 
-    pr_info("Leaked runtime address: 0x%lx (aligned: 0x%lx)\n",
+    pr_debug("Leaked runtime address: 0x%lx (aligned: 0x%lx)\n",
             runtime_addr, runtime_addr & ~(PAGE_SIZE - 1));
 
     // Write result back to where host expects it
@@ -976,38 +976,54 @@ static int parasite_cmd_leak_global_page(void *arg)
     return 0;
 }
 
+static int handle_unlock_mutex(void *arg) {
+    long addr = *(long *)arg;
 
+    int *lock_ptr = (int *)addr;
+    int *owner_ptr = lock_ptr + 2; // skip __count, reach __owner
+
+    pr_info("🔓 [parasite] Forcibly unlocking mutex at %p\n", lock_ptr);
+
+    *lock_ptr = 0;
+    *owner_ptr = 0;
+
+    return 0;
+}
 
 int parasite_daemon_cmd(int cmd, void *args)
 {
 	int ret;
 	switch (cmd) {
+	case PARASITE_CMD_UNLOCK_MUTEX:
+		pr_debug("Parasite: unlocking mutex\n");
+        ret = handle_unlock_mutex(args);
+        break;
 	case PARASITE_CMD_LEAK_GLOBAL_PAGE:
-		pr_info("Parasite: leaking global page\n");
+		pr_debug("Parasite: leaking global page\n");
 		ret = parasite_cmd_leak_global_page(args);
     	break; 
 	case PARASITE_CMD_REMAP_ANON:
-		pr_info("Parasite: remapping shared page with anon \n");
+		pr_debug("Parasite: remapping shared page with anon \n");
 		ret = parasite_cmd_remap_preserve(args);
     	break;
 	case PARASITE_CMD_INVALIDATE_PAGE:
-		pr_info("Parasite: invalidate page for have pagefaults on pages \n");
+		pr_debug("Parasite: invalidate page for have pagefaults on pages \n");
 		ret = parasite_cmd_invalidate_page(args); 
 		break;
 	case PARASITE_CMD_TEST_PRINT:
-		pr_info("DSM parasite received test print command\n");
+		pr_debug("DSM parasite received test print command\n");
 		ret = 0;
 		break;
 	case PARASITE_CMD_DUMP_SINGLE:
-		pr_warn("---dump_single\n");
+		pr_debug("---dump_single\n");
 		ret = dump_single_page(args);
 		break;
 	case PARASITE_CMD_STEAL_UFFD:
-		pr_warn("---steal_uffd\n");
+		pr_debug("---steal_uffd\n");
 		ret = createAndSendUFFD();
 		break;
 	case PARASITE_CMD_RUN_MADVISE:
-		pr_warn("---run madvise\n");
+		pr_debug("---run madvise\n");
 		ret = runMadvise(args);
 		break;
 	case PARASITE_CMD_DUMPPAGES:
