@@ -459,11 +459,11 @@ static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_in
 
 	if (sk_len == sizeof(addr.sun_family)) {
 		if (bind(ssock, (struct sockaddr *)&args->h_addr, args->h_addr_len) < 0) {
-			printf("Socket:%d\n", ssock);
+			pr_info("Socket:%d\n", ssock);
 			pr_perror("Can't bind socket");
 			goto err;
 		}
-		printf("Socket:%d\n", ssock);
+		pr_info("Socket:%d\n", ssock);
 
 
 		if (listen(ssock, 1)) {
