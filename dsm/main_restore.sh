@@ -1,13 +1,27 @@
-#node_id=$1
+#!/bin/bash
 
-cd ~/demo/images
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "Usage: $0 <app name> <number of thread> [--verbose]"
+  exit 1
+fi
 
-python3 ~/criu/dsm/thread_filter.py 0;
+app=$1
+threads=$2
+verbose_flag=""
+
+if [ "$3" == "--verbose" ]; then
+  verbose_flag="-v"
+fi
+
+cd ~/${app}/images || { echo "Image directory not found"; exit 1; }
+
+# Apply the thread filter
+python3 ~/criu/dsm/thread_filter.py "$threads" > /dev/null 2>&1
+
+# Remove previous PID file
 rm -f /tmp/criu-restored.pid
 
-echo "Images changed"
 
-cd ~/demo/images
-sudo ~/criu/criu/criu restore -v --shell-job --dsm_server
-
-
+# Restore using CRIU
+touch /tmp/.restore_flag
+sudo ~/criu/criu/criu restore --shell-job --dsm_server $verbose_flag

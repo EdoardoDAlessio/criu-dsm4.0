@@ -1,24 +1,25 @@
+#!/bin/bash
 
-
-if [ "$#" -ne 2 ]; then
-  echo "Invalid number of arguments. Expected $0 <app name> <client host name>"
+if [ "$#" -ne 3 ]; then
+  echo "Usage: $0 <app name> <client host name> <number of threads>"
   exit 1
 fi
 
 app=$1
 client=$2
+threads=$3
 
+# Ensure the directory exists
+mkdir -p ~/${app}/images
+cp ~/criu/dsm/${app} ~/${app}
 cd ~/${app}
-sudo ./${app} 2 &
+# Run the application with the specified number of threads
+sudo ./${app} "$threads" &
 sleep 3
 
-#sudo kill -9 $(pidof sh /root/criu/dsm/dump.sh dsm_write dsm_client) ;
-#sudo kill -9 $(pidof cat /tmp/pipe_scp) ;
+# Dump the running process
+sudo ~/criu/criu/criu dump -t "$(pidof $app)" --images-dir ~/${app}/images --shell-job -v 
 
-#rm -rf ~/${app}/images
-#mkdir ~/${app}/images
-
-sudo ~/criu/criu/criu  dump -t `pidof $app` --images-dir  ~/${app}/images --shell-job -v #vv -o dump_log.txt
-
-scp -r ~/${app} dsm_client:~/
- 
+# Copy the entire app directory to the client machine after cleaning old imgages
+ssh ${client} "rm -rf ~/${app}"
+scp -r ~/${app} ${client}:~/
