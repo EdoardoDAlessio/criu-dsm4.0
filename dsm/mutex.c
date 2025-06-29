@@ -8,14 +8,21 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Function run by the thread
 void *thread_func(void *arg) {
-    int tid = *((int *)arg);
+    int tid = *((int *)arg), i;
 
     while (1) {
+        i = 0;
         pthread_mutex_lock(&mutex);
-        //global++;
-        printf("Doing nothing\n");
+        //global++; 
+
         //printf("Global variable at address: %p\n", (void *)&global);
-        //printf("Thread[%d] incremented global to %d\n", tid, global);
+        //printf("Thread[0] incremented global to %d\n", global);
+        while( i < 11 ){
+            sleep(1);
+            printf("Simulating work inside mutex THREAD, i from 0 to 10, i:%d\n", i);
+            i++;
+        }
+        
         pthread_mutex_unlock(&mutex);
 
         sleep(1); // Simulate some work
@@ -26,7 +33,7 @@ void *thread_func(void *arg) {
 
 int main() {
     pthread_t thread;
-    int thread_id = 1;
+    int thread_id = 1, i;
     printf("Global variable at address: %p\n", (void *)&global);
 
     // Create the thread
@@ -34,11 +41,18 @@ int main() {
 
     // Main thread also modifies the global variable
     while (1) {
+        i = 0;
         pthread_mutex_lock(&mutex);
-        global++; 
+        //global++; 
 
-        printf("Global variable at address: %p\n", (void *)&global);
-        printf("Thread[0] incremented global to %d\n", global);
+        //printf("Global variable at address: %p\n", (void *)&global);
+        //printf("Thread[0] incremented global to %d\n", global);
+        while( i < 11 ){
+            sleep(1);
+            printf("Simulating work inside mutex MAIN, i from 0 to 10, i:%d\n", i);
+            i++;
+        }
+        
         pthread_mutex_unlock(&mutex);
 
         sleep(1); // Simulate some work

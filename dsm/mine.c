@@ -6,9 +6,9 @@
 int global = 0;  // Shared global variable
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Function run by the thread
 void *thread_func(void *arg) {
     int tid = *((int *)arg);
+    free(arg);  // Free the dynamically allocated memory
 
     while (1) {
         pthread_mutex_lock(&mutex);
@@ -24,15 +24,32 @@ void *thread_func(void *arg) {
     return NULL;
 }
 
-int main() {
-    pthread_t thread;
-    int thread_id = 1;
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <number_of_threads>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    int num_threads = atoi(argv[1]) - 1;
+    if (num_threads < 1) {
+        fprintf(stderr, "Please specify a positive number of threads.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    pthread_t threads[num_threads];
+
     printf("Global variable at address: %p\n", (void *)&global);
 
-    // Create the thread
-    pthread_create(&thread, NULL, thread_func, &thread_id);
+    for (int i = 0; i < num_threads; i++) {
+        int *tid = malloc(sizeof(int));
+        *tid = i + 1;
+        if (pthread_create(&threads[i], NULL, thread_func, tid) != 0) {
+            perror("Failed to create thread");
+            exit(EXIT_FAILURE);
+        }
+    }
 
-    // Main thread also modifies the global variable
+    // Main thread behaves as thread[0]
     while (1) {
         pthread_mutex_lock(&mutex);
         global++; 
@@ -44,6 +61,10 @@ int main() {
         sleep(1); // Simulate some work
     }
 
-    pthread_join(thread, NULL);
+    // Not reached, but included for completeness
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
     return 0;
 }
