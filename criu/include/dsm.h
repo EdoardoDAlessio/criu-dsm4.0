@@ -14,12 +14,19 @@
 #define NUM_THREADS 1
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
-#define ENABLE_LOGGING 1
 
+#define DBG 0
+#define COMMAND_LOOP 1 
+#define COMMAND_THREAD 1 & COMMAND_LOOP
+#define ENABLE_SERVER 1
+
+#define ENABLE_LOGGING 0
+#define DEMO 0
 #if ENABLE_LOGGING
 #define PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
-#define PRINT(...) do {} while (0)
+#include "log.h"
+#define PRINT(...) pr_info(__VA_ARGS__)
 #endif
 
 #define MAX_PAGE_COUNT 100000
@@ -45,11 +52,11 @@ enum msg_type {
 };
 
 
-enum page_status {
+typedef enum {
+    SHARED,
     MODIFIED,
-    SHARED, 
     INVALID,
-};
+} page_status;
 
 /****************** Structs ******************/
 
@@ -86,7 +93,7 @@ extern int total_pages;
 /****************** Function Declarations ******************/
 
 //vma setup
-void register_and_write_protect_coalesced(int uffd);
+void register_and_write_protect_coalesced(int uffd, page_status);
 void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list);
 struct vma_area *vma_area_alloc(void);
 void print_vm_area_list(struct vm_area_list *list);
@@ -111,6 +118,10 @@ unsigned long leakGlobalPage(int restored_pid, unsigned long offset);
 int replaceGlobalWithAnonPage(int restored_pid, void *addr);
 int print_global_value_from_page(void *page_buf, size_t page_len) ;
 int send_get_page(struct msg_info dsm_msg, int fd_handler, void *page_out);
+void print_mutex(const unsigned char *page_data, size_t offset);
+int change_mutex_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
+int test_mutex_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
+int runUnlockMutex(int restored_pid, void *mutex_addr);
 int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int runMADVISE(int restored_pid, void *addr);
 int read_invalidate(int restored_pid, void *addr);
