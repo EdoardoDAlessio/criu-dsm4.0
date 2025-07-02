@@ -208,7 +208,7 @@ void dsm_command_main_loop(int fd_command) {
 				PRINT("→ Handling SEND_INVALIDATE\n");
 				PRINT("[DSM] Sending madvise(MADV_DONTNEED) request...\n");
 
-				if (runMADVISE(restored_pid, (void *)msg.page_addr)) {
+				if (runMADVISE(restored_pid, (void *)msg.page_addr, 4096)) {
 					perror("runMADVISE command loop");
 				} else {
 					PRINT("Successfully ran madvise on page at %p\n", (void *)msg.page_addr);
@@ -326,7 +326,9 @@ void start_dsm_server(void)
 	register_page( uffd, (void *) aligned );
 	//enable_wp( uffd, (void *) aligned );
 #else
-	register_and_write_protect_coalesced(uffd, MODIFIED);
+	register_and_write_protect_coalesced(restored_pid, uffd, MODIFIED);
+	//replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
+	//register_page( uffd, (void *) aligned );
 #endif
 
 	//Creating pipes 

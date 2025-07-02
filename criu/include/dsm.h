@@ -15,7 +15,7 @@
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
 
-#define DBG 0
+#define DBG 1
 #define COMMAND_LOOP 1 
 #define COMMAND_THREAD 1 & COMMAND_LOOP
 #define ENABLE_SERVER 1
@@ -93,7 +93,7 @@ extern int total_pages;
 /****************** Function Declarations ******************/
 
 //vma setup
-void register_and_write_protect_coalesced(int uffd, page_status);
+void register_and_write_protect_coalesced(int restored_pid, int uffd, page_status);
 void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list);
 struct vma_area *vma_area_alloc(void);
 void print_vm_area_list(struct vm_area_list *list);
@@ -122,8 +122,9 @@ void print_mutex(const unsigned char *page_data, size_t offset);
 int change_mutex_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int test_mutex_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int runUnlockMutex(int restored_pid, void *mutex_addr);
+int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
-int runMADVISE(int restored_pid, void *addr);
+int runMADVISE(int restored_pid, void *addr, size_t len);
 int read_invalidate(int restored_pid, void *addr);
 int stealUFFD(int restored_pid);
 int infection_test(int restored_pid);

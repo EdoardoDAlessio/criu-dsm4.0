@@ -40,6 +40,7 @@ enum {
 	
 	PARASITE_CMD_DUMP_SINGLE,
 	PARASITE_CMD_STEAL_UFFD,
+	PARASITE_CMD_RUN_MADVISE_SINGLE_PAGE,
 	PARASITE_CMD_RUN_MADVISE,
 	PARASITE_CMD_TEST_PRINT,
 	PARASITE_CMD_INVALIDATE_PAGE,
@@ -48,6 +49,11 @@ enum {
 	PARASITE_CMD_UNLOCK_MUTEX,
 
 	PARASITE_CMD_MAX,
+};
+
+struct madvise_args { //DSM Madvise
+    long addr;
+    long length;
 };
 
 struct parasite_vma_entry {

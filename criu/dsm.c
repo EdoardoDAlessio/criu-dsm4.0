@@ -189,7 +189,7 @@ void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list) {
     PRINT("✅ Total trackable pages: %d\n", total_pages);
 }
 
-void register_and_write_protect_coalesced(int uffd, page_status status) {
+void register_and_write_protect_coalesced(int restored_pid, int uffd, page_status status) {
 	int i, j;
 	struct uffdio_register uffdio_register;
 	struct uffdio_writeprotect uf_wp;
@@ -237,7 +237,8 @@ void register_and_write_protect_coalesced(int uffd, page_status status) {
             fprintf(stderr, "   at range 0x%lx - 0x%lx\n", range_start, range_start + range_len);
         }
 
-        if( status != MODIFIED ){
+        if( status == SHARED ){
+            PRINT("Registering with WP mode\n");
             // Write-protect the range
             uf_wp.range.start = range_start;
             uf_wp.range.len   = range_len;
@@ -247,10 +248,16 @@ void register_and_write_protect_coalesced(int uffd, page_status status) {
                 perror("❌ ioctl/write_protect");
                 fprintf(stderr, "   at range 0x%lx - 0x%lx\n", range_start, range_start + range_len);
             }
+        }else if (status == INVALID) {
+            if (runMADVISE(restored_pid, (void *)range_start, range_len))
+                perror("runMADVISE command loop");
+            else
+                PRINT("✅ Successfully run madvise on range at 0x%lx (%zu bytes)\n", range_start, range_len);
         }
+
        
 
-        // Set all involved pages as shared
+        // Set all involved pages as status
         for (int k = i; k < j; k++) {
             page_list_data[k].state = status;
         }
@@ -258,6 +265,7 @@ void register_and_write_protect_coalesced(int uffd, page_status status) {
         i = j;  // move to the next non-contiguous page
     }
 }
+
 
 
 void read_proc_maps(int restored_pid) {
@@ -881,11 +889,11 @@ fail:
 	return -1;
 }
 
-int runMADVISE(int restored_pid, void *addr){
+int runMADVISE(int restored_pid, void *addr, size_t len){
 	int state;
 	struct parasite_ctl *ctl;
 	struct infect_ctx *ictx;
-	long *args;
+	struct madvise_args *args;
 	(void) state;
 	(void) args;
 
@@ -907,8 +915,10 @@ int runMADVISE(int restored_pid, void *addr){
 	}
 
 	//Prepare the addr to pass
-	args = compel_parasite_args(ctl, long);
-	*args = (long)addr;
+    args = compel_parasite_args(ctl, struct madvise_args);
+	args->addr = (long)addr;
+    args->length = len;  
+
 	if (compel_rpc_call(PARASITE_CMD_RUN_MADVISE, ctl) < 0) {
 		pr_err("❌ RPC call to run MADVISE failed\n");
 		goto fail;
@@ -1157,6 +1167,80 @@ fail:
     return -1;
 }
 
+int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg) {
+    int state, p[2];
+    long *args;
+    int *page_ints;
+    unsigned char page_content[4096];
+    struct parasite_ctl *ctl;
+    struct infect_ctx *ictx;
+
+    PRINT("[DSM] Sending get page to rpc daemon (DUMP_SINGLE) request...\n");
+
+    state = compel_stop_task(restored_pid);
+    if (!(ctl = compel_prepare(restored_pid))) {
+        pr_err("❌ Compel prepare failed\n");
+        return -1;
+    }
+
+    parasite_setup_c_header(ctl);
+    ictx = compel_infect_ctx(ctl);
+    ictx->log_fd = STDERR_FILENO;
+
+    if (compel_infect(ctl, 1, sizeof(long)) < 0) {
+        xfree(ctl);
+        return -1;
+    }
+
+    // Set the page address for the parasite
+    args = compel_parasite_args(ctl, long);
+    *args = dsm_msg->page_addr;
+
+    if (pipe(p) < 0) {
+        perror("pipe");
+        return -1;
+    }
+
+    if (compel_rpc_call(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
+        fprintf(stderr, "RPC DUMP_SINGLE call failed\n");
+        goto fail_pipe;
+    }
+
+    if (compel_util_send_fd(ctl, p[1]) != 0) {
+        fprintf(stderr, "Failed to send pipe fd\n");
+        goto fail_pipe;
+    }
+
+    if (compel_rpc_sync(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
+        fprintf(stderr, "RPC DUMP_SINGLE sync failed\n");
+        goto fail_pipe;
+    }
+
+    if (read(p[0], page_content, 4096) != 4096) {
+        perror("read from parasite pipe");
+        goto fail_pipe;
+    }
+
+    // ✅ Print entire page as int[]
+    page_ints = (int *)page_content;
+    PRINT("[DSM] Dumping full 4KB page content as int array:\n");
+    for (int i = 0; i < 4096 / sizeof(int); i++) {
+        PRINT("  [%03d] = %d (0x%x)\n", i, page_ints[i], page_ints[i]);
+    }
+
+    if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
+    if (compel_cure(ctl)) pr_err("Can't cure\n");
+    if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
+
+    close(p[0]);
+    close(p[1]);
+    return 0;
+
+fail_pipe:
+    close(p[0]);
+    close(p[1]);
+    return -1;
+}
 
 
 int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg) {
@@ -1222,7 +1306,7 @@ int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg) {
     }
 
     // ✅ Extract and print the value at GLOBAL_ADDR
-    offset = global_addr - aligned;
+    offset = 0xc0;
 	if (offset >= 4096 - sizeof(int)) {
 		fprintf(stderr, "Offset out of bounds\n");
 	} else {
@@ -1376,9 +1460,9 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
     // Handle invalidation or write protection
     if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
         PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
-        if (compel_rpc_call_sync(PARASITE_CMD_RUN_MADVISE, ctl) < 0) {
+        if (compel_rpc_call_sync(PARASITE_CMD_RUN_MADVISE_SINGLE_PAGE, ctl) < 0) {
             fprintf(stderr, "❌ MADV_DONTNEED failed\n");
-        }
+        }else PRINT("Madvise to invalidate page %p\n", (void *)dsm_msg->page_addr);
     } else {
         PRINT("Message is GET_PAGE → Enable WP to SHARED\n");
         enable_wp( uffd, (void *)dsm_msg->page_addr);
@@ -1467,7 +1551,8 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 		printf("  3 = restart process (send compel cure)\n> ");
 		printf("  4 = exit\n> ");
 		printf("  5 = simple infection test\n> ");
-		printf("  6 = test vmsplice\n> ");
+		printf("  61 = test vmsplice\n> ");
+        printf("  62 = test vmsplice full page\n> ");
 
 		printf("  7 = SIMULATE GET_PAGE_DATA\n> ");
 		printf("  8 = SIMULATE GET_PAGE_DATA_AND_INVALIDATE\n> ");
@@ -1489,7 +1574,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 			enable_wp( uffd, (void *) aligned);
         } else if (choice == 1) {
 			printf("[DSM] Sending remote madvise(MADV_DONTNEED) request...\n");
-			if( runMADVISE( restored_pid, (void *) aligned) )
+			if( runMADVISE( restored_pid, (void *) aligned, 4096))
 				perror("runMADVISE command loop");
 			else
 				printf("Successfully run madvise on page at %p\n", (void *) aligned);
@@ -1509,7 +1594,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 			//Infection test
 			printf("Do infection test\n");
 			infection_test(restored_pid);			
-		}else if( choice == 6 ){
+		}else if( choice == 61 ){
 			//vmsplice test
 			printf("Do vmsplice test at %p\n", (void *)aligned);
 			//Prepare dsm_msg
@@ -1518,6 +1603,15 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 			printf("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
 			dsm_msg.msg_id = 1;
 			test_page_content(restored_pid, uffd, &dsm_msg);
+		}else if( choice == 62 ){
+			//vmsplice test
+			printf("Do vmsplice test at %p\n", (void *)aligned);
+			//Prepare dsm_msg
+			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
+			dsm_msg.page_addr = aligned;
+			printf("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
+			dsm_msg.msg_id = 1;
+			test_full_page_content(restored_pid, uffd, &dsm_msg);
 		}else if (choice == 7) {
 			// SIMULATE GET_PAGE_DATA
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA;

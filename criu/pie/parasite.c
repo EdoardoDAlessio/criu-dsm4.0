@@ -76,7 +76,7 @@ int parasite_cmd_invalidate_page(void *args) {
 }
 
 
-static int runMadvise(void *args) {
+static int run_madvise_single_page(void *args) {
     long addr = *(long *)args;
     long ret;
 
@@ -93,6 +93,22 @@ static int runMadvise(void *args) {
 
     return 0;
 }
+static int runMadvise(void *args) {
+    struct madvise_args *margs = args;
+    long ret;
+
+    pr_info("madvise at 0x%lx for %ld bytes\n", margs->addr, margs->length);
+
+    ret = sys_madvise(margs->addr, margs->length, MADV_DONTNEED);
+    if (ret < 0) {
+        pr_err("madvise failed at %lx: %ld, range:%lx\n", margs->addr, margs->length, -ret);
+    } else {
+        pr_debug("madvise succeeded at %lx\n", margs->addr);
+    }
+
+    return ret;
+}
+
 
 static int g_uffd = -1;
 static int sock = 0;
@@ -1021,6 +1037,10 @@ int parasite_daemon_cmd(int cmd, void *args)
 	case PARASITE_CMD_STEAL_UFFD:
 		pr_debug("---steal_uffd\n");
 		ret = createAndSendUFFD();
+		break;
+	case PARASITE_CMD_RUN_MADVISE_SINGLE_PAGE:
+		pr_debug("---run madvise single page\n");
+		ret = run_madvise_single_page(args);
 		break;
 	case PARASITE_CMD_RUN_MADVISE:
 		pr_debug("---run madvise\n");

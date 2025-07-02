@@ -86,7 +86,7 @@ static void *handler(void *arg) {
         PRINT("[handler] page fault at 0x%llx, page:0x%lx (flags: %llx)\n", msg.arg.pagefault.address, addr, msg.arg.pagefault.flags);
 
         if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-            PRINT("[handler] WRITE-PROTECT fault on global page\n");
+            PRINT("[handler] WRITE-PROTECT fault on page\n");
 			//When I get WP fault it means we were in SHARED so MSG_SEND_INVALIDATE 
 			// to make SERVER issue the drop page to all 
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
@@ -115,8 +115,7 @@ static void *handler(void *arg) {
 			// Now you can safely disable WP
     		disable_wp(uffd, (void *)addr);
         } else {
-			PRINT("[handler] MISSING fault on global page\n");
-
+			PRINT("[handler] MISSING fault on page. Send MSG_GET_PAGE_DATA_INVALID\n");
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
 			dsm_msg.page_addr = addr;
 			dsm_msg.page_size = PAGE_SIZE;
@@ -132,8 +131,8 @@ static void *handler(void *arg) {
 			copy.src  = (unsigned long)page_data;
 			copy.dst  = addr;
 			copy.len  = PAGE_SIZE;
-			copy.mode = UFFDIO_COPY_MODE_WP;
-
+			//copy.mode = UFFDIO_COPY_MODE_WP;
+			copy.mode = 0; 
 			if (ioctl(p->uffd, UFFDIO_COPY, &copy) == -1)
 				perror("ioctl/copy (missing)");
 
@@ -200,7 +199,7 @@ void dsm_client_main_loop(int fd_command) {
 				PRINT("→ Handling SEND_INVALIDATE\n");
 				PRINT("[DSM] Sending madvise(MADV_DONTNEED) request...\n");
 
-				if (runMADVISE(restored_pid, (void *)msg.page_addr)) {
+				if (runMADVISE(restored_pid, (void *)msg.page_addr, PAGE_SIZE)) {
 					perror("runMADVISE command loop");
 				} else {
 					PRINT("Successfully ran madvise on page at %p\n", (void *)msg.page_addr);
@@ -274,10 +273,10 @@ void start_dsm_client(const char *server_ip)
 	}
 	else PRINT("Success initialize userfaultfd API\n");
 	register_page( uffd, (void *) aligned );
-	runMADVISE(restored_pid, (void *) aligned);
+	runMADVISE(restored_pid, (void *) aligned, PAGE_SIZE);
 	//enable_wp( uffd, (void *) aligned );
 #else
-	register_and_write_protect_coalesced(uffd, INVALID);
+	register_and_write_protect_coalesced(restored_pid, uffd, INVALID);
 #endif
 	
 	//Creating pipes 
