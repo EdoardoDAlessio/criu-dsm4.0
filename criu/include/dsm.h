@@ -1,6 +1,7 @@
 #ifndef DSM_H
 #define DSM_H
 
+#include <ctype.h> //for is_digit
 #include <stddef.h>  // for size_t
 #include <stdint.h>  // for uint8_t, uint64_t
 #include <sys/types.h> // for pid_t
@@ -21,7 +22,7 @@
 #define ENABLE_SERVER 1
 
 #define ENABLE_LOGGING 0
-#define DEMO 0
+#define DEMO 1
 #if ENABLE_LOGGING
 #define PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
@@ -29,7 +30,7 @@
 #define PRINT(...) pr_info(__VA_ARGS__)
 #endif
 
-#define MAX_PAGE_COUNT 100000
+#define MAX_PAGE_COUNT 500000
 
 /****************** Global Variables (defined in dsm.c) ******************/
 
@@ -114,6 +115,8 @@ void enable_wp(int uffd, void *addr);
 void disable_wp(int uffd, void *addr);
 
 // DSM helpers
+unsigned long get_base_address(int restored_pid);
+void scan_and_prepare_coalesced_globals(unsigned long base_addr, pid_t restored_pid, int uffd, page_status status);
 unsigned long leakGlobalPage(int restored_pid, unsigned long offset);
 int replaceGlobalWithAnonPage(int restored_pid, void *addr);
 int print_global_value_from_page(void *page_buf, size_t page_len) ;

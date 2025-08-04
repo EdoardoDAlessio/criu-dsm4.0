@@ -189,11 +189,83 @@ void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list) {
     PRINT("✅ Total trackable pages: %d\n", total_pages);
 }
 
+
+void scan_and_prepare_coalesced_globals(unsigned long base_addr, pid_t restored_pid, int uffd, page_status status) {
+    FILE *fp = fopen("/tmp/readelf.txt", "r");
+    char line[512], type[32], bind[32], vis[32], name[256], symbol[128];
+    int idx, section_idx, matched;
+    unsigned long offset, start, end, aligned_start, aligned_end, size;
+    if (!fp) {
+        perror("fopen readelf_file /tmp/readelf.txt");
+        return;
+    }
+
+   
+    while (fgets(line, sizeof(line), fp)) {
+        
+         // Skip empty or comment lines
+        //if (strlen(line) < 10 || !isdigit(line[0])) 
+            //continue;
+
+        // Try parsing relevant fields from readelf line
+        matched = sscanf(line, "%d: %lx %lx %s %s %s %d %s", &idx, &offset, &size, type, bind, vis, &section_idx, name);
+
+
+        if (matched == 8 && strcmp(type, "OBJECT") == 0 && strcmp(bind, "GLOBAL") == 0 && strcmp(vis, "DEFAULT") == 0) {
+            
+
+            start = base_addr + offset;
+            end   = start + size;
+
+            aligned_start = start & ~(PAGE_SIZE - 1);
+            aligned_end   = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+            printf("✅ Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Aligned page start:%lx\n", name, offset, size, aligned_start);
+
+            for (unsigned long addr = aligned_start; addr < aligned_end; addr += PAGE_SIZE) {
+                // Check for duplicates in page_list_data[]
+                int already_seen = 0;
+                for (int i = 0; i < total_pages; i++) {
+                    if (page_list_data[i].saddr == addr) {
+                        already_seen = 1;
+                        break;
+                    }
+                }
+
+                if (0 & !already_seen) {
+                    replaceGlobalWithAnonPage(restored_pid, (void *) addr);
+                    register_page( uffd, (void *) addr);
+                    
+                    if( status == SHARED ) 
+                        enable_wp( uffd, (void *) addr );
+                    //else if( status == INVALID )       madvise(  );
+
+                    page_list_data[total_pages].saddr = addr;
+                    page_list_data[total_pages].owner = 0;
+                    page_list_data[total_pages].state = status;
+                    total_pages++;
+
+                    PRINT("📌 Added global page: 0x%lx (from symbol: %s)\n", addr, symbol);
+                }
+            }
+        }else {
+            PRINT("⛔ Skipping line: %s", line);  // Optional: for debugging
+        }
+
+
+      
+    }
+
+    fclose(fp);
+}
+
+
+
 void register_and_write_protect_coalesced(int restored_pid, int uffd, page_status status) {
 	int i, j;
 	struct uffdio_register uffdio_register;
 	struct uffdio_writeprotect uf_wp;
-    struct uffdio_api uffdio_api = {
+    /*struct uffdio_api uffdio_api = {
         .api = UFFD_API,
         .features = UFFD_FEATURE_PAGEFAULT_FLAG_WP
     };
@@ -206,7 +278,7 @@ void register_and_write_protect_coalesced(int restored_pid, int uffd, page_statu
     if (uffdio_api.api != UFFD_API) {
         fprintf(stderr, "❌ unsupported userfaultfd api\n");
         exit(EXIT_FAILURE);
-    }
+    }*/
 
     i = 0;
     while (i < total_pages) {
@@ -264,6 +336,31 @@ void register_and_write_protect_coalesced(int restored_pid, int uffd, page_statu
 
         i = j;  // move to the next non-contiguous page
     }
+}
+unsigned long get_base_address(int restored_pid) {
+    char path[64], line[512];
+    FILE *fp;
+    unsigned long start;
+
+    snprintf(path, sizeof(path), "/proc/%d/maps", restored_pid);
+
+    fp = fopen(path, "r");
+    if (!fp) {
+        perror("Failed to open /proc/<pid>/maps");
+        return 0;
+    }
+
+    // Just read the first line and parse the starting address
+    if (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%lx-", &start) == 1) {
+            fclose(fp);
+            return start;
+        }
+    }
+
+    fclose(fp);
+    fprintf(stderr, "⚠️ Could not read base address from maps\n");
+    return 0;
 }
 
 
@@ -1553,7 +1650,8 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 		printf("  5 = simple infection test\n> ");
 		printf("  61 = test vmsplice\n> ");
         printf("  62 = test vmsplice full page\n> ");
-
+        printf("  63 = Full page dump test (interactive)\n> ");
+        printf("  64 = all pages registered\n> ");
 		printf("  7 = SIMULATE GET_PAGE_DATA\n> ");
 		printf("  8 = SIMULATE GET_PAGE_DATA_AND_INVALIDATE\n> ");
 		printf("  9 = SIMULATE INVALIDATE\n> ");
@@ -1612,7 +1710,31 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 			printf("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
 			dsm_msg.msg_id = 1;
 			test_full_page_content(restored_pid, uffd, &dsm_msg);
-		}else if (choice == 7) {
+		}else if( choice == 63 ){
+            // Full page dump test (interactive)
+            unsigned long input_addr;
+            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            fflush(stdout);
+            if (scanf("%lx", &input_addr) != 1) {
+                fprintf(stderr, "❌ Invalid input\n");
+                kill_and_exit(restored_pid);
+            }printf("[DSM] Address entered: %lx \n",input_addr );
+
+            // Prepare dsm_msg
+            dsm_msg.msg_type = MSG_SEND_INVALIDATE;  // or anything suitable
+            dsm_msg.page_addr = input_addr;
+            dsm_msg.msg_id = 1;
+
+            printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
+
+            test_full_page_content(restored_pid, uffd, &dsm_msg);
+        }else if( choice == 64 ){
+            // ✅ Now list all registered pages
+            printf("\n📋 Registered pages in page_list_data:\n");
+            for (int i = 0; i < total_pages; ++i) {
+                printf("  [%03d] %p\n", i, (void *)page_list_data[i].saddr);
+            }
+        }else if (choice == 7) {
 			// SIMULATE GET_PAGE_DATA
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA;
 			dsm_msg.page_addr = aligned;  // or any test address

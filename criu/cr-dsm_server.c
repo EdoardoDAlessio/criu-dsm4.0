@@ -258,6 +258,7 @@ void start_dsm_server(void)
 	struct dsm_connection conn[NUM_THREADS];
 	pthread_t uffd_thread;
 	struct thread_param param;
+	unsigned long base_address;
 	
     
 #if COMMAND_THREAD
@@ -317,13 +318,17 @@ void start_dsm_server(void)
 	uffd = stealUFFD(restored_pid);
 	
 #if DEMO
-	replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
+	//replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
 		exit(EXIT_FAILURE);
 	}
 	else PRINT("Success initialize userfaultfd API\n");
-	register_page( uffd, (void *) aligned );
+	base_address = get_base_address(restored_pid);
+	printf("Calling scan_and_prepare_coalesced_globals with base address:%lx\n", base_address);
+	scan_and_prepare_coalesced_globals(base_address, restored_pid, uffd, MODIFIED);
+
+	//register_page( uffd, (void *) aligned );
 	//enable_wp( uffd, (void *) aligned );
 #else
 	register_and_write_protect_coalesced(restored_pid, uffd, MODIFIED);
@@ -377,7 +382,7 @@ void start_dsm_server(void)
 	#endif
 #elif COMMAND_LOOP
 	PRINT("[DSM Server] Connections established. Entering command loop\n");
-	command_loop(restored_pid, uffd, &conn);
+	command_loop(restored_pid, uffd, &conn[0]);
 #elif ENABLE_SERVER
 	PRINT("[DSM Server] Connections established. Entering main loop...\n");
     dsm_command_main_loop(conn[0].fd_command);
