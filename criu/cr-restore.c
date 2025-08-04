@@ -2277,6 +2277,7 @@ skip_ns_bouncing:
 		pr_err("Post-resume script ret code %d\n", ret);
 
 	if (!opts.restore_detach && !opts.exec_cmd && (!opts.is_dsm_server && !opts.dsm_server_ip) ) {
+		pr_info("Reap zombies\n");
 		reap_zombies();
 	}
 
