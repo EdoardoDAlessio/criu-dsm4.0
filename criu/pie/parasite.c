@@ -144,6 +144,27 @@ static int createAndSendUFFD(void) {
 	return ret;
 }
 
+static int write_single_page( void *args){
+	unsigned long target_addr = (unsigned long) args;
+    int pipe_fd, tsock, ret;
+    //unsigned char page_buffer[4096];
+    tsock = parasite_get_rpc_sock();
+	pipe_fd = recv_fd(tsock);
+
+	pr_debug("args = %p, deref = %p\n", args, *(void **)args);
+
+	if (pipe_fd < 0) {
+		return -1;
+	}
+		
+	// Read directly into target memory location
+	ret = sys_read(pipe_fd, (void*)target_addr, 4096);
+	
+	sys_close(pipe_fd);
+	return (ret == 4096) ? 0 : -1;
+    
+}
+
 static int dump_single_page(void *args){
 
 	int p, ret, tsock;
@@ -944,6 +965,9 @@ void parasite_cleanup(void)
 		mprotect_vmas(mprotect_args);
 	}
 }
+
+#if 1
+
 static int parasite_cmd_remap_preserve(void *args_raw) {
     long addr = *(long *)args_raw;
     void *buf, *res;
@@ -973,6 +997,61 @@ static int parasite_cmd_remap_preserve(void *args_raw) {
     pr_debug("✅ Remapped page at 0x%lx and restored old data\n", addr);
     return 0;
 }
+#else
+static int parasite_cmd_remap_preserve(void *args_raw) {
+    long addr = *(long *)args_raw;
+    void *buf, *res;
+
+
+	pr_debug("parasite_cmd_remap_preserve of address:0x%lx (args_raw=%p)\n", addr, args_raw);
+    
+
+	//0. Validate address alignment and range
+    if (addr & (PAGE_SIZE - 1)) {
+        pr_err("Address 0x%lx is not page-aligned\n", addr);
+        return -1;
+    }
+
+	// Check if address is readable before copying
+    if (sys_mincore((void *)addr, PAGE_SIZE, NULL) != 0) {
+        //pr_err("Address %lx is not accessible\n", addr);
+        //return -1;
+		pr_debug("sys_mincore: determine whether pages are resident in memory, returned != 0 --> do not copy the old page \n");
+
+		// Just remap with anonymous page
+		res = (void *)sys_mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+
+		if (res == MAP_FAILED) {
+			pr_err("Failed to remap as anon\n");
+			return -1;
+		}
+		
+		pr_debug("✅ Remapped page at 0x%lx WITHOUT restoring old data\n", addr);
+
+    }else{
+		// 1. Save original content
+		buf = (void *)sys_mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (buf == MAP_FAILED) {
+			pr_err("Failed to mmap temp buffer\n");
+			return -1;
+		}
+		memcpy(buf, (void *)addr, PAGE_SIZE); // Copy from old page
+
+		// 2. Remap with anonymous page
+		res = (void *)sys_mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
+
+		if (res == MAP_FAILED) {
+			pr_err("Failed to remap as anon\n");
+			return -1;
+		}
+
+		// 3. Restore data
+		memcpy((void *)addr, buf, PAGE_SIZE);
+		pr_debug("✅ Remapped page at 0x%lx and restored old data\n", addr);
+	}  
+    return 0;
+}
+#endif
 static int parasite_cmd_leak_global_page(void *arg)
 {
     unsigned long offset = *(unsigned long *)arg;
@@ -1029,6 +1108,10 @@ int parasite_daemon_cmd(int cmd, void *args)
 	case PARASITE_CMD_TEST_PRINT:
 		pr_debug("DSM parasite received test print command\n");
 		ret = 0;
+		break;
+	case PARASITE_CMD_WRITE_SINGLE:
+		pr_debug("DSM parasite write page\n");
+		ret = write_single_page(args);
 		break;
 	case PARASITE_CMD_DUMP_SINGLE:
 		pr_debug("---dump_single\n");
