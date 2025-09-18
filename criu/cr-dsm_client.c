@@ -235,7 +235,10 @@ void start_dsm_client(const char *server_ip)
 	pthread_t uffd_thread;
 	struct thread_param param;
 	int client_pipe[2], uffd_pipe[2]; 
-
+	
+	#if DEMO
+	unsigned long base_address;
+	#endif
 
 	#if COMMAND_THREAD
 		pthread_attr_t attr;
@@ -243,7 +246,7 @@ void start_dsm_client(const char *server_ip)
 		struct command_thread_args* args;
 	#endif
 
-	
+	(void) base_address;
 	vm_area_list_init(&vmas); // CRIU macro
 
 	if (dsm_client_dual_connect(&conn, server_ip) < 0) {
@@ -251,32 +254,31 @@ void start_dsm_client(const char *server_ip)
 		exit(EXIT_FAILURE);
 	}
 
-	PRINT("Checking connection as SENDER on HANDLER\n");
+
+	/*PRINT("Checking connection as SENDER on HANDLER\n");
 	perform_struct_handshake(conn.fd_handler, conn.fd_handler, true);
 	PRINT("Checking connection as RECEIVER on HANDLER\n");
-	perform_struct_handshake(conn.fd_handler, conn.fd_handler, false);
+	perform_struct_handshake(conn.fd_handler, conn.fd_handler, false);*/
 
 	read_pid(&restored_pid);
-	read_proc_maps(restored_pid);
 
-    reconstruct_vm_area_list(restored_pid, &vmas);
-	PRINT("Aligned %p\n", (void*) aligned);
+	
 
+	//Start infection
 	uffd = stealUFFD(restored_pid);
 
-#if DEMO
-
-	replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
 		exit(EXIT_FAILURE);
 	}
 	else PRINT("Success initialize userfaultfd API\n");
-	register_page( uffd, (void *) aligned );
-	runMADVISE(restored_pid, (void *) aligned, PAGE_SIZE);
-	//enable_wp( uffd, (void *) aligned );
-#else
-	register_and_write_protect_coalesced(restored_pid, uffd, INVALID);
+
+#if !EP
+	read_proc_maps(restored_pid);
+	
+	base_address = get_base_address(restored_pid);
+	register_all(uffd, restored_pid, base_address, &vmas, DIVIDED);
+
 #endif
 	
 	//Creating pipes 

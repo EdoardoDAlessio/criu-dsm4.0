@@ -9,7 +9,6 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-
 /*COMPILE ERRORS*/
 #include "pstree.h"
 
@@ -40,7 +39,6 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 //#include "parsemap.h"
 
-
 //INFECTION
 #include "pie/parasite-blob.h"
 #include "parasite-syscall.h"
@@ -55,13 +53,57 @@ struct vm_area_list* my_vm_area_list;
 // Setup global variable address 
 extern unsigned long global_addr;
 extern unsigned long aligned;
-
+extern int total_pages;
 int restored_pid;
 int uffd;
-
+int total_threads = 2;
+int local_threads;
+//Special PTHREAD traps DSM 
+unsigned long barrier_start_address = 0;
+unsigned long barrier_end_address = 0;
 #include "dsm.h"
 
 
+#include <dirent.h>
+int get_local_thread_count(int restored_pid) {
+    char path[256];
+    int count = 0;
+    struct dirent *entry;
+    DIR *dir; 
+	PRINT("Opening /proc/%d/task", restored_pid);
+	snprintf(path, sizeof(path), "/proc/%d/task", restored_pid);
+	dir = opendir(path);
+    if (!dir) return -1;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            // skip "." and ".."
+            if (entry->d_name[0] != '.')
+                count++;
+        }
+    }
+    closedir(dir);
+    return count - 1;
+}
+
+#if 0
+int get_total_threads(void) {
+    char *env = getenv("TOTAL_THREADS");
+    if (!env) {
+        fprintf(stderr, "Error: TOTAL_THREADS not set\n");
+        return -1; // or some default value
+    }
+
+    char *endptr;
+    long val = strtol(env, &endptr, 10);
+    if (*endptr != '\0' || val <= 0) {
+        fprintf(stderr, "Error: TOTAL_THREADS has invalid value '%s'\n", env);
+        return -1;
+    }
+
+    return (int)val;
+}
+#endif
 
 #if 1
 static void *handler(void *arg) {
@@ -76,6 +118,12 @@ static void *handler(void *arg) {
 	unsigned char page_data[PAGE_SIZE] = {0}; 
 	struct uffdio_copy copy;
 	size_t n;
+	int count = total_threads;
+
+	(void) n;
+	(void) ack;
+	(void) dsm_msg;
+
     PRINT("[handler] started, uffd = %d\n", p->uffd);
 
 	sleep(5);
@@ -98,11 +146,26 @@ static void *handler(void *arg) {
         if (!(msg.event & UFFD_EVENT_PAGEFAULT)) continue;
 
         addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
-        PRINT("[handler] page fault at 0x%llx, page:0x%lx (flags: %llx)\n", msg.arg.pagefault.address, addr, msg.arg.pagefault.flags);
+        PRINT("[handler] page fault at 0x%llx, page:0x%lx (flags: %llx), thread:%d\n", msg.arg.pagefault.address, addr, msg.arg.pagefault.flags, msg.arg.pagefault.feat.ptid);
 
+		if( msg.arg.pagefault.address == barrier_start_address ){
+			count--;
+			PRINT("[handler] pthread_barrier page hit, count: %d\n", count);
+			//now we need to make that thread wait until all LOCAL and REMOTE threads
+			if( count ){
+				PRINT("Waiting for %d total threads\n", total_threads);
+			}else{
+				PRINT("We're the last thread! Release all\n");
+			}
+			
+			continue;
+		}
+		if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
+            //PRINT("[handler] WRITE-PROTECT fault on global page\n");
 
-        if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-            PRINT("[handler] WRITE-PROTECT fault on global page\n");
+			//check if page is tracked and who's the owner
+
+			#if ENABLE_SERVER
 			//When I get WP fault it means we were in SHARED so MSG_SEND_INVALIDATE 
 			// to make SERVER issue the drop page to all 
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
@@ -127,12 +190,14 @@ static void *handler(void *arg) {
 				return NULL;
 			}
 			PRINT("[CLIENT] Received MSG_INVALIDATE_ACK on INVALIDATION\n");
+			#endif
 
 			// Now you can safely disable WP
     		disable_wp(uffd, (void *)addr);
         } else {
 			PRINT("[handler] MISSING fault on tracked page\n");
 
+			#if ENABLE_SERVER
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
 			dsm_msg.page_addr = addr;
 			dsm_msg.page_size = PAGE_SIZE;
@@ -144,10 +209,17 @@ static void *handler(void *arg) {
 				fprintf(stderr, "[handler] Failed to fetch page from remote\n");
 				continue;
 			}
+			#else //meaning we are in debug mode without the client
+			// Create a zero page for missing fault
+			memset(page_data, 0, PAGE_SIZE);
+			PRINT("[handler] Creating zero page for missing fault (debug mode)\n");
+			#endif
 			copy.src  = (unsigned long)page_data;
 			copy.dst  = addr;
 			copy.len  = PAGE_SIZE;
 			copy.mode = UFFDIO_COPY_MODE_WP;
+
+
 
 			if (ioctl(p->uffd, UFFDIO_COPY, &copy) == -1)
 				perror("ioctl/copy (missing)");
@@ -254,12 +326,12 @@ void start_dsm_server(void)
 {
 	struct vm_area_list vmas = { .nr = 0};
 	int server_fd=0, client_fd=0;
-	int bin, i;
+	int bin, i, num_pages;
 	struct dsm_connection conn[NUM_THREADS];
 	pthread_t uffd_thread;
 	struct thread_param param;
 	unsigned long base_address;
-	
+	size_t page_size;
     
 #if COMMAND_THREAD
 
@@ -273,6 +345,13 @@ void start_dsm_server(void)
 	// server writes server_pipe[1], reads from uffd_pipe[0]
 	// uffd writes uffd_pipe[1], reads from server_pipe[0]
 
+	FILE *f = fopen("/tmp/dsm_barrier_pages.txt", "r");
+    if (!f) {
+        perror("fopen");
+        return;
+    }
+
+	(void) base_address;
 	(void) page;
 	(void) custom_fd_remote; //avoiding unused variable warning WERROR
 	(void) custom_fd_local; //avoiding unused variable warning WERROR
@@ -296,45 +375,49 @@ void start_dsm_server(void)
 		}
 		param.fd_handler[i] = conn[i].fd_handler; //give the thread's fault handler the connection to all clients
 
-		PRINT("Checking connection as RECEIVER on COMMAND\n");
-		perform_struct_handshake(conn[i].fd_command, conn[i].fd_command, false);
-		PRINT("Checking connection as SENDEE on COMMAND\n");
-		perform_struct_handshake(conn[i].fd_command, conn[i].fd_command, true);
+		//PRINT("Checking connection as RECEIVER on COMMAND\n");
+		//perform_struct_handshake(conn[i].fd_handler, conn[i].fd_command, false);
+		//PRINT("Checking connection as SENDEE on COMMAND\n");
+		//perform_struct_handshake(conn[i].fd_command, conn[i].fd_command, true);
 	}
-	
-	
 #endif 
 
 	read_pid(&restored_pid);
-	
-#if VMA_REC	
-	read_proc_maps(restored_pid);
+	local_threads = get_local_thread_count(restored_pid);
+	PRINT("local threads:%d\n", local_threads );
 
-    reconstruct_vm_area_list(restored_pid, &vmas);
-    //print_vm_area_list(&vmas);
-#endif
 	//Start infection
 	uffd = 0;
 	uffd = stealUFFD(restored_pid);
-	
-#if DEMO
-	//replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
+
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
 		exit(EXIT_FAILURE);
 	}
 	else PRINT("Success initialize userfaultfd API\n");
-	base_address = get_base_address(restored_pid);
-	printf("Calling scan_and_prepare_coalesced_globals with base address:%lx\n", base_address);
-	scan_and_prepare_coalesced_globals(base_address, restored_pid, uffd, MODIFIED);
 
-	//register_page( uffd, (void *) aligned );
-	//enable_wp( uffd, (void *) aligned );
-#else
-	register_and_write_protect_coalesced(restored_pid, uffd, MODIFIED);
-	//replaceGlobalWithAnonPage(restored_pid, (void *) aligned);
-	//register_page( uffd, (void *) aligned );
+
+#if VMA_REC	&& !EP
+	read_proc_maps(restored_pid);
+	
+	base_address = get_base_address(restored_pid);
+	register_all(uffd, restored_pid, base_address, &vmas, DIVIDED);
 #endif
+	
+	//pthread_barrier_wait_address = register_special_pages();
+
+	
+    if (fscanf(f, "base=%lx page_size=%zu num_pages=%d", &barrier_start_address, &page_size, &num_pages) != 3) {
+        fprintf(stderr, "[dsm] failed to parse barrier info file\n");
+    }
+    fclose(f);
+
+	
+	barrier_end_address = barrier_start_address + page_size * num_pages;
+	printf("start addr:%lx, end:%lx\n", barrier_start_address, barrier_end_address);
+
+	//register_page(uffd, (void*) pthread_barrier_wait_address);
+	//enable_wp(uffd, (void*) pthread_barrier_wait_address);  
 
 	//Creating pipes 
 	if (pipe(server_pipe) == -1 || pipe(uffd_pipe) == -1) {
@@ -366,7 +449,7 @@ void start_dsm_server(void)
 
 
 	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	//pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
 	if (pthread_create(&command_thread, &attr, command_thread_func_server, args) != 0) {
 		perror("pthread_create (command loop)");
