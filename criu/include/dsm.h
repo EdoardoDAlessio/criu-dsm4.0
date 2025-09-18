@@ -1,7 +1,6 @@
 #ifndef DSM_H
 #define DSM_H
 
-#include <ctype.h> //for is_digit
 #include <stddef.h>  // for size_t
 #include <stdint.h>  // for uint8_t, uint64_t
 #include <sys/types.h> // for pid_t
@@ -18,8 +17,9 @@
 
 #define DBG 1
 #define COMMAND_LOOP 1 
-#define COMMAND_THREAD 1 & COMMAND_LOOP
-#define ENABLE_SERVER 1
+#define ENABLE_SERVER 0
+#define COMMAND_THREAD ENABLE_SERVER & COMMAND_LOOP
+#define EP 1
 
 #define ENABLE_LOGGING 0
 #define DEMO 1
@@ -30,12 +30,14 @@
 #define PRINT(...) pr_info(__VA_ARGS__)
 #endif
 
-#define MAX_PAGE_COUNT 500000
+#define MAX_PAGE_COUNT 100000 //general pages
+#define MAX_PAGES 100 //malloc pages
 
 /****************** Global Variables (defined in dsm.c) ******************/
 
 extern unsigned long global_addr;
 extern unsigned long aligned;
+extern int total_pages;
 
 /****************** Enums ******************/
 
@@ -57,6 +59,7 @@ typedef enum {
     SHARED,
     MODIFIED,
     INVALID,
+	DIVIDED,
 } page_status;
 
 /****************** Structs ******************/
@@ -84,7 +87,17 @@ struct page_list {
     unsigned long saddr;
     int owner;
     int state;
+	int page_numbers; //if you have a continuous range, each page will tell how many pages are toghether
+	int index_of_allocs; // != 0 if it's from malloc, the value gives the index of PageAlloc in allocs array
 };
+
+typedef struct {
+    uintptr_t aligned_addr;
+    uintptr_t addr;
+    size_t npages;
+    char symbol_name[32];
+} PageAlloc;
+
 
 /****************** Extern Variables ******************/
 
@@ -94,8 +107,12 @@ extern int total_pages;
 /****************** Function Declarations ******************/
 
 //vma setup
+unsigned long register_special_pages(void);
+void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm_area_list *list, page_status status);
+unsigned long get_base_address(int restored_pid);
+void scan_and_prepare_coalesced_globals(unsigned long base_addr, pid_t restored_pid, int uffd, page_status status);
 void register_and_write_protect_coalesced(int restored_pid, int uffd, page_status);
-void reconstruct_vm_area_list(int restored_pid, struct vm_area_list *list);
+void reconstruct_vm_area_list(int uffd, int restored_pid, struct vm_area_list *list, page_status status);
 struct vma_area *vma_area_alloc(void);
 void print_vm_area_list(struct vm_area_list *list);
 void read_proc_maps(int restored_pid);
@@ -111,12 +128,11 @@ int perform_struct_handshake(int send_fd, int recv_fd, bool is_sender);
 // userfaultfd setup
 int init_userfaultfd_api(int uffd);
 void register_page(int uffd, void *addr);
+int register_region_with_uffd(int uffd, void *addr, size_t length);
 void enable_wp(int uffd, void *addr);
 void disable_wp(int uffd, void *addr);
 
 // DSM helpers
-unsigned long get_base_address(int restored_pid);
-void scan_and_prepare_coalesced_globals(unsigned long base_addr, pid_t restored_pid, int uffd, page_status status);
 unsigned long leakGlobalPage(int restored_pid, unsigned long offset);
 int replaceGlobalWithAnonPage(int restored_pid, void *addr);
 int print_global_value_from_page(void *page_buf, size_t page_len) ;
@@ -125,7 +141,7 @@ void print_mutex(const unsigned char *page_data, size_t offset);
 int change_mutex_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int test_mutex_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int runUnlockMutex(int restored_pid, void *mutex_addr);
-int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
+int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg, int print_int);
 int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int runMADVISE(int restored_pid, void *addr, size_t len);
 int read_invalidate(int restored_pid, void *addr);
@@ -140,4 +156,11 @@ void send_sigstop(int pid);
 void kill_and_exit(int pid);
 
 void command_loop(int restored_pid, int uffd, struct dsm_connection* conn);
+
+//DSM Testing functions
+int dsm_test_handle_page_fault(int restored_pid, int uffd, unsigned long fault_addr, int is_write);
+int dsm_test_init(int restored_pid);
+void dsm_test_finalize(void);
+void dsm_test_generate_report(void);
+int dsm_test_mode_controller(int restored_pid, int uffd);
 #endif // DSM_H
