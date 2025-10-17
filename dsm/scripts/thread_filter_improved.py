@@ -25,7 +25,10 @@ if TARGET_THREAD >= len(threads_list):
     print(f"   Valid range: 0 to {len(threads_list) - 1}")
     sys.exit(1)
 
-# No restriction on thread selection - any index is allowed
+if TARGET_THREAD == 0:
+    print("❌ Error: Cannot select main thread (index 0) as target")
+    print("   Please select a worker thread (index 1 or higher)")
+    sys.exit(1)
 
 # Create new list with only main thread
 new_list = []
@@ -59,36 +62,28 @@ except Exception as e:
     print(f"  ❌ Error loading main thread core: {e}")
     sys.exit(1)
 
-# Handle target thread processing
-if TARGET_THREAD == 0:
-    # Main thread selected - no TC replacement needed
-    print(f"  ✅ Main thread selected - using original core-{MAIN_PID}.img as-is")
-else:
-    # Worker thread selected - load it and replace TC values
-    try:
-        with open(f'core-{TARGET_TID}.img', 'rb') as f:
-            core_thread_object = pycriu.images.load(f)
-        print(f"  ✅ Loaded target thread core-{TARGET_TID}.img")
-    except Exception as e:
-        print(f"  ❌ Error loading target thread core: {e}")
-        sys.exit(1)
+# Load target thread's core image
+try:
+    with open(f'core-{TARGET_TID}.img', 'rb') as f:
+        core_thread_object = pycriu.images.load(f)
+    print(f"  ✅ Loaded target thread core-{TARGET_TID}.img")
+except Exception as e:
+    print(f"  ❌ Error loading target thread core: {e}")
+    sys.exit(1)
 
-    # Replace TC values with main thread's TC
-    core_thread_object['entries'][0]['tc'] = tc_object
+# Replace TC values with main thread's TC
+core_thread_object['entries'][0]['tc'] = tc_object
 
-    # Save modified core image (overwrites main core with target thread + main TC)
-    try:
-        with open(f'core-{MAIN_PID}.img', 'wb') as f:
-            pycriu.images.dump(core_thread_object, f)
-        print(f"  ✅ Updated core-{MAIN_PID}.img with target thread data + main TC")
-    except Exception as e:
-        print(f"  ❌ Error saving modified core: {e}")
-        sys.exit(1)
+# Save modified core image (overwrites main core with target thread + main TC)
+try:
+    with open(f'core-{MAIN_PID}.img', 'wb') as f:
+        pycriu.images.dump(core_thread_object, f)
+    print(f"  ✅ Updated core-{MAIN_PID}.img with target thread data + main TC")
+except Exception as e:
+    print(f"  ❌ Error saving modified core: {e}")
+    sys.exit(1)
 
 print(f"\n✅ Thread filtering complete!")
-print(f"   - Selected thread {TARGET_THREAD} (TID {TARGET_TID}) as the target thread")
+print(f"   - Selected thread {TARGET_THREAD} (TID {TARGET_TID}) as the single worker thread")
 print(f"   - Updated pstree.img to contain only main thread")
-if TARGET_THREAD == 0:
-    print(f"   - Main thread selected - kept original core data")
-else:
-    print(f"   - Replaced main core with selected thread data + main thread TC values")
+print(f"   - Replaced main core with selected thread data + main thread TC values")
