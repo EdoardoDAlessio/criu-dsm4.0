@@ -402,7 +402,7 @@ int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct
 {
 	int ret = -1;
 
-	pr_info("Dumping general registers for %d in %s mode\n", pid, user_regs_native(regs) ? "native" : "compat");
+	pr_debug("Dumping general registers for %d in %s mode\n", pid, user_regs_native(regs) ? "native" : "compat");
 
 	/* Did we come from a system call? */
 	if (get_signed_user_reg(regs, orig_ax) >= 0) {
@@ -429,7 +429,7 @@ int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct
 	 * thus decode it accordingly.
 	 */
 
-	pr_info("Dumping GP/FPU registers for %d\n", pid);
+	pr_debug("Dumping GP/FPU registers for %d\n", pid);
 
 	if (!compel_cpu_has_feature(X86_FEATURE_OSXSAVE)) {
 		ret = get_task_fpregs(pid, xs);

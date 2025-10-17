@@ -434,14 +434,117 @@ static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 
 	return sun_len;
 }
+#if 1
+#include <time.h>
+#include <stdint.h>
+#include <sys/un.h>
+#include <string.h>
+#include <errno.h>
 
+// Helper: get a strong-ish unique cookie (no rand())
+static uint64_t unique_cookie(void) {
+    struct timespec ts;
+	uint64_t pid;
+    uint64_t ns;
+    uint64_t self;
+	static uint64_t ctr = 0;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    // Mix pid, time, and address of this function for entropy
+    pid = (uint64_t)getpid();
+    ns  = (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 32);
+    self = (uint64_t)(uintptr_t)&unique_cookie;
+    
+    return (pid << 32) ^ ns ^ self ^ __atomic_add_fetch(&ctr, 1, __ATOMIC_RELAXED);
+}
+
+static bool is_socket_bound(int fd) {
+    struct sockaddr_un addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) < 0)
+        return false;
+    // If only the family is set, there is no bound name
+    return len > sizeof(addr.sun_family);
+}
+
+static void maybe_unlink_filesystem_path(const struct sockaddr_un *sun) {
+    // For filesystem namespace sockets only (sun_path not abstract)
+    if (sun->sun_path[0] != '\0' && sun->sun_path[0] != 0) {
+        // Best-effort: remove stale entry
+        unlink(sun->sun_path);
+    }
+}
+
+int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_init_args *args)
+{
+    int ssock;
+    int attempts = 0;
+    const int max_attempts = 8;
+
+    pr_debug("Putting tsock into pid %d\n", pid);
+
+    ssock = ctl->ictx.sock;
+    if (ssock == -1) {
+        pr_err("No socket in ictx\n");
+        goto err;
+    }
+
+    // If it's already bound (from a previous infection), don't bind again.
+    if (is_socket_bound(ssock)) {
+        pr_debug("tsock fd=%d already bound; skipping bind/listen\n", ssock);
+        ctl->tsock = -ssock;  // keep existing convention
+        return 0;
+    }
+
+    // Try to bind with a unique abstract address; retry on EADDRINUSE
+    for (; attempts < max_attempts; attempts++) {
+        uint64_t cookie = unique_cookie();
+        args->h_addr_len = gen_parasite_saddr(&args->h_addr, cookie);
+
+        // Defensive cleanup for filesystem sockets (usually not used; gen_parasite_saddr
+        // typically produces an abstract address starting with '\0').
+        maybe_unlink_filesystem_path((const struct sockaddr_un *)&args->h_addr);
+
+        if (bind(ssock, (struct sockaddr *)&args->h_addr, args->h_addr_len) == 0) {
+            pr_debug("tsock bound fd=%d (attempt %d)\n", ssock, attempts + 1);
+
+            if (listen(ssock, 1) != 0) {
+                pr_perror("Can't listen on transport socket");
+                goto err;
+            }
+
+            // If you sometimes force a reconnect failure, regenerate once more
+            if (ctl->ictx.flags & INFECT_FAIL_CONNECT)
+                args->h_addr_len = gen_parasite_saddr(&args->h_addr, unique_cookie());
+
+            ctl->tsock = -ssock;  // keep the negative marker your code expects
+            return 0;
+        }
+
+        if (errno == EADDRINUSE) {
+            pr_debug("bind EADDRINUSE for tsock fd=%d, retrying with new cookie\n", ssock);
+            continue;
+        }
+
+        pr_perror("Can't bind socket");
+        goto err;
+    }
+
+    pr_err("Can't bind tsock after %d attempts (EADDRINUSE)\n", max_attempts);
+    goto err;
+
+err:
+    close_safe(&ssock);
+    return -1;
+}
+
+#else
 static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_init_args *args)
 {
 	int ssock = -1;
 	socklen_t sk_len;
 	struct sockaddr_un addr;
 
-	pr_info("Putting tsock into pid %d\n", pid);
+	pr_debug("Putting tsock into pid %d\n", pid);
 	args->h_addr_len = gen_parasite_saddr(&args->h_addr, getpid() + rand());
 
 	ssock = ctl->ictx.sock;
@@ -459,11 +562,11 @@ static int prepare_tsock(struct parasite_ctl *ctl, pid_t pid, struct parasite_in
 
 	if (sk_len == sizeof(addr.sun_family)) {
 		if (bind(ssock, (struct sockaddr *)&args->h_addr, args->h_addr_len) < 0) {
-			pr_info("Socket:%d\n", ssock);
+			pr_debug("Socket:%d\n", ssock);
 			pr_perror("Can't bind socket");
 			goto err;
 		}
-		pr_info("Socket:%d\n", ssock);
+		pr_debug("Socket:%d\n", ssock);
 
 
 		if (listen(ssock, 1)) {
@@ -486,7 +589,7 @@ err:
 	close_safe(&ssock);
 	return -1;
 }
-
+#endif
 static int setup_child_handler(struct parasite_ctl *ctl)
 {
 	struct sigaction sa = {
@@ -883,7 +986,7 @@ static int parasite_memfd_exchange(struct parasite_ctl *ctl, unsigned long size,
 	parasite_memfd_close(ctl, fd);
 	close(lfd);
 
-	pr_info("Set up parasite blob using memfd\n");
+	pr_debug("Set up parasite blob using memfd\n");
 	return 0;
 
 err_curef:
@@ -1041,7 +1144,7 @@ int compel_infect_no_daemon(struct parasite_ctl *ctl, unsigned long nr_threads, 
 	if (ret)
 		goto err;
 
-	pr_info("Putting parasite blob into %p->%p\n", ctl->local_map, ctl->remote_map);
+	pr_debug("Putting parasite blob into %p->%p\n", ctl->local_map, ctl->remote_map);
 
 	ctl->parasite_ip = (unsigned long)(ctl->remote_map + ctl->pblob.hdr.parasite_ip_off);
 	ctl->cmd = ctl->local_map + ctl->pblob.hdr.cmd_off;

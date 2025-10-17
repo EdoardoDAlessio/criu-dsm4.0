@@ -14,6 +14,7 @@ obj-y			+= clone-noasan.o
 obj-y			+= cr-check.o
 obj-y			+= cr-dedup.o
 obj-y			+= dsm.o
+obj-y			+= dsm_log.o
 obj-y			+= cr-dsm_server.o
 obj-y			+= cr-dsm_client.o
 obj-y			+= cr-dump.o

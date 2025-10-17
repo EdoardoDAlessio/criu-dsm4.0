@@ -43,14 +43,13 @@
 #include "fault-injection.h"
 #include "proc_parse.h"
 #include "kerndat.h"
-
+#include "dsm.h"
 #include "setproctitle.h"
 #include "sysctl.h"
 
 /*DSM STUFF*/
 void start_dsm_server(void);
 void start_dsm_client(const char *server_ip);
-
 void flush_early_log_to_stderr(void) __attribute__((destructor));
 
 void flush_early_log_to_stderr(void)
@@ -150,6 +149,7 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	log_set_loglevel(opts.log_level);
+	log_level = opts.log_level;
 
 	/*
 	 * There kernel might send us lethal signals in the following cases:
