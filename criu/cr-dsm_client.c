@@ -72,16 +72,19 @@ static void *handler(void *arg) {
 	unsigned char ack = 0;
 	unsigned char page_data[PAGE_SIZE] = {0}; 
 	struct uffdio_copy copy;
+	int index;
+	struct uffdio_range r;
 	size_t n;
-
+	(void) n;
     DSM_EVENT_HANDLER("[handler] started, uffd = %d\n", p->uffd);
 
-	sleep(5);
+	//sleep(5);
 	//dsm_msg.msg_type = MSG_WAKE_THREAD;
 	//send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0);
 	//printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n");
-	if(!DBG) send_sigcont(restored_pid);
-
+#if !DBG 
+send_sigcont(restored_pid);
+#endif
     while (1) {
         int pollres = poll(pollfd, 1, -1);
         if (pollres == -1) {
@@ -91,7 +94,7 @@ static void *handler(void *arg) {
 
         if (!(pollfd[0].revents & POLLIN)) continue;
 
-        if (read(p->uffd, &msg, sizeof(msg)) != sizeof(msg)) {
+        if (all_read(p->uffd, &msg, sizeof(msg)) != 0) {
             perror("read/userfaultfd");
             continue;
         }
@@ -99,106 +102,224 @@ static void *handler(void *arg) {
          if (!(msg.event & UFFD_EVENT_PAGEFAULT)) continue;
 
         addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
-        DSM_DEBUG_HANDLER("[handler] page fault at 0x%llx, page:0x%lx (flags: %llx), thread:%d\n", msg.arg.pagefault.address, addr, msg.arg.pagefault.flags, msg.arg.pagefault.feat.ptid);
+        DSM_DEBUG_HANDLER("[handler] page fault at 0x%llx, (flags: %llx), thread:%d\n", msg.arg.pagefault.address, msg.arg.pagefault.flags, msg.arg.pagefault.feat.ptid);
 
-		if( msg.arg.pagefault.address >= barrier_start_address && msg.arg.pagefault.address <= barrier_end_address){
+		if( msg.arg.pagefault.address >= barrier_start_address && msg.arg.pagefault.address < barrier_end_address){
 			
 			pthread_mutex_lock(&barrier.lock);
 
 			DSM_EVENT_HANDLER("[barrier] Local barrier hit: tid=%d page=%p", msg.arg.pagefault.feat.ptid, (void*)msg.arg.pagefault.address);
-
+			local_barrier_addr = msg.arg.pagefault.address;
 			//all local threads arrived, send the message to remote 
 			// Send BARRIER HIT
 			dsm_msg.msg_type = MSG_BARRIER_HIT;
 			dsm_msg.msg_id = 1001;
-			if (send(p->fd_handler[0 ], &dsm_msg, sizeof(dsm_msg), 0) != sizeof(dsm_msg)) {
+			dsm_msg.page_addr = msg.arg.pagefault.address;
+			if (send_all(p->fd_handler[0 ], &dsm_msg, sizeof(dsm_msg)) != 0) {
 				perror("[CLIENT] Failed to send MSG_BARRIER_HIT");
-				return NULL;
-			}
-			DSM_DEBUG_HANDLER("[CLIENT] Sent MSG_BARRIER_HIT to server\n");
+				kill_and_exit(restored_pid);
+			}else DSM_DEBUG_HANDLER("[CLIENT] Sent MSG_BARRIER_HIT to server\n");
 			
 			//and let's see if remote threads have already arrived
-			while (remote_threads_barrier_arrived == 0) {
+			if (remote_threads_barrier_arrived == 0) {
 				pthread_cond_wait(&barrier.cond, &barrier.lock);
 			}
+
+			/*Cheking if fault address match*/
+			if( remote_barrier_addr != local_barrier_addr ){
+				printf("Error!\n");
+				//kill_and_exit(restored_pid);
+			}
+
 			DSM_DEBUG_HANDLER("[CLIENT] remote threads barrier arrived\n");
 			//remote threads arrived, resolve fault and exit
 			remote_threads_barrier_arrived = 0; //reset for next barrier
-
+			pthread_cond_broadcast(&barrier.cond);
+#if 0
 			disable_wp(uffd, (void*) msg.arg.pagefault.address);
-			dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
-			if( dsm_msg.page_addr >= barrier_end_address ) dsm_msg.page_addr = barrier_start_address;
+			dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE*2;
+			if( dsm_msg.page_addr >= barrier_end_address ) dsm_msg.page_addr = barrier_start_address + dsm_msg.page_addr - barrier_end_address;
 			enable_wp(uffd, (void*) dsm_msg.page_addr );
-
+#else
+			dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
+			if( dsm_msg.page_addr >= barrier_end_address ) dsm_msg.page_addr = barrier_start_address;// + dsm_msg.page_addr - barrier_end_address;
+			enable_wp(uffd, (void*) dsm_msg.page_addr ); //enable next
+			disable_wp(uffd, (void*) msg.arg.pagefault.address); //disable current
+			
+#endif
 			pthread_mutex_unlock(&barrier.lock);
 			continue;
 		}
 
+		//pthread_mutex_lock(&pagefaults_mutex);
+
+		//Getting index in page list data
+		index = -1;
+		for (int i=0; i < total_pages; i++) {
+			unsigned long start = page_list_data[i].saddr;
+			if (addr == start ) {
+				index = i;
+				break;
+			}
+		}
+		if(index == -1 ) {
+			PRINT("[DSM] ❌ Address 0x%lx not found in page_list_data[]\n", addr);
+			continue;
+		}
 
         if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-            //PRINT("[handler] WRITE-PROTECT fault on page\n");
+            DSM_DEBUG_HANDLER("[handler] WRITE-PROTECT fault on page\n");
 			//When I get WP fault it means we were in SHARED so MSG_SEND_INVALIDATE 
 			// to make SERVER issue the drop page to all 
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
-			dsm_msg.page_addr = addr;  // or any test address
+			dsm_msg.page_addr = addr; 
 			dsm_msg.page_size = 4096;
-			dsm_msg.msg_id = 1001;
+
+			dsm_msg.msg_id = get_list_page_index(addr);
+			if( dsm_msg.msg_id < 0 ){
+				fprintf(stderr, "[handler] ERROR: page not found in list for address %lx\n", addr);
+				exit(-1);
+				//pthread_mutex_unlock(&pagefaults_mutex);
+				continue;
+			}
+			
 
 			// Send invalidate request
-			if (send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0) != sizeof(dsm_msg)) {
+			if (send_all(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg)) != 0) {
 				perror("[CLIENT] Failed to send MSG_SEND_INVALIDATE");
 				return NULL;
 			}
 			DSM_EVENT_HANDLER("[CLIENT] Sent MSG_SEND_INVALIDATE to server. With address:0x%lx\n", addr);
 
-			n = recv(p->fd_handler[0], &ack, 1, MSG_WAITALL);
-			if (n != 1) {
-				fprintf(stderr, "[CLIENT] Failed to receive ACK (got %zd bytes)\n", n);
-				return NULL;
+			switch ( all_read(p->fd_handler[0], &ack, 1) ) {
+				case -2:
+					fprintf(stderr, "[SERVER] Connection closed before ACK\n");
+					kill_and_exit(restored_pid);
+					break;
+				case -1:
+					perror("[SERVER] all_read(ACK) failed");
+					kill_and_exit(restored_pid);
+					break;
+				case 0: 
+					DSM_EVENT_HANDLER("[SERVER] Received MSG_INVALIDATE_ACK on INVALIDATION\n");
+					break;
+				default:
+					perror("Unknown value for handler all_read(ACK)\n");
+					kill_and_exit(restored_pid);
+					break;
 			}
-			if (ack != MSG_INVALIDATE_ACK) {
-				fprintf(stderr, "[CLIENT] Unexpected ACK value: 0x%x\n", ack);
-				return NULL;
-			}
-			DSM_EVENT_HANDLER("[CLIENT] Received MSG_INVALIDATE_ACK on INVALIDATION\n");
 
 			// Now you can safely disable WP
     		disable_wp(uffd, (void *)addr);
-        } else {
-
+			//update_page_info(addr, 0, MODIFIED, -2);
+			PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %d \n", addr, page_list_data[index].state, MODIFIED, index);
+			page_list_data[index].state = MODIFIED;	
+     	} else {
 			if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WRITE) {
 				DSM_EVENT_HANDLER("[handler] MISSING fault on tracked page for WRITE: %p\n", (void*)msg.arg.pagefault.address);
 				dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
 				copy.mode = 0; 
+				//update_page_info(addr, 0, MODIFIED, -2);
+				PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %d \n", addr, page_list_data[index].state, MODIFIED, index);
+				page_list_data[index].state = MODIFIED;
 			} else {
 				DSM_EVENT_HANDLER("[handler] MISSING fault on tracked page for READ: %p\n", (void*)msg.arg.pagefault.address);
 				dsm_msg.msg_type = MSG_GET_PAGE_DATA;
 				copy.mode = UFFDIO_COPY_MODE_WP;
+				//update_page_info(addr, -1, SHARED, -2);
+				PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %d \n", addr, page_list_data[index].state, SHARED, index);
+				page_list_data[index].state = SHARED;
 			}
 
-			dsm_msg.page_addr = addr;
-			dsm_msg.page_size = PAGE_SIZE;
-			dsm_msg.msg_id = 1001;
+#if ENABLE_SERVER
+			//if( ENABLE_SERVER ){
+				dsm_msg.page_addr = addr;
+				dsm_msg.page_size = PAGE_SIZE;
+				dsm_msg.msg_id = index;
+				if( dsm_msg.msg_id < 0 ){
+					fprintf(stderr, "[handler] ERROR: page not found in list for address %lx\n", addr);
+					kill_and_exit(restored_pid);
+					//pthread_mutex_unlock(&pagefaults_mutex);
+					continue;
+				}
 
-			if (send_get_page(dsm_msg, p->fd_handler[0], page_data) == 0) {
-				print_global_value_from_page(page_data, sizeof(page_data));
-			}else if (send_get_page(dsm_msg, p->fd_handler[0], page_data) < 0) {
-				fprintf(stderr, "[handler] Failed to fetch page from remote\n");
+				if (send_get_page(dsm_msg, p->fd_handler[0 ], page_data) != 0) {
+					fprintf(stderr, "[handler] Failed to fetch page from remote\n");
+					kill_and_exit(restored_pid);
+					continue;
+				}
+				copy.src  = (unsigned long)page_data;
+#else
+			//}else{ //meaning we are in debug mode without the client
+				// Create a zero page for missing fault
+				//memset(page_data, 0, PAGE_SIZE);
+				copy.src  = (unsigned long)zero_page;
+				DSM_EVENT_HANDLER("[handler] Creating zero page for MISSING PAGE FAULT on READ on an ALREADY SHARED PAGE (debug mode)\n");
+			//}
+#endif
+			// dst & len already set:
+			copy.dst = addr;
+			copy.len = PAGE_SIZE;        // or your chunk size
+			// copy.mode = UFFDIO_COPY_MODE_WP;   // if you want WP after copy
+
+			if (ioctl(p->uffd, UFFDIO_COPY, &copy) == -1) {
+				// Kernel-level failure (not the EEXIST race, that shows up in copy.copy)
+				int e = errno;
+				if (e == EEXIST) {
+					// Some kernels may surface EEXIST via errno (rare). Wake and continue.
+					r.start = addr;
+                    r.len = PAGE_SIZE;
+					(void)ioctl(p->uffd, UFFDIO_WAKE, &r);
+					DSM_DEBUG_HANDLER("[handler] UFFDIO_COPY errno==EEXIST on %p → woke waiters", (void*)addr);
+					continue;
+				}
+				perror("[handler] UFFDIO_COPY ioctl failed");
+				kill_and_exit(restored_pid);
+			}
+
+			/*
+			* On success, copy.copy is either:
+			*   + PAGE_SIZE             → full copy, normal case
+			*   + -EEXIST               → another thread already resolved; just wake & continue
+			*   + < 0 (other -errno)    → semantic error; decide policy
+			*   + otherwise             → short copy (unexpected)
+			*/
+			if (copy.copy == PAGE_SIZE) {
+				// normal — optional wake to release any co-waiters
+				r.start = addr;
+                r.len = PAGE_SIZE;
+				if (ioctl(p->uffd, UFFDIO_WAKE, &r) == -1) {
+					perror("[handler] UFFDIO_WAKE failed after copy");
+					kill_and_exit(restored_pid);
+				}
+				DSM_EVENT_HANDLER("[handler] Page copied back to missing region\n");
+			} else if (copy.copy == -EEXIST) {
+				// Raced with another handler that already copied this page
+				r.start = addr;
+            	r.len = PAGE_SIZE;
+				(void)ioctl(p->uffd, UFFDIO_WAKE, &r);  // harmless if none waiting
+				DSM_DEBUG_HANDLER("[handler] EEXIST on %p → woke waiters and skipped duplicate copy", (void*)addr);
 				continue;
+			} else if (copy.copy < 0) {
+				int e = -(int)copy.copy;
+				// You can decide to log & continue, or treat as fatal
+				fprintf(stderr, "[handler] UFFDIO_COPY semantic error %s (%d) on %lx\n",
+						strerror(e), e, addr);
+				// Optional: wake anyone waiting so they don’t hang
+				r.start = addr;
+                r.len = PAGE_SIZE;
+				(void)ioctl(p->uffd, UFFDIO_WAKE, &r);
+				kill_and_exit(restored_pid);
+			} else {
+				// Short copy – shouldn’t happen for anonymous pages
+				fprintf(stderr, "[handler] UFFDIO_COPY short copy (%lld bytes) on %lx\n",
+						(long long)copy.copy, addr);
+				kill_and_exit(restored_pid);
 			}
-
-			copy.src  = (unsigned long)page_data;
-			copy.dst  = addr;
-			copy.len  = PAGE_SIZE;
-
-			if (ioctl(p->uffd, UFFDIO_COPY, &copy) == -1)
-				perror("ioctl/copy (missing)");
-
-			DSM_EVENT_HANDLER("[handler] Page copied back to missing region\n");
 		}
+		DSM_EVENT_HANDLER("[handler] done handling fault at 0x%lx\n", addr);
 
-	
-        DSM_EVENT_HANDLER("[handler] done handling fault at 0x%lx\n", addr);
+		//pthread_mutex_unlock(&pagefaults_mutex);
     }
 
     return NULL;
@@ -247,10 +368,28 @@ void dsm_client_main_loop(int fd_command) {
         switch (msg.msg_type) {
 			case MSG_BARRIER_HIT:
                 DSM_DEBUG_CLIENT("[DSM Client] Remote barrier hit.\n");
+				#if 1
 				pthread_mutex_lock(&barrier.lock);
 				// mark that remote threads have arrived, this is useful if we come before the local threads have, 
 				//so that we don't care if the signal was lost since we can check the variable
 				remote_threads_barrier_arrived = 1; 
+				remote_barrier_addr = msg.page_addr;
+				pthread_cond_broadcast(&barrier.cond);
+				DSM_EVENT_CLIENT("[DSM Client] Remote hit barrier, releasing...\n");
+				pthread_mutex_unlock(&barrier.lock);
+				#endif
+				break;
+			case MSG_BARRIER_RELEASE:
+				DSM_DEBUG_CLIENT("[DSM Client] Remote barrier released.\n");
+				pthread_mutex_lock(&barrier.lock);
+				// mark that remote threads have arrived, this is useful if we come before the local threads have, 
+				//so that we don't care if the signal was lost since we can check the variable
+				if( remote_threads_barrier_arrived ){
+					pthread_cond_wait(&barrier.cond, &barrier.lock);
+				}
+
+				remote_threads_barrier_arrived = 1; 
+				remote_barrier_addr = msg.page_addr;
 				pthread_cond_broadcast(&barrier.cond);
 				DSM_EVENT_CLIENT("[DSM Client] Remote hit barrier, releasing...\n");
 				pthread_mutex_unlock(&barrier.lock);
@@ -262,28 +401,37 @@ void dsm_client_main_loop(int fd_command) {
 				send_sigstop(restored_pid);
 				break;
 			case MSG_GET_PAGE_DATA:
+				//pthread_mutex_lock(&pagefaults_mutex);
 				DSM_EVENT_CLIENT("→ Handling GET_PAGE_DATA\n");
                 handle_page_data_request(restored_pid, uffd, fd_command, &msg);
+				//pthread_mutex_unlock(&pagefaults_mutex);
                 break;
             case MSG_GET_PAGE_DATA_INVALID:
+				//pthread_mutex_lock(&pagefaults_mutex);
                 DSM_EVENT_CLIENT("→ Handling GET_PAGE_DATA_INVALID\n");
                 handle_page_data_request(restored_pid, uffd, fd_command, &msg);
+				//pthread_mutex_unlock(&pagefaults_mutex);
                 break;
             case MSG_SEND_INVALIDATE:
+				//pthread_mutex_lock(&pagefaults_mutex);
 				DSM_EVENT_CLIENT("→ Handling remote invalidation request. Madvise(MADV_DONTNEED) on page at %p\n", (void *)msg.page_addr);
 
 				if (runMADVISE(restored_pid, (void *)msg.page_addr, 4096)) {
 					perror("runMADVISE command loop");
+					kill_and_exit(restored_pid);
 				} else {
 					DSM_EVENT_CLIENT("Successfully ran madvise on page at %p\n", (void *)msg.page_addr);
 
 					ack = MSG_INVALIDATE_ACK;
-					if (send(fd_command, &ack, 1, 0) != 1) {
+					if (send_all(fd_command, &ack, 1) != 0) {
 						perror("send MSG_INVALIDATE_ACK");
+						kill_and_exit(restored_pid);
 					} else {
 						DSM_EVENT_CLIENT("[SERVER] Sent MSG_INVALIDATE_ACK to client.\n");
 					}
+					update_page_info(msg.page_addr, 1, INVALID, -1);
 				}
+				//pthread_mutex_unlock(&pagefaults_mutex);
 				break;
 
             case MSG_HANDSHAKE:
@@ -326,6 +474,10 @@ void start_dsm_client(const char *server_ip)
 	(void) base_address;
 
 #if 1
+	remote_threads_barrier_arrived = 0;
+	read_pid(&restored_pid);
+	dsm_log_verbosity_check();
+	init_zero_page();
 	barrier_init();
 	//pthread_create(&barrier_tid, NULL, barrier_resolver_thread, NULL);
 #endif 
@@ -334,7 +486,7 @@ void start_dsm_client(const char *server_ip)
 
 	if (dsm_client_dual_connect(&conn, server_ip) < 0) {
 		fprintf(stderr, "DSM client connection failed\n");
-		exit(EXIT_FAILURE);
+		kill_and_exit(restored_pid);
 	}
 
 
@@ -343,7 +495,6 @@ void start_dsm_client(const char *server_ip)
 	PRINT("Checking connection as RECEIVER on HANDLER\n");
 	perform_struct_handshake(conn.fd_handler, conn.fd_handler, false);*/
 
-	read_pid(&restored_pid);
 
 	
 
@@ -352,23 +503,35 @@ void start_dsm_client(const char *server_ip)
 
 	if (init_userfaultfd_api(uffd) < 0) {
 		fprintf(stderr, "Failed to initialize userfaultfd API\n");
-		exit(EXIT_FAILURE);
+		kill_and_exit(restored_pid);
 	}
 	else PRINT("Success initialize userfaultfd API\n");
 
 
 	read_proc_maps(restored_pid);
-#if !EP
+#if 0 //!EP
 	base_address = get_base_address(restored_pid);
 	register_all(uffd, restored_pid, base_address, &vmas, INVALID);
 
 #endif
 
 	if( f2 ){
+
 		while (fgets(line, sizeof(line), f2)) {
 			if (sscanf(line, "base=%lx page_size=%zu num_pages=%d", &start_address, &page_size, &num_pages) != 3) {
 				fprintf(stderr, "[dsm] failed to parse line: %s", line);
 				continue; // skip malformed line
+			}
+
+			for( int i=0; i< num_pages; i++ ){
+				unsigned long aux = start_address + i*page_size;
+				PRINT("Registering page %d at address %lx\n", i, aux);
+				page_list_data[total_pages].saddr = aux;
+				page_list_data[total_pages].owner = -1;
+				page_list_data[total_pages].state = SHARED;
+				//register_page(uffd, (void*)aux);
+				//enable_wp(uffd, (void*)aux);
+				total_pages++;
 			}
 
 			end_address = start_address + page_size * num_pages;
@@ -450,7 +613,7 @@ void start_dsm_client(const char *server_ip)
 	if(!DBG) send_sigcont(restored_pid);
 #endif
 
-
+	PRINT("Killing and exiting\n");
 	kill_and_exit(restored_pid);
 
 }
