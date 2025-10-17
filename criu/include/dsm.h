@@ -17,9 +17,9 @@
 
 #define DBG 1
 #define COMMAND_LOOP 1 
-#define ENABLE_SERVER 0
+#define ENABLE_SERVER 1
 #define COMMAND_THREAD ENABLE_SERVER & COMMAND_LOOP
-#define EP 1
+#define EP 0
 
 #define ENABLE_LOGGING 0
 #define DEMO 1
@@ -52,6 +52,8 @@ enum msg_type {
 	MSG_STOP_THREAD,
 	MSG_HANDSHAKE,
 	MSG_ACK,
+	MSG_BARRIER_HIT,
+	MSG_BARRIER_RELEASE,
 };
 
 
@@ -83,13 +85,13 @@ struct thread_param {
     int fd_handler[NUM_THREADS];
 };
 
-struct page_list {
+typedef struct {
     unsigned long saddr;
     int owner;
     int state;
 	int page_numbers; //if you have a continuous range, each page will tell how many pages are toghether
 	int index_of_allocs; // != 0 if it's from malloc, the value gives the index of PageAlloc in allocs array
-};
+} page_list ;
 
 typedef struct {
     uintptr_t aligned_addr;
@@ -99,13 +101,38 @@ typedef struct {
 } PageAlloc;
 
 
+typedef struct barrier_state {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;     // signal resolver when all arrived
+} barrier_state_t;
+
+void barrier_init(void);
 /****************** Extern Variables ******************/
-
-extern struct page_list page_list_data[MAX_PAGE_COUNT];
+extern void *zero_page;
+extern int log_level;
+extern pthread_mutex_t pagefaults_mutex;
+extern page_list page_list_data[MAX_PAGE_COUNT];
 extern int total_pages;
-
+extern unsigned long barrier_addr;
+extern unsigned long barrier_start_address;
+extern unsigned long barrier_end_address;
+extern unsigned long page_thread0;
+extern unsigned long page_thread1;
+extern unsigned long barrier_end_address;
+extern unsigned long remote_barrier_addr;
+extern unsigned long local_barrier_addr;
+extern int remote_threads_barrier_arrived;
+extern barrier_state_t barrier;
+extern pthread_mutex_t fault_lock;
+extern unsigned long active_fault_addr;
+extern int active_fault_tid;
 /****************** Function Declarations ******************/
-
+void mark_fault_start(unsigned long addr, const char *who, pid_t tid);
+void mark_fault_end(unsigned long addr, const char *who, pid_t tid);
+void init_zero_page(void);
+int get_list_page_index(unsigned long addr);
+int update_page_info(unsigned long addr, int new_owner, int new_state, int new_index);
+int interactive_page_inspect(struct msg_info *dsm_msg, int fd_handler, int mode);
 //vma setup
 unsigned long register_special_pages(void);
 void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm_area_list *list, page_status status);
@@ -129,7 +156,9 @@ int perform_struct_handshake(int send_fd, int recv_fd, bool is_sender);
 int init_userfaultfd_api(int uffd);
 void register_page(int uffd, void *addr);
 int register_region_with_uffd(int uffd, void *addr, size_t length);
-void enable_wp(int uffd, void *addr);
+void enable_region_wp( int uffd, void *addr, size_t length);
+void disable_region_wp( int uffd, void *addr, size_t length);
+int enable_wp(int uffd, void *addr);
 void disable_wp(int uffd, void *addr);
 
 // DSM helpers
@@ -148,6 +177,8 @@ int read_invalidate(int restored_pid, void *addr);
 int stealUFFD(int restored_pid);
 int infection_test(int restored_pid);
 int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg);
+ssize_t all_read(int fd, void *buf, size_t len);
+int send_all(int fd, const void *buf, size_t len);
 
 //App helpers
 void read_pid(int* restored_pid);

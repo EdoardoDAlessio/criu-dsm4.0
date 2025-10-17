@@ -21,7 +21,7 @@ struct vm_area_list* my_vm_area_list;
 /***************** END INFECTION HEADERS ************************/
 
 #include "dsm.h"
-
+#include "dsm_log.h"
 /***************** USERFAULTFD HEADERS ************************/
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -34,17 +34,39 @@ struct vm_area_list* my_vm_area_list;
 #include "page.h" //this takes the page size
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 // Setup global variable address 
-
-
+int log_level = 2; //default log level
+void *zero_page = NULL;
+unsigned long barrier_local = 0;
+unsigned long barrier_remote = 0;
+unsigned long barrier_start_address = 0;
+unsigned long barrier_end_address = 0;
+unsigned long page_thread0 = 0;
+unsigned long page_thread1 = 0;
+barrier_state_t barrier = {0};
+int remote_threads_barrier_arrived = 0;
 unsigned long global_addr = 0x555555558080;
-unsigned long aligned = 0x555555558080 & ~(PAGE_SIZE - 1);/*
+unsigned long aligned = 0x555555558080 & ~(PAGE_SIZE - 1);
+
+pthread_mutex_t pagefaults_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Global or shared debug map
+pthread_mutex_t fault_lock = PTHREAD_MUTEX_INITIALIZER;
+unsigned long active_fault_addr = 0;
+unsigned long remote_barrier_addr = 0;
+unsigned long local_barrier_addr = 0;
+int active_fault_tid = -1;
+
+/*
 unsigned long global_addr = 0x5555555580c0;
 unsigned long aligned = 0x5555555580c0 & ~(PAGE_SIZE - 1);
 unsigned long global_addr = 0x7fffffffe5dc;
 unsigned long aligned = 0x7fffffffe5dc & ~(PAGE_SIZE - 1);*/
 /***************** END USERFAULTFD HEADERS ************************/
 
-
+void barrier_init(void) {
+    pthread_mutex_init(&barrier.lock, NULL);
+    pthread_cond_init(&barrier.cond, NULL);
+}
 
 /*********************************** VMA RECONSTRUCTION ********************* */
 
@@ -77,6 +99,53 @@ struct vma_area *vma_area_alloc(void)
 
 
 
+void mark_fault_start(unsigned long addr, const char *who, pid_t tid) {
+    pthread_mutex_lock(&fault_lock);
+    if (active_fault_addr == addr) {
+        fprintf(stderr,
+            "⚠️  [RACE] %s (tid=%d) started handling page %lx "
+            "while already active by tid=%d!\n",
+            who, tid, addr, active_fault_tid);
+    } else {
+        active_fault_addr = addr;
+        active_fault_tid = tid;
+        fprintf(stderr, "[TRACE] %s begins page %lx (tid=%d)\n", who, addr, tid);
+    }
+    pthread_mutex_unlock(&fault_lock);
+}
+
+void mark_fault_end(unsigned long addr, const char *who, pid_t tid) {
+    pthread_mutex_lock(&fault_lock);
+    if (active_fault_addr == addr && active_fault_tid == tid) {
+        active_fault_addr = 0;
+        active_fault_tid = -1;
+        fprintf(stderr, "[TRACE] %s done page %lx (tid=%d)\n", who, addr, tid);
+    } else {
+        fprintf(stderr,
+            "⚠️  [UNSYNC END] %s (tid=%d) ended handling %lx, but current active=%lx by %d\n",
+            who, tid, addr, active_fault_addr, active_fault_tid);
+    }
+    pthread_mutex_unlock(&fault_lock);
+}
+
+void init_zero_page(void) {
+    size_t page_size = sysconf(_SC_PAGESIZE);
+    if (!page_size) page_size = 4096; // fallback
+
+    // Allocate a page-aligned anonymous mapping
+    zero_page = mmap(NULL, page_size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (zero_page == MAP_FAILED) {
+        perror("mmap zero_page");
+        exit(1);
+    }
+
+    // Fill it with zeros
+    memset(zero_page, 0, page_size);
+}
+
 
 // Register region with userfaultfd for missing page faults
 int register_region_with_uffd(int uffd, void *addr, size_t length) {
@@ -87,8 +156,8 @@ int register_region_with_uffd(int uffd, void *addr, size_t length) {
     // Register for both missing page faults and write protection
     reg.range.start = (unsigned long)addr;
     reg.range.len = length;
-    //reg.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
-    reg.mode = UFFDIO_REGISTER_MODE_WP;
+    reg.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
+    //reg.mode = UFFDIO_REGISTER_MODE_WP;
     
     if (ioctl(uffd, UFFDIO_REGISTER, &reg) == -1) {
         printf("Failing to register %p \n", addr);
@@ -105,7 +174,7 @@ void enable_region_wp( int uffd, void *addr, size_t length) {
 	struct uffdio_writeprotect wp = {
 		.range.start = (unsigned long)addr,
 		.range.len = length,
-		.mode = UFFDIO_WRITEPROTECT_MODE_WP
+		.mode = UFFDIO_WRITEPROTECT_MODE_WP  
 	};
     
     if (uffd == -1) exit(-1);
@@ -137,7 +206,7 @@ void disable_region_wp( int uffd, void *addr, size_t length) {
 
 
 
-struct page_list page_list_data[MAX_PAGE_COUNT];
+page_list page_list_data[MAX_PAGE_COUNT];
 int total_pages = 0;
 
 
@@ -920,7 +989,55 @@ void register_and_write_protect_coalesced(int restored_pid, int uffd, page_statu
 }
 
 #endif 
+int get_list_page_index(unsigned long addr){
+    for (int i = 0; i < total_pages; i++) {
+        unsigned long start = page_list_data[i].saddr;
 
+        // Check if the given address falls inside this region
+        if (addr == start ) {
+          /*PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld (range 0x%lx - 0x%lx)\n",
+                   addr, page_list_data[i].state, new_state, i, start, end - 1);
+
+            if (new_owner  != -2) page_list_data[i].owner = new_owner;
+            if (new_state  != -2) page_list_data[i].state = new_state;
+            if (new_index  != -2) page_list_data[i].index_of_allocs = new_index;*/
+
+            return i; // success
+        }
+    }
+
+    PRINT("[DSM] ❌ Address 0x%lx not found in page_list_data[]\n", addr);
+    return -1;
+}
+
+
+int update_page_info(unsigned long addr, int new_owner, int new_state, int new_index){
+    for (int i = 0; i < total_pages; i++) {
+        unsigned long start = page_list_data[i].saddr;
+        unsigned long end   = start + PAGE_SIZE - 1;
+
+        // Check if the given address falls inside this region
+        if (addr == start ) {
+            PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %d (range 0x%lx - 0x%lx)\n",
+                   addr, page_list_data[i].state, new_state, i, start, end - 1);
+
+            if( new_state == page_list_data[i].state  ){
+                return -2;
+            }
+
+            if (new_owner  != -2) page_list_data[i].owner = new_owner;
+            if (new_state  != -2) page_list_data[i].state = new_state;
+            if (new_index  != -2) page_list_data[i].index_of_allocs = new_index;
+
+            
+
+            return 0; // success
+        }
+    }
+
+    PRINT("[DSM] ❌ Address 0x%lx not found in page_list_data[]\n", addr);
+    return -1;
+}
 
 unsigned long get_base_address(int restored_pid) {
     char path[64], line[512];
@@ -1232,7 +1349,7 @@ void register_page(int uffd, void *addr) {
 
 }
 
-void enable_wp(int uffd, void *addr)
+int enable_wp(int uffd, void *addr)
 {
 	struct uffdio_writeprotect wp = {
 		.range.start = (unsigned long)addr,
@@ -1240,12 +1357,14 @@ void enable_wp(int uffd, void *addr)
 		.mode = UFFDIO_WRITEPROTECT_MODE_WP
 	};
 
-	PRINT("UFFD enable: %d\n", uffd);
+	DSM_DEBUG_UFFD("UFFD enable: %d\n", uffd);
 
-	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1)
+	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1){
 		perror("UFFDIO_WRITEPROTECT (enable)");
-	else
-		PRINT("Successfully protected global page at %p\n", addr);
+        return -1;
+    }
+	DSM_DEBUG_UFFD("Successfully protected global page at %p\n", addr);
+    return 0;
 }	
 
 void disable_wp(int uffd, void *addr)
@@ -1259,7 +1378,7 @@ void disable_wp(int uffd, void *addr)
 	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1)
 		perror("UFFDIO_WRITEPROTECT (disable)");
 	else
-		PRINT("Successfully disabled write protection on page at %p\n", addr);
+		DSM_DEBUG_UFFD("Successfully disabled write protection on page at %p\n", addr);
 }
 
 /******************************** END USERFAULT FUNCTIONS ****************************/
@@ -1589,6 +1708,57 @@ fail:
 	return -1;
 }
 
+#if 1
+
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <linux/mman.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_process_madvise
+#define SYS_process_madvise 440
+#endif
+
+int runMADVISE(int restored_pid, void *addr, size_t len) {
+    int pidfd;
+    struct iovec iov;
+    long ret;
+
+    PRINT("[DSM] Sending remote process_madvise(MADV_DONTNEED) request to pid %d at %p (len=%zu)...\n",
+          restored_pid, addr, len);
+
+    // Get a pidfd for the target process
+    pidfd = syscall(SYS_pidfd_open, restored_pid, 0);
+    if (pidfd < 0) {
+        perror("pidfd_open");
+        return -1;
+    }
+
+    // Prepare iovec for the target memory region
+    iov.iov_base = addr;
+    iov.iov_len = len;
+
+    // Call process_madvise on the target mm
+    ret = syscall(SYS_process_madvise, pidfd, &iov, 1, MADV_DONTNEED, 0);
+    if (ret < 0) {
+        fprintf(stderr, "❌ process_madvise failed: %s (errno=%d)\n", strerror(errno), errno);
+        close(pidfd);
+        return -1;
+    }
+
+    PRINT("✅ process_madvise succeeded (ret=%ld)\n", ret);
+    close(pidfd);
+    return 0;
+}
+
+
+#else
 int runMADVISE(int restored_pid, void *addr, size_t len){
 	int state;
 	struct parasite_ctl *ctl;
@@ -1638,7 +1808,7 @@ fail:
 	state = compel_resume_task(restored_pid, state, state);
 	return -1;
 }
-
+#endif
 void print_mutex(const unsigned char *page_data, size_t offset) {
     const pthread_mutex_t *mutex = (const pthread_mutex_t *)(page_data + offset);
     int lock = *((int *)mutex);               // __lock
@@ -1867,11 +2037,102 @@ fail:
     return -1;
 }
 
-int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg, int print_int ) {
+int interactive_page_inspect(struct msg_info *dsm_msg, int fd_handler, int mode)
+{
+    unsigned long addr = 0;
+    unsigned char page_content[PAGE_SIZE];
+    int rows = 0;
+    int *page_ints;
+    float *page_floats;
+    double *page_doubles;
+
+    printf("🔍 Enter target virtual page address (hex, e.g. 0x7f537a016000): ");
+    if (scanf("%lx", &addr) != 1) {
+        fprintf(stderr, "❌ Invalid address input.\n");
+        return -1;
+    }
+
+    dsm_msg->msg_type = MSG_GET_PAGE_DATA;
+    dsm_msg->page_addr = addr;
+    dsm_msg->page_size = PAGE_SIZE;
+    dsm_msg->msg_id = 1234; // arbitrary ID for tracking
+
+    printf("[DSM] Requesting page 0x%lx from remote node...\n", addr);
+
+    if (send_get_page(*dsm_msg, fd_handler, page_content) != 0) {
+        fprintf(stderr, "❌ Failed to get page data.\n");
+        return -1;
+    }
+
+    printf("✅ Page 0x%lx successfully retrieved!\n", addr);
+  
+
+    printf("How many rows (4 values per row)? ");
+    if (scanf("%d", &rows) != 1) {
+        printf("Invalid input. Defaulting to 16 rows.\n");
+        rows = 16;
+    }
+
+    printf("\n");
+
+    // --------------------------------------------
+    // MODE 1: Integers
+    // --------------------------------------------
+    if (mode == 0) {
+        page_ints = (int *)page_content;
+        PRINT("[DSM] Dumping %d values as int array:\n", rows * 4);
+        for (int i = 0; i < rows * 4; i += 4) {
+            PRINT("  [%03d] = %d (0x%x), [%03d] = %d (0x%x), "
+                  "[%03d] = %d (0x%x), [%03d] = %d (0x%x)\n",
+                  i, page_ints[i], page_ints[i],
+                  i+1, page_ints[i+1], page_ints[i+1],
+                  i+2, page_ints[i+2], page_ints[i+2],
+                  i+3, page_ints[i+3], page_ints[i+3]);
+        }
+    }
+
+    // --------------------------------------------
+    // MODE 0: Floats
+    // --------------------------------------------
+    else if (mode == 1) {
+        page_floats = (float *)page_content;
+        PRINT("[DSM] Dumping %d values as float array:\n", rows * 4);
+        for (int i = 0; i < rows * 4; i += 4) {
+            PRINT("  [%03d] = %f (0x%08x), [%03d] = %f (0x%08x), "
+                  "[%03d] = %f (0x%08x), [%03d] = %f (0x%08x)\n",
+                  i, page_floats[i], *(unsigned int*)&page_floats[i],
+                  i+1, page_floats[i+1], *(unsigned int*)&page_floats[i+1],
+                  i+2, page_floats[i+2], *(unsigned int*)&page_floats[i+2],
+                  i+3, page_floats[i+3], *(unsigned int*)&page_floats[i+3]);
+        }
+    }
+
+    // --------------------------------------------
+    // MODE 2: Doubles
+    // --------------------------------------------
+    else if (mode == 2) {
+        page_doubles = (double *)page_content;
+        PRINT("[DSM] Dumping %d values as double array:\n", rows * 4);
+        for (int i = 0; i < rows * 4; i += 4) {
+            PRINT("  [%03d] = %lf (0x%016lx), [%03d] = %lf (0x%016lx), "
+                  "[%03d] = %lf (0x%016lx), [%03d] = %lf (0x%016lx)\n",
+                  i, page_doubles[i], *(uint64_t*)&page_doubles[i],
+                  i+1, page_doubles[i+1], *(uint64_t*)&page_doubles[i+1],
+                  i+2, page_doubles[i+2], *(uint64_t*)&page_doubles[i+2],
+                  i+3, page_doubles[i+3], *(uint64_t*)&page_doubles[i+3]);
+        }
+    }
+
+    printf("\n✅ Page content inspection complete.\n");
+    return 0;
+}
+
+int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg, int mode ) {
     int state, p[2], rows;
     long *args;
     int *page_ints;
     float *page_floats;
+    double *page_doubles;
     unsigned char page_content[4096];
     struct parasite_ctl *ctl;
     struct infect_ctx *ictx;
@@ -1923,53 +2184,73 @@ int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg,
     }
 
     
+    if (mode == 1) {
 
-    if(print_int) {
-
-        
         // ✅ Print entire page as int[]
         page_ints = (int *)page_content;
 
-        //Make the user choose how many rows by 4
-        
-        rows = 0;
         printf("How many rows?\n");
         if (scanf("%d", &rows) != 1) {
             printf("Invalid input\n");
             rows = 1024;
         }
 
-
-        PRINT("[DSM] Dumping %d page content as int array:\n", rows*4);
-        for (int i = 0; i < rows * 4 ; i += 4) {
-            PRINT("  [%03d] = %d (0x%x), [%03d] = %d (0x%x), [%03d] = %d (0x%x), [%03d] = %d (0x%x)\n", 
-                i, page_ints[i], page_ints[i], 
+        PRINT("[DSM] Dumping %d values as int array:\n", rows * 4);
+        for (int i = 0; i < rows * 4; i += 4) {
+            PRINT("  [%03d] = %d (0x%x), [%03d] = %d (0x%x), "
+                "[%03d] = %d (0x%x), [%03d] = %d (0x%x)\n",
+                i, page_ints[i], page_ints[i],
                 i+1, page_ints[i+1], page_ints[i+1],
                 i+2, page_ints[i+2], page_ints[i+2],
                 i+3, page_ints[i+3], page_ints[i+3]);
         }
-    }else{
+
+    } else if (mode == 0) {
+
         // ✅ Print entire page as float[]
         page_floats = (float *)page_content;
-        //Make the user choose how many rows by 4
 
-        rows = 0;
         printf("How many rows?\n");
         if (scanf("%d", &rows) != 1) {
             printf("Invalid input\n");
             rows = 1024;
         }
-        PRINT("[DSM] Dumping %d page content as float array:\n", rows*4);
-        for (int i = 0; i < rows * 4 ; i += 4) {
-            PRINT("  [%03d] = %f (0x%08x), [%03d] = %f (0x%08x), [%03d] = %f (0x%08x), [%03d] = %f (0x%08x)\n",
+
+        PRINT("[DSM] Dumping %d values as float array:\n", rows * 4);
+        for (int i = 0; i < rows * 4; i += 4) {
+            PRINT("  [%03d] = %f (0x%08x), [%03d] = %f (0x%08x), "
+                "[%03d] = %f (0x%08x), [%03d] = %f (0x%08x)\n",
                 i, page_floats[i], *(unsigned int*)&page_floats[i],
                 i+1, page_floats[i+1], *(unsigned int*)&page_floats[i+1],
                 i+2, page_floats[i+2], *(unsigned int*)&page_floats[i+2],
                 i+3, page_floats[i+3], *(unsigned int*)&page_floats[i+3]);
         }
 
+    } else if (mode == 2) {
+
+        // ✅ Print entire page as double[]
+        page_doubles = (double *)page_content;
+
+        printf("How many rows?\n");
+        if (scanf("%d", &rows) != 1) {
+            printf("Invalid input\n");
+            rows = 512; // 512 * 8 bytes * 4 = 16KB printed max
+        }
+
+        PRINT("[DSM] Dumping %d values as double array:\n", rows * 4);
+        for (int i = 0; i < rows * 4; i += 4) {
+            PRINT("  [%03d] = %lf (0x%016lx), [%03d] = %lf (0x%016lx), "
+                "[%03d] = %lf (0x%016lx), [%03d] = %lf (0x%016lx)\n",
+                i, page_doubles[i], *(uint64_t*)&page_doubles[i],
+                i+1, page_doubles[i+1], *(uint64_t*)&page_doubles[i+1],
+                i+2, page_doubles[i+2], *(uint64_t*)&page_doubles[i+2],
+                i+3, page_doubles[i+3], *(uint64_t*)&page_doubles[i+3]);
+        }
+
+    } else {
+        PRINT("[DSM] Unknown mode: %d\n", mode);
     }
-  
+
 
     if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
     if (compel_cure(ctl)) pr_err("Can't cure\n");
@@ -2054,7 +2335,7 @@ int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg) {
 		fprintf(stderr, "Offset out of bounds\n");
 	} else {
 		memcpy(&value, &page_content[offset], sizeof(int));
-		PRINT("[DSM] Value at GLOBAL_ADDR (0x%lx): %d (0x%x)\n", global_addr, value, value);
+		//PRINT("[DSM] Value at GLOBAL_ADDR (0x%lx): %d (0x%x)\n", global_addr, value, value);
 	}
 
    /*
@@ -2111,21 +2392,241 @@ int send_get_page(struct msg_info dsm_msg, int fd_handler, void *page_out) {
 
     // 1. Send request
     if (send(fd_handler, &dsm_msg, sizeof(dsm_msg), 0) != sizeof(dsm_msg)) {
-        perror("[CLIENT] Failed to send MSG_GET_PAGE_DATA");
+        perror("[SERVER] Failed to send MSG_GET_PAGE_DATA");
         return -1;
     }
 
     // 2. Receive the page
     n = recv(fd_handler, page_out, 4096, MSG_WAITALL);
     if (n != 4096) {
-        fprintf(stderr, "[CLIENT] Failed to receive full page (got %zd bytes)\n", n);
+        fprintf(stderr, "[SERVER] Failed to receive full page (got %zd bytes)\n", n);
         return -1;
     }
 
     return 0;
 }
 
+
+
 #if 1
+
+
+int wait_readable(int fd, int timeout_ms) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int r = poll(&pfd, 1, timeout_ms);
+    if (r <= 0) return -1;
+    return (pfd.revents & POLLIN) ? 0 : -1;
+}
+
+ssize_t all_read(int fd, void *buf, size_t len) {
+    char *p = buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -2; // EOF before all data
+        p += n;
+        len -= n;
+    }
+    return 0;
+}
+
+int send_all(int fd, const void *buf, size_t len) {
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += n;
+        len -= n;
+    }
+    return 0;
+}
+
+
+#include <sys/uio.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#endif
+
+
+#if 1
+int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg) {
+    unsigned char page_content[PAGE_SIZE];
+    struct iovec local_iov, remote_iov;
+    ssize_t nread;
+
+    PRINT("[DSM] Using process_vm_readv() to fetch remote page (pid=%d, addr=%p)\n",
+          restored_pid, (void*)dsm_msg->page_addr);
+
+    // --- Prepare iovecs ---
+    local_iov.iov_base = page_content;
+    local_iov.iov_len  = PAGE_SIZE;
+    remote_iov.iov_base = (void*)dsm_msg->page_addr;
+    remote_iov.iov_len  = PAGE_SIZE;
+
+    // --- Read the page directly from target process ---
+    nread = process_vm_readv(restored_pid,
+                             &local_iov, 1,
+                             &remote_iov, 1,
+                             0);
+    if (nread != PAGE_SIZE) {
+        if (nread < 0)
+            PRINT("❌ process_vm_readv failed: %s\n", strerror(errno));
+        else
+            PRINT("⚠️ process_vm_readv read partial data: %ld bytes\n", nread);
+        return -1;
+    }
+
+    PRINT("✅ Read %ld bytes from target process memory\n", nread);
+
+    // --- Send page data to client ---
+    if (send_all(sk, page_content, PAGE_SIZE) < 0) {
+        perror("send_all(page_content)");
+        return -1;
+    }
+
+    PRINT("✅ Page_transfer_complete to client (addr=%p)\n", (void*)dsm_msg->page_addr);
+
+    // --- Post-transfer page management ---
+    if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
+        PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
+        if (madvise((void*)dsm_msg->page_addr, PAGE_SIZE, MADV_DONTNEED) == -1)
+            PRINT("❌ MADV_DONTNEED failed: %s\n", strerror(errno));
+        else
+            PRINT("Madvise to invalidate page %p\n", (void*)dsm_msg->page_addr);
+        //update_page_info(dsm_msg->page_addr, 1, INVALID, -2);
+        PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n",
+                   			dsm_msg->page_addr, page_list_data[dsm_msg->msg_id].state, INVALID, dsm_msg->msg_id);
+        page_list_data[dsm_msg->msg_id].state = INVALID;	
+    } else {
+        PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n");
+        if (enable_wp(uffd, (void*)dsm_msg->page_addr)){
+            PRINT("⚠️ enable_wp failed\n");
+            kill_and_exit(restored_pid);
+        }
+        //update_page_info(dsm_msg->page_addr, 1, SHARED, -2);
+          PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n",
+                   			dsm_msg->page_addr, page_list_data[dsm_msg->msg_id].state, SHARED, dsm_msg->msg_id);
+        page_list_data[dsm_msg->msg_id].state = SHARED;	
+    }
+
+    return 0;
+}
+
+
+
+#elif 1
+int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg) {
+    int state;
+    int p[2];
+    unsigned char page_content[PAGE_SIZE];
+    struct parasite_ctl *ctl;
+    struct infect_ctx *ictx;
+    long *args;
+
+    PRINT("[DSM] Sending get page to rpc daemon (DUMP_SINGLE) request...\n");
+
+    state = compel_stop_task(restored_pid);
+    if (!(ctl = compel_prepare(restored_pid))) {
+        PRINT("❌ compel_prepare failed\n");
+        return -1;
+    }
+
+    parasite_setup_c_header(ctl);
+    ictx = compel_infect_ctx(ctl);
+    ictx->log_fd = STDERR_FILENO;
+
+    if (compel_infect(ctl, 1, sizeof(long)) < 0) {
+        PRINT("❌ compel_infect failed\n");
+        xfree(ctl);
+        return -1;
+    }
+
+    args = compel_parasite_args(ctl, long);
+    *args = dsm_msg->page_addr;
+
+    if (pipe(p) < 0) {
+        perror("pipe");
+        return -1;
+    }
+
+    if (compel_rpc_call(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
+        PRINT("❌ RPC DUMP_SINGLE call failed\n");
+        goto fail_close;
+    }
+
+    if (compel_util_send_fd(ctl, p[1]) != 0) {
+        PRINT("❌ Failed to send pipe fd\n");
+        goto fail_close;
+    }
+
+    if (compel_rpc_sync(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
+        PRINT("❌ RPC DUMP_SINGLE sync failed\n");
+        goto fail_close;
+    }
+
+    close(p[1]); // close write end on parent
+
+    PRINT("[DSM] Waiting for parasite page data on fd=%d\n", p[0]);
+
+    if (wait_readable(p[0], 5000) < 0) {
+        PRINT("❌ Timeout waiting for parasite page data\n");
+        goto fail_close;
+    }
+
+    if (all_read(p[0], page_content, PAGE_SIZE) < 0) {
+        perror("all_read parasite pipe");
+        goto fail_close;
+    }
+
+    PRINT("✅ Received 4096 bytes from parasite, sending to client (fd=%d)\n", sk);
+
+    if (send_all(sk, page_content, PAGE_SIZE) < 0) {
+        perror("send_all(page_content)");
+        goto fail_close;
+    }
+
+    PRINT("✅ Page_transfer_complete to client (addr=%p)\n", (void*)dsm_msg->page_addr);
+
+    // Optional: perform invalidation or re-enable WP
+    if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
+        PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
+        if (compel_rpc_call_sync(PARASITE_CMD_RUN_MADVISE_SINGLE_PAGE, ctl) < 0)
+            PRINT("❌ MADV_DONTNEED failed\n");
+        else
+            PRINT("Madvise to invalidate page %p\n", (void *)dsm_msg->page_addr);
+        update_page_info(dsm_msg->page_addr, 1, INVALID, -2);
+    } else {
+        PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n");
+        if (enable_wp(uffd, (void *)dsm_msg->page_addr))
+            PRINT("⚠️ enable_wp failed\n");
+        update_page_info(dsm_msg->page_addr, 1, SHARED, -2);
+    }
+
+    if (compel_stop_daemon(ctl))
+        PRINT("⚠️ Can't stop daemon\n");
+    if (compel_cure(ctl))
+        PRINT("⚠️ Can't cure\n");
+    if (compel_resume_task(restored_pid, state, state))
+        PRINT("⚠️ Can't resume task\n");
+
+    close(p[0]);
+    return 0;
+
+fail_close:
+    close(p[0]);
+    close(p[1]);
+    return -1;
+}
+
+#elif 0
 int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg) {
     int state, value, p[2];
     long *args;
@@ -2133,6 +2634,11 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
     size_t offset;
     struct parasite_ctl *ctl;
     struct infect_ctx *ictx;
+
+    
+    (void) value;
+    (void) offset;
+
 
     PRINT("[DSM] Sending get page to rpc daemon (DUMP_SINGLE) request...\n");
 
@@ -2191,7 +2697,7 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
     send(sk, page_content, 4096, 0);
     PRINT("✅ Page_transfer_complete to client\n");
 
-    //#if 0
+    #if 0
     // Show value at global_addr for debugging
     offset = global_addr - aligned;
     if (offset >= 4096 - sizeof(int)) {
@@ -2200,20 +2706,25 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
         memcpy(&value, &page_content[offset], sizeof(int));
         //PRINT("[DSM] Value at GLOBAL_ADDR (0x%lx): %d (0x%x)\n", global_addr, value, value);
     }
-    //#endif
+    #endif
 
     // Handle invalidation or write protection
-    #if !EP
+
     if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
         PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
         if (compel_rpc_call_sync(PARASITE_CMD_RUN_MADVISE_SINGLE_PAGE, ctl) < 0) {
             fprintf(stderr, "❌ MADV_DONTNEED failed\n");
         }else PRINT("Madvise to invalidate page %p\n", (void *)dsm_msg->page_addr);
+        if( update_page_info(dsm_msg->page_addr, 1, INVALID, -2) != 0) kill_and_exit(restored_pid);
     } else {
-        PRINT("Message is GET_PAGE → Enable WP to SHARED\n");
+        PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n");
         enable_wp( uffd, (void *)dsm_msg->page_addr);
+        if( update_page_info(dsm_msg->page_addr, 1, SHARED, -2) == -2){
+            printf("mah\n");
+            kill_and_exit(restored_pid);
+        }
     }
-    #endif
+
     
     if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
     if (compel_cure(ctl)) pr_err("Can't cure\n");
@@ -2228,6 +2739,7 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
 /******************************** END INFECTION FUNCTIONS *******************************/
 
 /******************************** CONTROLLER HELPER FUNCTIONS *******************************/
+
 
 void read_pid(int* restored_pid)
 {
@@ -2473,19 +2985,23 @@ int or_pages(unsigned char *local_page, unsigned char *remote_page, unsigned cha
     
     return 0;
 }
-
-// Enhanced function that compares pages AND performs OR operation
-int compare_and_or_pages(int restored_pid, int uffd, struct msg_info *dsm_msg, int fd_handler, unsigned char *or_result) {
-    int state, p[2], rows, differences;
+int compare_and_or_pages(int restored_pid, int uffd,
+                         struct msg_info *dsm_msg,
+                         int fd_handler,
+                         unsigned char *or_result,
+                         int mode)
+{
+    int state, p[2], rows, differences, total_vals;
     long *args;
-    float *local_page_floats, *remote_page_floats;
+    float  *local_page_floats,  *remote_page_floats;
+    double *local_page_doubles, *remote_page_doubles;
     unsigned char local_page_content[4096];
     unsigned char remote_page_content[4096];
     struct parasite_ctl *ctl;
     struct infect_ctx *ictx;
-    
+
     printf("[DSM] Requesting both local and remote pages for address: 0x%lx\n", dsm_msg->page_addr);
-    
+
     // =========================
     // 1. GET REMOTE PAGE FIRST
     // =========================
@@ -2495,112 +3011,148 @@ int compare_and_or_pages(int restored_pid, int uffd, struct msg_info *dsm_msg, i
         return -1;
     }
     printf("✅ Remote page received successfully\n");
-    
+
     // =========================
     // 2. GET LOCAL PAGE
     // =========================
     printf("\n[DSM] Getting LOCAL page via parasite injection...\n");
-    
+
     state = compel_stop_task(restored_pid);
     if (!(ctl = compel_prepare(restored_pid))) {
         pr_err("❌ Compel prepare failed\n");
         return -1;
     }
-    
+
     parasite_setup_c_header(ctl);
     ictx = compel_infect_ctx(ctl);
     ictx->log_fd = STDERR_FILENO;
-    
+
     if (compel_infect(ctl, 1, sizeof(long)) < 0) {
         xfree(ctl);
         return -1;
     }
-    
-    // Set the page address for the parasite
+
     args = compel_parasite_args(ctl, long);
     *args = dsm_msg->page_addr;
-    
+
     if (pipe(p) < 0) {
         perror("pipe");
         goto fail_cleanup;
     }
-    
+
     if (compel_rpc_call(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
         fprintf(stderr, "❌ RPC DUMP_SINGLE call failed\n");
         goto fail_pipe;
     }
-    
+
     if (compel_util_send_fd(ctl, p[1]) != 0) {
         fprintf(stderr, "❌ Failed to send pipe fd\n");
         goto fail_pipe;
     }
-    
+
     if (compel_rpc_sync(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
         fprintf(stderr, "❌ RPC DUMP_SINGLE sync failed\n");
         goto fail_pipe;
     }
-    
+
     if (read(p[0], local_page_content, 4096) != 4096) {
         perror("❌ read from parasite pipe");
         goto fail_pipe;
     }
-    
+
     printf("✅ Local page retrieved successfully\n");
-    
+
     // =========================
-    // 3. PRINT BOTH PAGES AS FLOATS
+    // 3. PRINT BOTH PAGES (FLOAT or DOUBLE)
     // =========================
-    local_page_floats = (float *)local_page_content;
-    remote_page_floats = (float *)remote_page_content;
-    
-    // Get number of rows to display
-    rows = 0;
-    printf("\nHow many rows of floats to display for comparison? (each row = 4 floats): ");
+    printf("\nHow many rows to display for comparison? (each row = 4 values): ");
     if (scanf("%d", &rows) != 1 || rows <= 0) {
         printf("Invalid input, defaulting to 64 rows\n");
         rows = 64;
     }
-    
-    // Ensure we don't exceed page boundaries
-    if (rows * 4 > 1024) {
-        printf("⚠️  Limiting to 256 rows (1024 floats max per page)\n");
-        rows = 256;
-    }
-    
+
     printf("\n================================================================================\n");
     printf("COMPARISON: LOCAL vs REMOTE PAGE (Address: 0x%lx)\n", dsm_msg->page_addr);
     printf("================================================================================\n");
     printf("Format: [idx] LOCAL_val (hex) | REMOTE_val (hex) [MATCH/DIFF]\n");
     printf("--------------------------------------------------------------------------------\n");
-    
+
     differences = 0;
-    for (int i = 0; i < rows * 4; i += 4) {
-        printf("\nRow %03d:\n", i/4);
-        
-        for (int j = 0; j < 4; j++) {
-            int idx = i + j;
-            float local_val = local_page_floats[idx];
-            float remote_val = remote_page_floats[idx];
-            unsigned int local_hex = *(unsigned int*)&local_val;
-            unsigned int remote_hex = *(unsigned int*)&remote_val;
-            
-            const char *status = (local_hex == remote_hex) ? "✅ MATCH" : "❌ DIFF ";
-            if (local_hex != remote_hex) differences++;
-            
-            printf("  [%03d] %12.6f (0x%08x) | %12.6f (0x%08x) %s\n",
-                   idx, local_val, local_hex, remote_val, remote_hex, status);
+
+    if(mode < 0 ){
+        printf("\nChoose print mode:\n");
+        printf("  [0] float (4 bytes)\n");
+        printf("  [] int (4 bytes)\n");
+        printf("  [1] double (8 bytes)\n");
+        printf("Enter mode: ");
+
+        if (scanf("%d", &mode) != 1 || mode < 0 || mode > 2) {
+            fprintf(stderr, "Invalid mode. Defaulting to float (0).\n");
+            mode = 0;
         }
     }
-    
-    printf("\n================================================================================\n");
-    printf("SUMMARY: %d differences found out of %d floats compared\n", differences, rows * 4);
-    if (differences == 0) {
-        printf("🎉 Pages are IDENTICAL!\n");
+   
+
+    if (mode == 0) {
+        // ========== FLOAT MODE ==========
+        local_page_floats  = (float  *)local_page_content;
+        remote_page_floats = (float  *)remote_page_content;
+
+        for (int i = 0; i < rows * 4; i += 4) {
+            printf("\nRow %03d:\n", i / 4);
+            for (int j = 0; j < 4; j++) {
+                int idx = i + j;
+                float local_val  = local_page_floats[idx];
+                float remote_val = remote_page_floats[idx];
+                unsigned int local_hex  = *(unsigned int *)&local_val;
+                unsigned int remote_hex = *(unsigned int *)&remote_val;
+                const char *status = (local_hex == remote_hex) ? "✅ MATCH" : "❌ DIFF ";
+                if (local_hex != remote_hex) differences++;
+                printf("  [%03d] %12.6f (0x%08x) | %12.6f (0x%08x) %s\n",
+                       idx, local_val, local_hex, remote_val, remote_hex, status);
+            }
+        }
+
+    } else if (mode == 1) {
+        // ========== DOUBLE MODE ==========
+        local_page_doubles  = (double *)local_page_content;
+        remote_page_doubles = (double *)remote_page_content;
+
+        // each double = 8 bytes → 512 doubles per page
+        total_vals = rows * 4;
+        if (total_vals > 512) total_vals = 512;
+
+        for (int i = 0; i < total_vals; i += 4) {
+            printf("\nRow %03d:\n", i / 4);
+            for (int j = 0; j < 4; j++) {
+                int idx = i + j;
+                double local_val  = local_page_doubles[idx];
+                double remote_val = remote_page_doubles[idx];
+                unsigned long local_hex  = *(unsigned long *)&local_val;
+                unsigned long remote_hex = *(unsigned long *)&remote_val;
+                const char *status = (local_hex == remote_hex) ? "✅ MATCH" : "❌ DIFF ";
+                if (local_hex != remote_hex) differences++;
+                printf("  [%03d] %14.8lf (0x%016lx) | %14.8lf (0x%016lx) %s\n",
+                       idx, local_val, local_hex, remote_val, remote_hex, status);
+            }
+        }
+
     } else {
-        printf("⚠️  Pages have %d different float values\n", differences);
+        printf("❌ Unknown mode (%d). Use 0 = float, 1 = double.\n", mode);
     }
+
+    printf("\n================================================================================\n");
+    if (mode == 0)
+        printf("SUMMARY: %d differences found out of %d floats compared\n", differences, rows * 4);
+    else
+        printf("SUMMARY: %d differences found out of %d doubles compared\n", differences, rows * 4);
+
+    if (differences == 0)
+        printf("🎉 Pages are IDENTICAL!\n");
+    else
+        printf("⚠️  Pages have %d differing values\n", differences);
     printf("================================================================================\n\n");
-    
+
     // =========================
     // 4. PERFORM OR OPERATION
     // =========================
@@ -2608,19 +3160,17 @@ int compare_and_or_pages(int restored_pid, int uffd, struct msg_info *dsm_msg, i
         char response;
         printf("Do you want to perform bitwise OR operation? (y/n): ");
         if (scanf(" %c", &response) == 1 && (response == 'y' || response == 'Y')) {
-            if (or_pages(local_page_content, remote_page_content, or_result, 1) == 0) {
+            if (or_pages(local_page_content, remote_page_content, or_result, 1) == 0)
                 printf("✅ OR operation completed and stored in result buffer\n");
-            } else {
+            else
                 printf("❌ OR operation failed\n");
-            }
         }
     }
-    
-    // Cleanup parasite
+
     if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
     if (compel_cure(ctl)) pr_err("Can't cure\n");
     if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
-    
+
     close(p[0]);
     close(p[1]);
     return 0;
@@ -2635,6 +3185,54 @@ fail_cleanup:
     return -1;
 }
 
+
+
+// Function to fill local page using UFFDIO_COPY
+int fill_local_page_uffdio(int uffd, unsigned long addr, unsigned char *merged_page_data, int restored_pid) {
+    struct uffdio_copy copy;
+    
+    /**/
+
+    if( runMADVISE( restored_pid, (void *) addr, 4096))
+            perror("runMADVISE command loop");
+        else
+            printf("Successfully run madvise on page at %p\n", (void *) addr);
+    
+    if (!merged_page_data) {
+        printf("❌ Invalid page data pointer\n");
+        return -1;
+    }
+    
+    printf("\n💾 FILLING LOCAL PAGE WITH REMOTE DATA\n");
+    printf("======================================\n");
+    printf("Target address: 0x%lx\n", addr);
+    printf("Data source: remote page (REMOTE)\n");
+    
+    // Set up the copy structure
+    copy.src  = (unsigned long)merged_page_data;
+    copy.dst  = addr;
+    copy.len  = PAGE_SIZE;
+    copy.mode = UFFDIO_COPY_MODE_WP;  // Copy with write protection
+    
+    printf("Performing UFFDIO_COPY...\n");
+    printf("  src: 0x%llx (remote data)\n", copy.src);
+    printf("  dst: 0x%llx (target address)\n", copy.dst);
+    printf("  len: %llu bytes\n", copy.len);
+    printf("  mode: UFFDIO_COPY_MODE_WP\n");
+    
+    // Perform the copy
+    if (ioctl(uffd, UFFDIO_COPY, &copy) == -1) {
+        perror("❌ ioctl/copy (merged page fill)");
+        return -1;
+    }
+    
+    printf("✅ Successfully filled local page with remote data\n");
+    printf("   Bytes copied: %llu\n", copy.len);
+    printf("   Local page now contains: REMOTE\n");
+    printf("======================================\n\n");
+    
+    return 0;
+}
 
 
 // Function to fill local page with merged data using UFFDIO_COPY
@@ -2827,9 +3425,11 @@ int complete_page_merge_workflow(int restored_pid, int uffd, struct msg_info *ds
     printf("===============================\n");
     printf("Target address: 0x%lx\n", dsm_msg->page_addr);
     printf("Steps: 1) Compare pages  2) OR merge  3) Fill local\n\n");
+
+ 
     
     // Step 1 & 2: Compare pages and create OR merge
-    if (compare_and_or_pages(restored_pid, uffd, dsm_msg, fd_handler, or_result_page) != 0) {
+    if (compare_and_or_pages(restored_pid, uffd, dsm_msg, fd_handler, or_result_page, -1) != 0) {
         printf("❌ Page comparison and OR merge failed\n");
         return -1;
     }
@@ -2873,34 +3473,43 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
         send_sigcont(restored_pid);
         return;
     }
-
+    sleep(1);
+    printf("\n[DSM] Enter command:\n>");
+    printf("  0 = reapply write-protection\n> ");
+    printf("  1 = remote madvise(MADV_DONTNEED)\n> ");
+    printf("  21 = restart process (send SIGCONT)\n> ");
+    printf("  22 = stop process (send SIGSTOP)\n> ");
+    printf("  23 = restart local and remote processes (send SIGCONT & WAKE UP REMOTE THREAD)\n> ");
+    printf("  3 = restart process (send compel cure)\n> ");
+    printf("  4 = exit\n> ");
+    printf("  5 = simple infection test\n> ");
+    printf("  61 = test vmsplice\n> ");
+    printf("  62 = test vmsplice full page\n> ");
+    printf("  631 = Full page dump test (interactive) [as int]\n> ");
+    printf("  632 = Full page dump test (interactive) [as double] \n> ");
+    printf("  633 = Full page dump test (interactive) [as float] \n> ");
+    printf("  64 = all pages registered\n> ");
+    printf("  65 = DIVIDED page dump test (interactive)\n> ");
+    printf("  66 = DIVIDED page local/remote (interactive)\n> ");
+    printf("  67 = DIVIDED page local/remote and OR operation (interactive)\n> ");
+    printf("  68 = DIVIDED page local/remote and OR operation and possibly update local copy (fixed address)\n> ");
+    printf("  69 = DIVIDED page local/remote and OR operation and possibly update local copy (interactive)\n> ");
+    printf("  7 = SIMULATE GET_PAGE_DATA\n> ");
+    printf("  71 = GET_PAGE_DATA (interactive) [as int] \n> ");
+    printf("  72 = GET_PAGE_DATA (interactive) [as float] \n> ");
+    printf("  73 = GET_PAGE_DATA (interactive) [as double] \n> ");
+    printf("  74 = REAL GET_PAGE_DATA with LOCAL COPY (interactive)\n> ");
+    printf("  8 = SIMULATE GET_PAGE_DATA_AND_INVALIDATE\n> ");
+    printf("  9 = SIMULATE INVALIDATE\n> ");
+    printf("  10 = WAKE UP REMOTE THREAD\n> ");
+    printf("  11 = STOP REMOTE THREAD\n> ");
+    printf("  12 = Show mutex page content\n> ");
+    printf("  13 = Change mutex lock\n> ");
+    printf("  55 = Barrier release\n> ");
+    fflush(stdout);
     while (1) {
         int choice;
-        printf("\n[DSM] Enter command:\n>");
-        printf("  0 = reapply write-protection\n> ");
-        printf("  1 = remote madvise(MADV_DONTNEED)\n> ");
-		printf("  21 = restart process (send SIGCONT)\n> ");
-		printf("  22 = stop process (send SIGSTOP)\n> ");
-        printf("  23 = restart local and remote processes (send SIGCONT & WAKE UP REMOTE THREAD)\n> ");
-		printf("  3 = restart process (send compel cure)\n> ");
-		printf("  4 = exit\n> ");
-		printf("  5 = simple infection test\n> ");
-		printf("  61 = test vmsplice\n> ");
-        printf("  62 = test vmsplice full page\n> ");
-        printf("  63 = Full page dump test (interactive)\n> ");
-        printf("  64 = all pages registered\n> ");
-        printf("  65 = DIVIDED page dump test (interactive)\n> ");
-        printf("  66 = DIVIDED page local/remote (interactive)\n> ");
-        printf("  67 = DIVIDED page local/remote and OR operation (interactive)\n> ");
-        printf("  68 = DIVIDED page local/remote and OR operation and possibly update local copy (interactive)\n> ");
-		printf("  7 = SIMULATE GET_PAGE_DATA\n> ");
-		printf("  8 = SIMULATE GET_PAGE_DATA_AND_INVALIDATE\n> ");
-		printf("  9 = SIMULATE INVALIDATE\n> ");
-		printf("  10 = WAKE UP REMOTE THREAD\n> ");
-		printf("  11 = STOP REMOTE THREAD\n> ");
-        printf("  12 = Show mutex page content\n> ");
-        printf("  13 = Change mutex lock\n> ");
-        fflush(stdout);
+        
 
         if (scanf("%d", &choice) != 1) {
             printf("Invalid input\n");
@@ -2929,7 +3538,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             //Resume remote process
             dsm_msg.msg_type = MSG_WAKE_THREAD;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n");
+			printf("[SERVER] Sent MSG_WAKE_THREAD to server.\n");
 		}else if( choice == 3 ) {
 			// Resume the stopped process
 			if (compel_resume_task(restored_pid, 3, 3)) pr_err("Can't resume\n");
@@ -2976,11 +3585,47 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
 
             test_full_page_content(restored_pid, uffd, &dsm_msg, 1);
+        }else if( choice == 632){
+            // Full page dump test (interactive)
+            unsigned long input_addr;
+            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            fflush(stdout);
+            if (scanf("%lx", &input_addr) != 1) {
+                fprintf(stderr, "❌ Invalid input\n");
+                kill_and_exit(restored_pid);
+            }printf("[DSM] Address entered: %lx \n",input_addr );
+
+            // Prepare dsm_msg
+            dsm_msg.msg_type = MSG_SEND_INVALIDATE;  // or anything suitable
+            dsm_msg.page_addr = input_addr;
+            dsm_msg.msg_id = 1;
+
+            printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
+
+            test_full_page_content(restored_pid, uffd, &dsm_msg, 2);
+        }else if( choice == 633 ){
+            // Full page dump test (interactive)
+            unsigned long input_addr;
+            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            fflush(stdout);
+            if (scanf("%lx", &input_addr) != 1) {
+                fprintf(stderr, "❌ Invalid input\n");
+                kill_and_exit(restored_pid);
+            }printf("[DSM] Address entered: %lx \n",input_addr );
+
+            // Prepare dsm_msg
+            dsm_msg.msg_type = MSG_SEND_INVALIDATE;  // or anything suitable
+            dsm_msg.page_addr = input_addr;
+            dsm_msg.msg_id = 1;
+
+            printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
+
+            test_full_page_content(restored_pid, uffd, &dsm_msg, 0);
         }else if( choice == 64 ){
             // ✅ Now list all registered pages
             printf("\n📋 Registered pages in page_list_data:\n");
             for (int i = 0; i < total_pages; ++i) {
-                printf("  [%03d] %p\n", i, (void *)page_list_data[i].saddr);
+                printf("  [%03d] %p, owner:%d, state(SH/MOD/INV/DIV):%d\n", i, (void *)page_list_data[i].saddr, page_list_data[i].owner, page_list_data[i].state);
             }
         }else if( choice == 65 ){
             // Full page dump test (interactive)
@@ -3040,7 +3685,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             printf("Starting combined local/remote page comparison with OR operation...\n");
             
             // Call the enhanced function
-            if (compare_and_or_pages(restored_pid, uffd, &dsm_msg, conn->fd_handler, or_result_page) != 0) {
+            if (compare_and_or_pages(restored_pid, uffd, &dsm_msg, conn->fd_handler, or_result_page, -1) != 0) {
                 printf("❌ Combined page comparison and OR failed\n");
                 return;
             }
@@ -3071,6 +3716,39 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             }
             
             printf("✅ Complete page merge workflow finished successfully\n");
+        }else if( choice == 69 ){
+            unsigned long input_addr;
+            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            fflush(stdout);
+            if (scanf("%lx", &input_addr) != 1) {
+                fprintf(stderr, "❌ Invalid input\n");
+                kill_and_exit(restored_pid);
+            }printf("[DSM] Address entered: %lx \n",input_addr );
+            
+            
+            printf("\n🔄 COMPLETE PAGE MERGE WORKFLOW TEST\n");
+            printf("====================================\n");
+            printf("Target address: 0x%lx\n", input_addr);
+            printf("Workflow: Compare → OR Merge → Fill Local\n\n");
+            
+            // Prepare message for both local and remote requests
+            dsm_msg.msg_type = MSG_GET_PAGE_DATA;
+            dsm_msg.page_addr = input_addr;  
+            dsm_msg.page_size = 4096;
+            dsm_msg.msg_id = 1001;
+            
+            printf("Starting complete page merge workflow...\n");
+            
+            // Call the complete workflow function
+            if (complete_page_merge_workflow(restored_pid, uffd, &dsm_msg, conn->fd_handler) != 0) {
+                printf("❌ Complete page merge workflow failed\n");
+                return;
+            }
+            
+            printf("✅ Complete page merge workflow finished successfully\n");
+            // Mark page as SHARED and owned by both
+            if(  update_page_info(input_addr, -1, SHARED, -2) != 0) kill_and_exit(restored_pid);
+            disable_wp( uffd, (void *) input_addr); 
         }else if (choice == 7) {
 			// SIMULATE GET_PAGE_DATA
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA;
@@ -3080,7 +3758,54 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             if (send_get_page(dsm_msg, conn->fd_handler, page_data) == 0) {
                 print_global_value_from_page(page_data, sizeof(page_data));
             }
-		} else if (choice == 8) {
+		}else if (choice == 71) {
+            interactive_page_inspect(&dsm_msg, conn->fd_handler, 0);
+        }else if (choice == 72) {
+            interactive_page_inspect(&dsm_msg, conn->fd_handler, 1);
+        }else if (choice == 73) {
+            interactive_page_inspect(&dsm_msg, conn->fd_handler, 2);
+        }else if (choice == 74) {
+            // ACTUAL GET PAGE DATA WITH WRITE ON LOCAL ONE
+            unsigned long input_addr;
+            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            fflush(stdout);
+            if (scanf("%lx", &input_addr) != 1) {
+                fprintf(stderr, "❌ Invalid input\n");
+                //kill_and_exit(restored_pid);
+                continue;
+            }
+
+            printf("[DSM] Address entered: 0x%lx\n", input_addr);
+
+            dsm_msg.msg_type = MSG_GET_PAGE_DATA;
+            dsm_msg.page_addr = input_addr;
+            dsm_msg.page_size = PAGE_SIZE;
+            dsm_msg.msg_id = 1001;
+
+            // =====================================
+            // 1️⃣ Get remote page content
+            // =====================================
+            if (send_get_page(dsm_msg, conn->fd_handler, page_data) == 0) {
+                printf("✅ Remote page received successfully.\n");
+
+                // Print preview of the received page (optional)
+                //print_global_value_from_page(page_data, sizeof(page_data));
+
+                // =====================================
+                // 2️⃣ Copy into local address
+                // =====================================
+                printf("\n[DSM] Writing remote page data into local memory...\n");
+                //disable_wp( uffd, (void *) input_addr);
+                //memcpy((void *)input_addr, page_data, PAGE_SIZE);
+                if( fill_local_page_uffdio(uffd, input_addr, page_data, restored_pid) ){
+                    printf("❌ Failed to update local page at 0x%lx\n", input_addr);
+                    continue;
+                }
+                if( update_page_info(input_addr, -1, SHARED, -2) != 0) kill_and_exit(restored_pid); // Mark page as SHARED and owned by both, if fail, exit and kill
+                printf("✅ Successfully updated local page at 0x%lx\n", input_addr);
+
+            }
+        }else if (choice == 8) {
 			// SIMULATE GET_PAGE_DATA_AND_INVALIDATE
 			dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
 			dsm_msg.page_addr = aligned;  // or any test address
@@ -3089,7 +3814,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             if (send_get_page(dsm_msg, conn->fd_handler, page_data) == 0) {
                 print_global_value_from_page(page_data, sizeof(page_data));
             }
-            printf("[CLIENT] Sent MSG_GET_PAGE_DATA_INVALID to server.\n");
+            printf("[SERVER] Sent MSG_GET_PAGE_DATA_INVALID to server.\n");
 		} else if (choice == 9) {
 			// SIMULATE INVALIDATE
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
@@ -3097,15 +3822,15 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 			dsm_msg.page_size = 4096;
 			dsm_msg.msg_id = 1001;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[CLIENT] Sent MSG_SEND_INVALIDATE to server.\n");
+			printf("[SERVER] Sent MSG_SEND_INVALIDATE to server.\n");
 		}else if (choice == 10) {
 			dsm_msg.msg_type = MSG_WAKE_THREAD;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n");
+			printf("[SERVER] Sent MSG_WAKE_THREAD to server.\n");
 		}else if (choice == 11) {
 			dsm_msg.msg_type = MSG_STOP_THREAD;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[CLIENT] Sent MSG_STOP_THREAD to server.\n");
+			printf("[SERVER] Sent MSG_STOP_THREAD to server.\n");
 		}else if (choice == 12) {
             //vmsplice test
 			printf("Print mutex content test at %p\n", (void *)0x0c0);
@@ -3118,6 +3843,27 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
         }else if (choice == 13){
 			printf("Change mutex content %p\n", (void *)0x5555555580c0);
 			runUnlockMutex(restored_pid, (void *)0x5555555580c0);
+        }else if (choice == 55){
+            printf("Barrier, releasing...\n");
+            pthread_mutex_lock(&barrier.lock);
+            // mark that remote threads have arrived, this is useful if we come before the local threads have, 
+            //so that we don't care if the signal was lost since we can check the variable
+            remote_threads_barrier_arrived = 1; 
+            pthread_cond_broadcast(&barrier.cond);
+			printf("Barrier released!\n");
+            pthread_mutex_unlock(&barrier.lock);
+        }else if (choice == 56){
+            printf("Barrier, releasing...\n");
+            pthread_mutex_lock(&barrier.lock);
+            // mark that remote threads have arrived, this is useful if we come before the local threads have, 
+            //so that we don't care if the signal was lost since we can check the variable
+            remote_threads_barrier_arrived = 1; 
+            pthread_cond_broadcast(&barrier.cond);
+			printf("Local Barrier released!\n");
+            dsm_msg.msg_type = MSG_BARRIER_RELEASE;
+			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
+			printf("[SERVER] Sent MSG_BARRIER_RELEASE to client.\n");
+            pthread_mutex_unlock(&barrier.lock);
         }else {
             printf("[DSM] Unknown command: %d\n", choice);
         }
