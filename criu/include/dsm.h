@@ -38,7 +38,9 @@
 extern unsigned long global_addr;
 extern unsigned long aligned;
 extern int total_pages;
-
+extern int uffd;
+extern int restored_pid;
+extern int local_threads;
 /****************** Enums ******************/
 
 enum msg_type {
@@ -126,6 +128,8 @@ extern barrier_state_t barrier;
 extern pthread_mutex_t fault_lock;
 extern unsigned long active_fault_addr;
 extern int active_fault_tid;
+extern struct vm_area_list* my_vm_area_list;
+extern unsigned long start_address, end_address;
 /****************** Function Declarations ******************/
 void mark_fault_start(unsigned long addr, const char *who, pid_t tid);
 void mark_fault_end(unsigned long addr, const char *who, pid_t tid);
