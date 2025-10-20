@@ -35,7 +35,7 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
 //#undef uffdio_range
-#include "user.h"
+//#include "user.h"
 
 //#include "parsemap.h"
 
@@ -43,7 +43,6 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 #include "pie/parasite-blob.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
-struct vm_area_list* my_vm_area_list;
 
 //#define PAGE_SIZE 4096
 #include "page.h" //this takes the page size
@@ -53,11 +52,6 @@ struct vm_area_list* my_vm_area_list;
 // Setup global variable address 
 extern unsigned long global_addr;
 extern unsigned long aligned;
-unsigned long start_address, end_address;
-extern int total_pages;
-int restored_pid;
-int uffd;
-int local_threads;
 
 #include "dsm.h"
 #include "dsm_log.h"
@@ -68,7 +62,6 @@ struct params {
     long page_size;
     int client_send_socket;
 };
-int total_pages;
 
 
 #include <dirent.h>

@@ -30,7 +30,7 @@ struct vm_area_list* my_vm_area_list;
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
-#include "user.h"
+//#include "user.h"
 #include "page.h" //this takes the page size
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 // Setup global variable address 
@@ -47,6 +47,7 @@ int remote_threads_barrier_arrived = 0;
 unsigned long global_addr = 0x555555558080;
 unsigned long aligned = 0x555555558080 & ~(PAGE_SIZE - 1);
 
+unsigned long start_address, end_address;
 pthread_mutex_t pagefaults_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Global or shared debug map
@@ -55,7 +56,9 @@ unsigned long active_fault_addr = 0;
 unsigned long remote_barrier_addr = 0;
 unsigned long local_barrier_addr = 0;
 int active_fault_tid = -1;
-
+page_list page_list_data[MAX_PAGE_COUNT];
+int total_pages = 0;
+int uffd, restored_pid, local_threads;
 /*
 unsigned long global_addr = 0x5555555580c0;
 unsigned long aligned = 0x5555555580c0 & ~(PAGE_SIZE - 1);
@@ -73,6 +76,8 @@ void barrier_init(void) {
 #include "vma.h"
 #include "mem.h"       // Required for xmalloc()
 #include "cr_options.h"
+
+struct vm_area_list* my_vm_area_list;
 
 void print_vm_area_list(struct vm_area_list *list) {
     struct vma_area *vma;
@@ -206,12 +211,11 @@ void disable_region_wp( int uffd, void *addr, size_t length) {
 
 
 
-page_list page_list_data[MAX_PAGE_COUNT];
-int total_pages = 0;
 
 
 
 int check_process_state(int pid) {
+    int ret; 
     char stat_path[64], state;
     FILE *f;
     
@@ -219,14 +223,15 @@ int check_process_state(int pid) {
     f = fopen(stat_path, "r");
     if (!f) return -1;
     
-    fscanf(f, "%*d %*s %c", &state);
+    ret = fscanf(f, "%*d %*s %c", &state);
     fclose(f);
     PRINT("Process state:%c\n", state);
     if (state == 'D') {
         pr_warn("Process %d in uninterruptible sleep\n", pid);
         return 1; // Problematic state
     }
-    return 0;
+    ret = 0;
+    return ret;
 }
 
 

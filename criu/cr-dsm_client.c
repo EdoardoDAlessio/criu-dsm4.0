@@ -9,7 +9,6 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #define HANDSHAKE_MSG "READY"
-int restored_pid, uffd;
 
 #define SIGMAX 64
 
@@ -22,7 +21,6 @@ int restored_pid, uffd;
 #include <compel/ptrace.h>
 #include "compel/plugins/std/fds.h"
 #include "compel/include/uapi/infect-util.h"
-struct vm_area_list* my_vm_area_list;
 /***************** END INFECTION HEADERS ************************/
 
 /***************** USERFAULTFD HEADERS ************************/
@@ -33,7 +31,7 @@ struct vm_area_list* my_vm_area_list;
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
-#include "user.h"
+//#include "user.h"
 #include "page.h" //this takes the page size
 // Setup global variable address 
 extern unsigned long global_addr;
@@ -43,12 +41,7 @@ extern unsigned long aligned;
 // Setup global variable address 
 extern unsigned long global_addr;
 extern unsigned long aligned;
-unsigned long start_address, end_address;
-extern int total_pages;
-int restored_pid;
-int uffd;
 int total_threads = 2; //total threads (local + remote)
-int local_threads;
 //Special PTHREAD traps DSM 
 
 #include "dsm.h"
