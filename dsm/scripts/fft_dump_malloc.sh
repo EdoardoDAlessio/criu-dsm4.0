@@ -1,35 +1,27 @@
 #!/bin/bash
 set -e
 
-if [ "$#" -lt 3 ]; then
-  echo "Usage: $0 <app name> <client host name> <num_threads> [extra args...]"
+if [ "$#" -lt 2 ]; then
+  echo "Usage: $0 <app name> <client host name> [extra args...]"
+  echo "./fft_dump_malloc.sh FFT dsm_client -m22 -p4 -t"
   exit 1
 fi
 
 app=$1
 client=$2
-threads=$3
-shift 3
+shift 2
 extra_args=("$@")
 
 dump_dir=~/${app}/images
 
-# Clean previous logs
-rm -f /tmp/mmapalloc_log
-
-# 📂 Prepare build / app directory
-cd ~/criu/dsm/my_malloc
-if [ ! -f mymmapalloc.so ]; then
-  echo "🛠️ Compiling mmap alloc interposer..."
-  gcc -Wall -fPIC -shared -o mymmapalloc.so /root/criu/dsm/my_malloc/mymmapalloc.c -ldl
-fi
 
 rm -rf ~/${app}
 mkdir -p "$dump_dir"
-cp ~/splash2/codes/kernels/fft/${app} ~/${app}
+#cp ~/splash2/codes/kernels/fft/${app} ~/${app}
+cp ~/criu/dsm/apps/${app} ~/${app}
 cd ~/${app}
 
-echo "🚀 Starting $app with $threads threads..."
+echo "🚀 Starting $app ..."
 rm -f /tmp/criu-restored.pid
 rm -f /tmp/haltcode
 

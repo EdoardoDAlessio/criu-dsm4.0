@@ -17,7 +17,7 @@
 
 #define DBG 1
 #define COMMAND_LOOP 1 
-#define ENABLE_SERVER 1
+#define ENABLE_SERVER 0
 #define COMMAND_THREAD ENABLE_SERVER & COMMAND_LOOP
 #define EP 0
 

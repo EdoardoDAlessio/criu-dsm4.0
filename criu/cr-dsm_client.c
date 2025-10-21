@@ -63,7 +63,9 @@ static void *handler(void *arg) {
     };
 	unsigned long addr;
 	unsigned char ack = 0;
+	#if ENABLE_SERVER
 	unsigned char page_data[PAGE_SIZE] = {0}; 
+	#endif
 	struct uffdio_copy copy;
 	int index;
 	struct uffdio_range r;

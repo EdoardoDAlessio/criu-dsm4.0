@@ -21,7 +21,7 @@ fi
 cd ~/"${app}" || { echo "App directory not found"; exit 1; }
 readelf -s "./$app" | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > /tmp/readelf.txt
 
-rm -r images
+rm -rf images
 cp -r backup images
 
 # Go to images directory
