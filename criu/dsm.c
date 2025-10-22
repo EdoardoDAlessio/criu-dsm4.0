@@ -1142,6 +1142,90 @@ int wait_for_connection(int listen_fd) {
     return conn_fd;
 }
 
+
+int dsm_connectivity_test(struct dsm_connection *conn, bool is_server)  {
+    struct msg_info msg_in = {0}, msg_out = {0};
+    ssize_t n;
+
+    /* ============================
+     * Test 1: SERVER->CLIENT path
+     * ============================ */
+    if (is_server) {
+        // 1. Server sends on handler
+        msg_out.msg_type = MSG_HANDSHAKE;
+        msg_out.page_addr = 0xABCDEF01;
+        msg_out.page_size = 4096;
+        msg_out.msg_id = 1;
+
+        PRINT("[DSM-CONN] [SERVER] (Test1) Sending PING on fd_handler=%d\n", conn->fd_handler);
+        n = send(conn->fd_handler, &msg_out, sizeof(msg_out), 0);
+        if (n != sizeof(msg_out)) { perror("[SERVER] send PING"); return -1; }
+
+        // 2. Server receives ACK on command
+        n = recv(conn->fd_command, &msg_in, sizeof(msg_in), 0);
+        if (n != sizeof(msg_in)) { perror("[SERVER] recv ACK"); return -1; }
+        if (msg_in.msg_type != MSG_ACK) { fprintf(stderr, "[SERVER] Invalid ACK\n"); return -1; }
+
+        PRINT("[DSM-CONN] [SERVER] (Test1) OK: handler->command ✅\n");
+    } else {
+        // 1. Client receives PING on command
+        n = recv(conn->fd_command, &msg_in, sizeof(msg_in), 0);
+        if (n != sizeof(msg_in)) { perror("[CLIENT] recv PING"); return -1; }
+        if (msg_in.msg_type != MSG_HANDSHAKE) { fprintf(stderr, "[CLIENT] Unexpected msg\n"); return -1; }
+
+        PRINT("[DSM-CONN] [CLIENT] (Test1) Received PING on fd_command=%d\n", conn->fd_command);
+
+        // 2. Client replies ACK on handler
+        msg_out.msg_type = MSG_ACK;
+        n = send(conn->fd_handler, &msg_out, sizeof(msg_out), 0);
+        if (n != sizeof(msg_out)) { perror("[CLIENT] send ACK"); return -1; }
+
+        PRINT("[DSM-CONN] [CLIENT] (Test1) Sent ACK on fd_handler=%d\n", conn->fd_handler);
+    }
+
+    /* ============================
+     * Test 2: CLIENT->SERVER path
+     * ============================ */
+    if (!is_server) {
+        // 1. Client sends on command
+        msg_out.msg_type = MSG_HANDSHAKE;
+        msg_out.page_addr = 0xBEEFDEAD;
+        msg_out.page_size = 4096;
+        msg_out.msg_id = 2;
+
+        PRINT("[DSM-CONN] [CLIENT] (Test2) Sending PING on fd_command=%d\n", conn->fd_command);
+        n = send(conn->fd_command, &msg_out, sizeof(msg_out), 0);
+        if (n != sizeof(msg_out)) { perror("[CLIENT] send PING2"); return -1; }
+
+        // 2. Client receives ACK on handler
+        n = recv(conn->fd_handler, &msg_in, sizeof(msg_in), 0);
+        if (n != sizeof(msg_in)) { perror("[CLIENT] recv ACK2"); return -1; }
+        if (msg_in.msg_type != MSG_ACK) { fprintf(stderr, "[CLIENT] Invalid ACK2\n"); return -1; }
+
+        PRINT("[DSM-CONN] [CLIENT] (Test2) OK: command->handler ✅\n");
+    } else {
+        // 1. Server receives PING on handler
+        n = recv(conn->fd_handler, &msg_in, sizeof(msg_in), 0);
+        if (n != sizeof(msg_in)) { perror("[SERVER] recv PING2"); return -1; }
+        if (msg_in.msg_type != MSG_HANDSHAKE) { fprintf(stderr, "[SERVER] Unexpected msg2\n"); return -1; }
+
+        PRINT("[DSM-CONN] [SERVER] (Test2) Received PING on fd_handler=%d\n", conn->fd_handler);
+
+        // 2. Server replies ACK on command
+        msg_out.msg_type = MSG_ACK;
+        n = send(conn->fd_command, &msg_out, sizeof(msg_out), 0);
+        if (n != sizeof(msg_out)) { perror("[SERVER] send ACK2"); return -1; }
+
+        PRINT("[DSM-CONN] [SERVER] (Test2) Sent ACK on fd_command=%d\n", conn->fd_command);
+    }
+
+    PRINT("[DSM-CONN] [%s] Connectivity fully verified (4 paths OK) 🎉\n",
+          is_server ? "SERVER" : "CLIENT");
+    return 0;
+}
+
+
+
 int dsm_setup_dual_connections(struct dsm_connection *conn) {
     int fd_handler_listen = create_server_socket(PORT_HANDLER);
     int fd_command_listen = create_server_socket(PORT_COMMAND);
@@ -3468,6 +3552,41 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 	int bin;
     unsigned char page_data[4096];
 	struct msg_info dsm_msg = {0};
+    const char *menu =
+    "\n[DSM] Enter command:\n"
+    ">  0  = reapply write-protection\n"
+    ">  1  = remote madvise(MADV_DONTNEED)\n"
+    "> 21  = restart process (send SIGCONT)\n"
+    "> 22  = stop process (send SIGSTOP)\n"
+    "> 23  = restart local and remote processes (send SIGCONT & WAKE UP REMOTE THREAD)\n"
+    ">  3  = restart process (send compel cure)\n"
+    ">  4  = exit\n"
+    ">  5  = simple infection test\n"
+    "> 61  = test vmsplice\n"
+    "> 62  = test vmsplice full page\n"
+    ">631  = Full page dump test (interactive) [as int]\n"
+    ">632  = Full page dump test (interactive) [as double]\n"
+    ">633  = Full page dump test (interactive) [as float]\n"
+    "> 64  = all pages registered\n"
+    "> 65  = DIVIDED page dump test (interactive)\n"
+    "> 66  = DIVIDED page local/remote (interactive)\n"
+    "> 67  = DIVIDED page local/remote and OR operation (interactive)\n"
+    "> 68  = DIVIDED page local/remote and OR operation and possibly update local copy (fixed address)\n"
+    "> 69  = DIVIDED page local/remote and OR operation and possibly update local copy (interactive)\n"
+    ">  7  = SIMULATE GET_PAGE_DATA\n"
+    "> 71  = GET_PAGE_DATA (interactive) [as int]\n"
+    "> 72  = GET_PAGE_DATA (interactive) [as float]\n"
+    "> 73  = GET_PAGE_DATA (interactive) [as double]\n"
+    "> 74  = REAL GET_PAGE_DATA with LOCAL COPY (interactive)\n"
+    ">  8  = SIMULATE GET_PAGE_DATA_AND_INVALIDATE\n"
+    ">  9  = SIMULATE INVALIDATE\n"
+    "> 10  = WAKE UP REMOTE THREAD\n"
+    "> 11  = STOP REMOTE THREAD\n"
+    "> 12  = Show mutex page content\n"
+    "> 13  = Change mutex lock\n"
+    "> 55  = Barrier release\n";
+
+
 	(void) bin;
 	(void) args;	
 	(void) dsm_msg;	
@@ -3478,49 +3597,48 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
         send_sigcont(restored_pid);
         return;
     }
+  
     sleep(1);
-    printf("\n[DSM] Enter command:\n>");
-    printf("  0 = reapply write-protection\n> ");
-    printf("  1 = remote madvise(MADV_DONTNEED)\n> ");
-    printf("  21 = restart process (send SIGCONT)\n> ");
-    printf("  22 = stop process (send SIGSTOP)\n> ");
-    printf("  23 = restart local and remote processes (send SIGCONT & WAKE UP REMOTE THREAD)\n> ");
-    printf("  3 = restart process (send compel cure)\n> ");
-    printf("  4 = exit\n> ");
-    printf("  5 = simple infection test\n> ");
-    printf("  61 = test vmsplice\n> ");
-    printf("  62 = test vmsplice full page\n> ");
-    printf("  631 = Full page dump test (interactive) [as int]\n> ");
-    printf("  632 = Full page dump test (interactive) [as double] \n> ");
-    printf("  633 = Full page dump test (interactive) [as float] \n> ");
-    printf("  64 = all pages registered\n> ");
-    printf("  65 = DIVIDED page dump test (interactive)\n> ");
-    printf("  66 = DIVIDED page local/remote (interactive)\n> ");
-    printf("  67 = DIVIDED page local/remote and OR operation (interactive)\n> ");
-    printf("  68 = DIVIDED page local/remote and OR operation and possibly update local copy (fixed address)\n> ");
-    printf("  69 = DIVIDED page local/remote and OR operation and possibly update local copy (interactive)\n> ");
-    printf("  7 = SIMULATE GET_PAGE_DATA\n> ");
-    printf("  71 = GET_PAGE_DATA (interactive) [as int] \n> ");
-    printf("  72 = GET_PAGE_DATA (interactive) [as float] \n> ");
-    printf("  73 = GET_PAGE_DATA (interactive) [as double] \n> ");
-    printf("  74 = REAL GET_PAGE_DATA with LOCAL COPY (interactive)\n> ");
-    printf("  8 = SIMULATE GET_PAGE_DATA_AND_INVALIDATE\n> ");
-    printf("  9 = SIMULATE INVALIDATE\n> ");
-    printf("  10 = WAKE UP REMOTE THREAD\n> ");
-    printf("  11 = STOP REMOTE THREAD\n> ");
-    printf("  12 = Show mutex page content\n> ");
-    printf("  13 = Change mutex lock\n> ");
-    printf("  55 = Barrier release\n> ");
+    fputs(menu, stdout);   /* prints whole menu at once */
+    printf("[DEBUG] isatty(stdin)=%d\n", isatty(0));
     fflush(stdout);
-    while (1) {
-        int choice;
-        
 
+    while (1) {
+        char line[64];
+        int choice;
+        char *endptr;
+
+        printf("\n[DSM] Enter command:\n> ");
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            perror("fgets");
+            clearerr(stdin);
+            continue;
+        }
+
+        // Trim newline
+        line[strcspn(line, "\n")] = '\0';
+
+        // If user entered nothing, skip
+        if (strlen(line) == 0)
+            continue;
+
+        // Convert to int safely
+        choice = strtol(line, &endptr, 10);
+        if (*endptr != '\0') {
+            printf("[WARN] Invalid input: '%s'\n", line);
+            continue;
+        }
+
+        printf("[DEBUG] parsed choice=%d\n", choice);
+    
+        /*
         if (scanf("%d", &choice) != 1) {
             printf("Invalid input\n");
             while (getchar() != '\n'); // flush
             continue;
-        }
+        }*/
 
         if (choice == 0) {
             printf("[DSM] Reapplying write-protection on global page...\n");

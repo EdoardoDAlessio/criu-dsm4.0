@@ -21,13 +21,13 @@ fi
 cd ~/"${app}" || { echo "App directory not found"; exit 1; }
 readelf -s "./$app" | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > /tmp/readelf.txt
 
-rm -rf images
+sudo rm -rf images
 cp -r backup images
 
 # Go to images directory
 cd ~/"${app}/images" || { echo "Image directory not found"; exit 1; }
 cp ranges.txt /tmp/ranges.txt
-
+cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt
 # Apply thread filtering (range passed directly)
 if [ "$3" == "--verbose" ]; then
   python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range"
@@ -36,7 +36,7 @@ else
 fi
 
 # Remove previous PID file
-rm -f /tmp/criu-restored.pid
+sudo rm -f /tmp/criu-restored.pid
 
 
 # Setting program arguments
@@ -46,4 +46,16 @@ echo $first > /tmp/authorized_barrier_thread.txt
 # Trigger CRIU restore
 touch /tmp/.restore_flag
 touch /tmp/haltcode
+
+# Clean up defunct processes with same PID as in CRIU image
+#defunct_pid=$(ps -ef | awk '/\[.*\] <defunct>/{print $2}' | head -n1)
+echo "🧹 Checking for defunct processes of $app..."
+defunct_pid=$(pidof $app) 
+if [ -n "$defunct_pid" ]; then
+  echo "🧹 Cleaning zombie PID $defunct_pid..."
+  sudo kill -9 $(ps -o ppid= -p "$defunct_pid" 2>/dev/null) 2>/dev/null || true
+fi
+
+
+
 sudo ~/criu/criu/criu restore --shell-job --dsm_server $verbose_flag

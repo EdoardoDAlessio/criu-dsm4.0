@@ -2,35 +2,29 @@
 set -e
 
 if [ "$#" -lt 3 ]; then
-  echo "Usage: $0 <app name> <client host name> <num_threads> [extra args...]"
+  echo "Usage: $0 <app name> <client host name> [extra args...]"
+  echo "./lu_dump.sh LU dsm_client -n256 -b64 -p4 -t -s"
+  echo "For restore, use main_restore.sh script with ~/criu/dsm/scripts/main_restore.sh LU 0-1 --verbose"
   exit 1
 fi
 
+
 app=$1
 client=$2
-threads=$3
-shift 3
+shift 2
 extra_args=("$@")
 
 dump_dir=~/${app}/images
 
-# Clean previous logs
-rm -f /tmp/mmapalloc_log
-
-# 📂 Prepare build / app directory
-cd ~/criu/dsm/my_malloc
-if [ ! -f mymmapalloc.so ]; then
-  echo "🛠️ Compiling mmap alloc interposer..."
-  gcc -Wall -fPIC -shared -o mymmapalloc.so /root/criu/dsm/my_malloc/mymmapalloc.c -ldl
-fi
 
 rm -rf ~/${app}
 mkdir -p "$dump_dir"
-cp ~/splash2/codes/kernels/lu/contiguous_blocks/${app} ~/${app}
+#cp ~/splash2/codes/kernels/lu/contiguous_blocks/${app} ~/${app}
+cp ~/criu/dsm/apps/${app} ~/${app}
 cd ~/${app}
 
-echo "🚀 Starting $app with $threads threads..."
-rm -f /tmp/criu-restored.pid
+echo "🚀 Starting $app...."
+sudo rm -f /tmp/criu-restored.pid
 rm -f /tmp/haltcode
 
 # Run LU (main thread is also a worker)
@@ -51,6 +45,7 @@ sleep 5
 sudo ~/criu/criu/criu dump -t "$app_pid" --images-dir "$dump_dir" --shell-job -v
 
 cp /tmp/ranges.txt ~/${app}/images/.
+cp /tmp/dsm_barrier_pages.txt ~/${app}/images/.
 echo "✅ Dump completed. Backing up images..."
 cp -r ~/${app}/images ~/${app}/backup
 

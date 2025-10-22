@@ -22,7 +22,7 @@ cp ~/criu/dsm/apps/${app} ~/${app}
 cd ~/${app}
 
 echo "🚀 Starting $app ..."
-rm -f /tmp/criu-restored.pid
+sudo rm -f /tmp/criu-restored.pid
 rm -f /tmp/haltcode
 
 # Run FFT (main thread is also a worker)
@@ -43,6 +43,7 @@ sleep 5
 sudo ~/criu/criu/criu dump -t "$app_pid" --images-dir "$dump_dir" --shell-job -v
 
 cp /tmp/ranges.txt ~/${app}/images/.
+cp /tmp/dsm_barrier_pages.txt ~/${app}/images/.
 echo "✅ Dump completed. Backing up images..."
 cp -r ~/${app}/images ~/${app}/backup
 

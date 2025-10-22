@@ -196,7 +196,7 @@ static void *handler(void *arg) {
 
 	//sleep(5);
 #if !DBG 
-send_sigcont(restored_pid);
+	send_sigcont(restored_pid);
 #endif
 
     while (1) {
@@ -605,6 +605,8 @@ void start_dsm_server(void)
 
 	FILE *f = fopen("/tmp/dsm_barrier_pages.txt", "r");
     FILE *f2 = fopen("/tmp/ranges.txt", "r");
+
+
 	char line[256]; 
 
 	(void) line;
@@ -635,19 +637,26 @@ void start_dsm_server(void)
 	custom_fd_remote = fds[1];  // to be sent into parasite
 
 #if ENABLE_SERVER
-	for( i = 0; i < NUM_THREADS; i++ ){
+	for (i = 0; i < NUM_THREADS; i++) {
 		if (dsm_setup_dual_connections(&conn[i]) < 0) {
-				fprintf(stderr, "Failed to set up DSM connections\n");
-				kill_and_exit(restored_pid);
+			fprintf(stderr, "Failed to set up DSM connections\n");
+			kill_and_exit(restored_pid);
 		}
-		param.fd_handler[i] = conn[i].fd_handler; //give the thread's fault handler the connection to all clients
 
-		//PRINT("Checking connection as RECEIVER on COMMAND\n");
-		//perform_struct_handshake(conn[i].fd_handler, conn[i].fd_command, false);
-		//PRINT("Checking connection as SENDEE on COMMAND\n");
-		//perform_struct_handshake(conn[i].fd_command, conn[i].fd_command, true);
+		param.fd_handler[i] = conn[i].fd_handler;
+		
+		printf("[DSM-CONN] [%s] handler_fd=%d command_fd=%d\n",
+      		 "SERVER" , conn[i].fd_handler, conn[i].fd_command);
+
+
+		PRINT("[DSM] Checking connectivity on handler connection...\n");
+		if (dsm_connectivity_test(&conn[i], true) < 0) {
+			fprintf(stderr, "[DSM] Connectivity test failed for thread %d\n", i);
+			kill_and_exit(restored_pid);
+		}
+		PRINT("[DSM] Connectivity OK for thread %d ✅\n", i);
 	}
-#endif 
+#endif
 
 	local_threads = get_local_thread_count(restored_pid);
 	PRINT("local threads:%d\n", local_threads );
@@ -751,6 +760,14 @@ void start_dsm_server(void)
 	pthread_create(&uffd_thread, NULL, handler, &param);
 	
 
+#if ENABLE_SERVER
+	PRINT("[DSM] Checking connectivity on handler connection...\n");
+	if (dsm_connectivity_test(&conn[0], true) < 0) {
+		fprintf(stderr, "[DSM] Connectivity test failed for thread %d\n", 0);
+		kill_and_exit(restored_pid);
+	}
+	PRINT("[DSM] Connectivity OK for thread %d ✅\n", 0);
+#endif
 
 #if COMMAND_THREAD
 	PRINT("[DSM Server] Connections established. Creating thread for command loop\n");

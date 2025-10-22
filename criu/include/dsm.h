@@ -15,7 +15,7 @@
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
 
-#define DBG 1
+#define DBG 0
 #define COMMAND_LOOP 1 
 #define ENABLE_SERVER 0
 #define COMMAND_THREAD ENABLE_SERVER & COMMAND_LOOP
@@ -152,6 +152,7 @@ void read_proc_maps(int restored_pid);
 int create_server_socket(int port);
 int wait_for_connection(int listen_fd);
 int dsm_setup_dual_connections(struct dsm_connection *conn);
+int dsm_connectivity_test(struct dsm_connection *conn, bool is_server);
 int connect_to_port(const char *server_ip, int port);
 int dsm_client_dual_connect(struct dsm_connection *conn, const char *server_ip);
 int perform_struct_handshake(int send_fd, int recv_fd, bool is_sender);
