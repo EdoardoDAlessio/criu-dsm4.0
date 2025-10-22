@@ -73,11 +73,12 @@ static void *handler(void *arg) {
 	(void) n;
     DSM_EVENT_HANDLER("[handler] started, uffd = %d\n", p->uffd);
 
-	//sleep(5);
+	
 	//dsm_msg.msg_type = MSG_WAKE_THREAD;
 	//send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0);
 	//printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n");
 #if !DBG 
+sleep(5);
 send_sigcont(restored_pid);
 #endif
     while (1) {
@@ -484,15 +485,19 @@ void start_dsm_client(const char *server_ip)
 		kill_and_exit(restored_pid);
 	}
 
+	PRINT("[DSM] Checking connectivity with server...\n");
+	
+	printf("[DSM-CONN] [%s] handler_fd=%d command_fd=%d\n",
+         "CLIENT", conn.fd_handler, conn.fd_command);
 
-	/*PRINT("Checking connection as SENDER on HANDLER\n");
-	perform_struct_handshake(conn.fd_handler, conn.fd_handler, true);
-	PRINT("Checking connection as RECEIVER on HANDLER\n");
-	perform_struct_handshake(conn.fd_handler, conn.fd_handler, false);*/
 
+	if (dsm_connectivity_test(&conn, false) < 0) {
+		fprintf(stderr, "[DSM] Connectivity test failed\n");
+		kill_and_exit(restored_pid);
+	}
+	PRINT("[DSM] Connectivity OK ✅\n");
 
 	
-
 	//Start infection
 	uffd = stealUFFD(restored_pid);
 
@@ -571,6 +576,16 @@ void start_dsm_client(const char *server_ip)
 	//Spawn handler thread
 	pthread_create(&uffd_thread, NULL, handler, &param);
 
+
+	
+	PRINT("[DSM] Checking connectivity with server...\n");
+	if (dsm_connectivity_test(&conn, false) < 0) {
+		fprintf(stderr, "[DSM] Connectivity test failed\n");
+		kill_and_exit(restored_pid);
+	}
+	PRINT("[DSM] Connectivity OK ✅\n");
+
+
 #if COMMAND_THREAD
 	PRINT("[DSM Client] Connections established. Creating thread for command loop\n");
 
@@ -605,7 +620,7 @@ void start_dsm_client(const char *server_ip)
 #elif ENABLE_CLIENT
 	PRINT("[DSM Client] Connections established. Entering main loop...\n");
     dsm_client_main_loop(conn.fd_command);
-	if(!DBG) send_sigcont(restored_pid);
+	//if(!DBG) send_sigcont(restored_pid);
 #endif
 
 	PRINT("Killing and exiting\n");
