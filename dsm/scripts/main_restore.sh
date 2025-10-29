@@ -17,6 +17,9 @@ if [ "$3" == "--verbose" ]; then
   echo "🚀 Saving readelf..."
 fi
 
+sudo kill -9 $(pidof criu) 2>/dev/null || true
+sudo kill -9 $(pidof "$app") 2>/dev/null || true
+
 # Change to app folder and dump readelf
 cd ~/"${app}" || { echo "App directory not found"; exit 1; }
 readelf -s "./$app" | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > /tmp/readelf.txt

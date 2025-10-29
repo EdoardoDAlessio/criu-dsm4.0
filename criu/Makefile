@@ -42,6 +42,11 @@ include $(__nmk_dir)msg.mk
 # Needed libraries checks
 include criu/Makefile.packages
 
+# DSM library build
+#include criu/Makefile.dsm
+#all-y += $(DSM_LIB)
+
+
 #
 # Architecture dependent part.
 ARCH-LIB		:= $(ARCH_DIR)/crtools.built-in.o
@@ -83,10 +88,10 @@ $(obj)/Makefile.packages: ;
 $(obj)/%: pie
 	$(Q) $(MAKE) $(call build-as,Makefile.crtools,criu) $@
 
-#DSM: added -lpthread
+#DSM: added -lpthread, and -libverbs for RDMA
 $(obj)/criu: $(PROGRAM-BUILTINS)
 	$(call msg-link, $@)
-	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@ -lpthread 
+	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) $(WRAPFLAGS) $(GMONLDOPT) -rdynamic -o $@ -lpthread -libverbs
 
 UNIT-BUILTINS		+= $(obj)/util.o
 UNIT-BUILTINS		+= $(obj)/config.o

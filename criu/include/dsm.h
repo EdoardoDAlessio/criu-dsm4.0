@@ -5,6 +5,9 @@
 #include <stdint.h>  // for uint8_t, uint64_t
 #include <sys/types.h> // for pid_t
 #include "vma.h" 
+#include <linux/types.h>
+
+#include <infiniband/verbs.h> //RDMA
 /****************** Constants ******************/
 
 #include "page.h" //this takes the page size #define PAGE_SIZE 4096
@@ -15,9 +18,10 @@
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
 
+#define RDMA_ENABLE 1
 #define DBG 0
-#define COMMAND_LOOP 1 
-#define ENABLE_SERVER 0
+#define COMMAND_LOOP 0
+#define ENABLE_SERVER 1
 #define COMMAND_THREAD ENABLE_SERVER & COMMAND_LOOP
 #define EP 0
 
@@ -32,7 +36,7 @@
 
 #define MAX_PAGE_COUNT 100000 //general pages
 #define MAX_PAGES 100 //malloc pages
-
+#define MAX_RDMA_REGIONS 128
 /****************** Global Variables (defined in dsm.c) ******************/
 
 extern unsigned long global_addr;
@@ -41,6 +45,7 @@ extern int total_pages;
 extern int uffd;
 extern int restored_pid;
 extern int local_threads;
+extern int pidfd;
 /****************** Enums ******************/
 
 enum msg_type {
@@ -93,6 +98,8 @@ typedef struct {
     int state;
 	int page_numbers; //if you have a continuous range, each page will tell how many pages are toghether
 	int index_of_allocs; // != 0 if it's from malloc, the value gives the index of PageAlloc in allocs array
+    void *rdma_addr;          // pointer inside RDMA mmap region
+    int rdma_region_idx;      // index into rdma_context.regions[] if you keep those
 } page_list ;
 
 typedef struct {
@@ -107,6 +114,7 @@ typedef struct barrier_state {
     pthread_mutex_t lock;
     pthread_cond_t cond;     // signal resolver when all arrived
 } barrier_state_t;
+
 
 void barrier_init(void);
 /****************** Extern Variables ******************/
@@ -167,6 +175,7 @@ int enable_wp(int uffd, void *addr);
 void disable_wp(int uffd, void *addr);
 
 // DSM helpers
+void register_ranges_from_file(int uffd);
 unsigned long leakGlobalPage(int restored_pid, unsigned long offset);
 int replaceGlobalWithAnonPage(int restored_pid, void *addr);
 int print_global_value_from_page(void *page_buf, size_t page_len) ;
@@ -178,6 +187,8 @@ int runUnlockMutex(int restored_pid, void *mutex_addr);
 int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg, int print_int);
 int test_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg);
 int runMADVISE(int restored_pid, void *addr, size_t len);
+int init_pidfd(int restored_pid);
+int run_proc_MADVISE(int pidfd, int restored_pid, void *addr, size_t len);
 int read_invalidate(int restored_pid, void *addr);
 int stealUFFD(int restored_pid);
 int infection_test(int restored_pid);
@@ -199,4 +210,96 @@ int dsm_test_init(int restored_pid);
 void dsm_test_finalize(void);
 void dsm_test_generate_report(void);
 int dsm_test_mode_controller(int restored_pid, int uffd);
+
+
+#if RDMA_ENABLE
+
+#include <infiniband/verbs.h>
+#include <stdint.h>
+#include <stdbool.h>
+/* --------- Simple RDMA Context --------- */
+typedef struct {
+    struct ibv_context *ctx;
+    struct ibv_pd *pd;
+    struct ibv_cq *cq;
+    struct ibv_qp *qp;
+    struct ibv_mr *mr;
+    void *base_addr;
+    size_t length;
+    uint32_t rkey;
+    uint32_t lkey;
+    uint32_t psn;
+    uint32_t max_inline;
+    struct ibv_port_attr port_attr;
+    union ibv_gid gid;
+} rdma_context;
+
+/* --------- Wire Info exchanged over TCP --------- */
+
+
+#pragma pack(push,1)
+typedef struct {
+    uint32_t qp_num;   /* network byte order on wire */
+    uint16_t lid;      /* network byte order on wire (0 per RoCE) */
+    uint8_t  gid[16];  /* raw */
+    uint32_t psn;      /* network byte order */
+    uint32_t rkey;     /* network byte order */
+    uint64_t vaddr;    /* big-endian on wire */
+} rdma_wire_info;
+#pragma pack(pop)
+
+
+typedef struct __attribute__((packed))  {
+    uint64_t target_addr;   /* client's RDMA buffer addr */
+    uint64_t example_addr;  /* e.g. 0xDEADBEEF */
+    uint32_t id;            /* some tag, e.g. 10 */
+} rdma_cmd_msg;
+
+/* ---------------- Bundle of THREE zones ---------------- */
+typedef struct {
+    rdma_wire_info handler;
+    rdma_wire_info receiver;
+    rdma_wire_info data;
+    rdma_wire_info handler_data;
+    rdma_wire_info receiver_data;
+} rdma_wire_all;
+
+
+/* ---------------- Global rdma decl ---------------- */
+extern rdma_context z_handler, z_receiver, z_data;
+extern rdma_context z_handler_data, z_receiver_data;
+extern rdma_wire_all local_all, remote_all;
+/* --------- Function prototypes --------- */
+int  rdma_context_init(rdma_context *ctx);
+int  init_rdma_zone(rdma_context *ctx, const char *path, size_t size, int use_huge);
+void rdma_cleanup(rdma_context *ctx);
+/* dsm.h */
+void qp_to_rtr_rts(struct ibv_qp *qp,
+                   const struct ibv_port_attr *pa,
+                   const rdma_wire_info *peer,
+                   uint32_t local_psn,      /* NEW: your ctx.psn */
+                   uint8_t sgid_idx,
+                   uint8_t port);
+
+void post_one_recv(rdma_context *ctx);
+void poll_one_cqe(rdma_context *ctx, struct ibv_wc *wc);
+void rdma_write_core(rdma_context *ctx,
+                     uint64_t remote_addr, uint32_t remote_rkey,
+                     const void *src, size_t len, uint32_t imm);
+
+
+int pick_valid_sgid_index(struct ibv_context *ctx, uint8_t port,
+                                 uint8_t *out_idx, union ibv_gid *out_gid);
+
+void fill_conn_info_from_ctx(rdma_context *c,
+                             uint16_t lid,
+                             const uint8_t gid[16],
+                             rdma_wire_info *out);
+
+
+int writen_all_exact(int fd, const void *buf, size_t n);
+int readn_all_exact(int fd, void *buf, size_t n);
+
+#endif
+
 #endif // DSM_H

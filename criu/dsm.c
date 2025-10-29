@@ -58,7 +58,7 @@ unsigned long local_barrier_addr = 0;
 int active_fault_tid = -1;
 page_list page_list_data[MAX_PAGE_COUNT];
 int total_pages = 0;
-int uffd, restored_pid, local_threads;
+int uffd, restored_pid, local_threads, pidfd;
 /*
 unsigned long global_addr = 0x5555555580c0;
 unsigned long aligned = 0x5555555580c0 & ~(PAGE_SIZE - 1);
@@ -70,6 +70,554 @@ void barrier_init(void) {
     pthread_mutex_init(&barrier.lock, NULL);
     pthread_cond_init(&barrier.cond, NULL);
 }
+
+
+#if RDMA_ENABLE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include "dsm.h"
+
+rdma_context z_handler, z_receiver, z_data;
+rdma_context z_handler_data, z_receiver_data;
+rdma_wire_all local_all;
+rdma_wire_all remote_all;
+
+int readn_all_exact(int fd, void *buf, size_t n)
+{
+    char *p;
+    ssize_t r;
+    size_t left;
+    p = (char*)buf;
+    left = n;
+    while (left > 0) {
+        r = recv(fd, p, left, 0);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
+        p += r;
+        left -= (size_t)r;
+    }
+    return 0;
+}
+
+int writen_all_exact(int fd, const void *buf, size_t n)
+{
+    const char *p;
+    ssize_t w;
+    size_t left;
+    p = (const char*)buf;
+    left = n;
+    while (left > 0) {
+        w = send(fd, p, left, 0);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w == 0) return -1;
+        p += w;
+        left -= (size_t)w;
+    }
+    return 0;
+}
+
+int rdma_context_init(rdma_context *r)
+{
+    struct ibv_device **dev_list;
+    int num_devices;
+    struct ibv_qp_init_attr qia;
+    struct ibv_qp_attr attr;
+
+    dev_list = ibv_get_device_list(&num_devices);
+    if (!dev_list || num_devices == 0) { fprintf(stderr, "[RDMA] No devices\n"); return -1; }
+    r->ctx = ibv_open_device(dev_list[0]);
+    ibv_free_device_list(dev_list);
+    if (!r->ctx) { perror("ibv_open_device"); return -1; }
+
+    r->pd = ibv_alloc_pd(r->ctx);
+    if (!r->pd) { perror("ibv_alloc_pd"); ibv_close_device(r->ctx); return -1; }
+
+    r->cq = ibv_create_cq(r->ctx, 256, NULL, NULL, 0);
+    if (!r->cq) { perror("ibv_create_cq"); ibv_dealloc_pd(r->pd); ibv_close_device(r->ctx); return -1; }
+
+    memset(&qia, 0, sizeof(qia));
+    qia.send_cq = r->cq;
+    qia.recv_cq = r->cq;
+    qia.qp_type = IBV_QPT_RC;
+    qia.cap.max_send_wr  = 128;
+    qia.cap.max_recv_wr  = 128;
+    qia.cap.max_send_sge = 1;
+    qia.cap.max_recv_sge = 1;
+
+    r->qp = ibv_create_qp(r->pd, &qia);
+    if (!r->qp) { perror("ibv_create_qp"); ibv_destroy_cq(r->cq); ibv_dealloc_pd(r->pd); ibv_close_device(r->ctx); return -1; }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state        = IBV_QPS_INIT;
+    attr.pkey_index      = 0;
+    attr.port_num        = 1;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+
+    if (ibv_modify_qp(r->qp, &attr,
+                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+        perror("ibv_modify_qp INIT");
+        ibv_destroy_qp(r->qp); ibv_destroy_cq(r->cq); ibv_dealloc_pd(r->pd); ibv_close_device(r->ctx);
+        return -1;
+    }
+
+    memset(&r->port_attr, 0, sizeof(r->port_attr));
+    if (ibv_query_port(r->ctx, 1, &r->port_attr)) { perror("ibv_query_port"); return -1; }
+
+    memset(&r->gid, 0, sizeof(r->gid));
+    if (ibv_query_gid(r->ctx, 1, 0, &r->gid)) { /* ok if zero on IB */ }
+
+    r->psn = (uint32_t)(rand() & 0xFFFFFFu);
+
+    return 0;
+}
+
+int init_rdma_zone(rdma_context *ctx, const char *path, size_t size, int use_huge)
+{
+    void *addr;
+    int fd;
+
+    fd = -1;
+    if (use_huge) {
+        fd = open(path ? path : "/tmp/rdma_zone.bin", O_CREAT | O_RDWR, 0666);
+        if (fd < 0) { perror("open"); return -1; }
+        if (ftruncate(fd, (off_t)size) < 0) { perror("ftruncate"); close(fd); return -1; }
+        addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB, fd, 0);
+    } else {
+        addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    }
+    if (addr == MAP_FAILED) { perror("mmap"); if (fd>=0) close(fd); return -1; }
+    if (fd >= 0) close(fd);
+
+    ctx->mr = ibv_reg_mr(ctx->pd, addr, size,
+                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+    if (!ctx->mr) { perror("ibv_reg_mr"); munmap(addr, size); return -1; }
+
+    ctx->base_addr = addr;
+    ctx->length    = size;
+    ctx->rkey      = ctx->mr->rkey;
+    ctx->lkey      = ctx->mr->lkey;
+    return 0;
+}
+
+void fill_conn_info_from_ctx(rdma_context *c,
+                             uint16_t lid,
+                             const uint8_t gid[16],
+                             rdma_wire_info *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->qp_num = htonl(c->qp->qp_num);
+    out->lid    = htons(lid);
+    memcpy(out->gid, gid, 16);
+    out->psn    = htonl(c->psn);
+    out->rkey   = htonl(c->rkey);
+    out->vaddr  = htobe64((uint64_t)(uintptr_t)c->base_addr);
+}
+
+void qp_to_rtr_rts(struct ibv_qp *qp,
+                   const struct ibv_port_attr *pa,
+                   const rdma_wire_info *peer,
+                   uint32_t local_psn,
+                   uint8_t sgid_idx,
+                   uint8_t port)
+{
+    struct ibv_qp_attr a;
+    int flags;
+
+    /* RTR */
+    memset(&a, 0, sizeof(a));
+    a.qp_state           = IBV_QPS_RTR;
+    a.path_mtu           = pa->active_mtu;
+    a.dest_qp_num        = ntohl(peer->qp_num);
+    a.rq_psn             = ntohl(peer->psn);
+    a.max_dest_rd_atomic = 1;
+    a.min_rnr_timer      = 12;
+    a.ah_attr.port_num   = port;
+
+    if (pa->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+        a.ah_attr.is_global = 0;
+        a.ah_attr.dlid      = ntohs(peer->lid);
+    } else {
+        a.ah_attr.is_global      = 1;
+        a.ah_attr.grh.hop_limit  = 1;
+        a.ah_attr.grh.sgid_index = sgid_idx;
+        memcpy(&a.ah_attr.grh.dgid, peer->gid, 16);
+    }
+
+    flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+            IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+
+    if (ibv_modify_qp(qp, &a, flags)) { perror("modify_qp RTR"); exit(1); }
+
+    /* RTS */
+    memset(&a, 0, sizeof(a));
+    a.qp_state      = IBV_QPS_RTS;
+    a.timeout       = 14;
+    a.retry_cnt     = 7;
+    a.rnr_retry     = 7;
+    a.sq_psn        = (local_psn & 0xFFFFFFu);
+    a.max_rd_atomic = 1;
+
+    flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
+
+    if (ibv_modify_qp(qp, &a, flags)) { perror("modify_qp RTS"); exit(1); }
+}
+
+void post_one_recv(rdma_context *ctx)
+{
+    struct ibv_sge sge;
+    struct ibv_recv_wr wr;
+    struct ibv_recv_wr *bad;
+    uint32_t len;
+
+    len = (ctx->length >= 4) ? 4u : (uint32_t)ctx->length;
+    memset(&sge, 0, sizeof(sge));
+    sge.addr   = (uintptr_t)ctx->base_addr;
+    sge.length = len;
+    sge.lkey   = ctx->lkey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id   = (uintptr_t)ctx;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    bad = NULL;
+    if (ibv_post_recv(ctx->qp, &wr, &bad)) {
+        fprintf(stderr, "[RDMA] ibv_post_recv failed\n");
+    }
+}
+
+void poll_one_cqe(rdma_context *ctx, struct ibv_wc *wc)
+{
+    int n;
+    for (;;) {
+        n = ibv_poll_cq(ctx->cq, 1, wc);
+        if (n != 0) break;
+    }
+    if (n < 0) { fprintf(stderr, "CQ poll error\n"); exit(1); }
+    if (wc->status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "CQE error: %s (opcode=%d)\n", ibv_wc_status_str(wc->status), wc->opcode);
+        exit(1);
+    }
+}
+
+int pick_valid_sgid_index(struct ibv_context *ctx, uint8_t port,
+                                 uint8_t *out_idx, union ibv_gid *out_gid)
+{
+    int idx;
+    union ibv_gid g;
+
+    for (idx = 0; idx < 16; idx++) {
+        if (ibv_query_gid(ctx, port, idx, &g) != 0)
+            continue;
+
+        /* skip all-zero gid */
+        if (((uint64_t*)g.raw)[0] == 0 && ((uint64_t*)g.raw)[1] == 0)
+            continue;
+
+        *out_idx = (uint8_t)idx;
+        if (out_gid) *out_gid = g;
+        printf("[RDMA] pick_valid_sgid_index: using gid_index=%d "
+               "gid=%02x:%02x:%02x:%02x:%02x:%02x:... (port=%u)\n",
+               idx,
+               g.raw[0], g.raw[1], g.raw[2], g.raw[3], g.raw[4], g.raw[5],
+               (unsigned)port);
+        return 0;
+    }
+    fprintf(stderr, "[RDMA] No valid GID found on port %u\n", (unsigned)port);
+    return -1;
+}
+
+
+void rdma_write_core(rdma_context *ctx,
+                     uint64_t remote_addr, uint32_t remote_rkey,
+                     const void *src, size_t len, uint32_t imm)
+{
+    struct ibv_send_wr wr;
+    struct ibv_send_wr *bad;
+    struct ibv_sge s;
+    struct ibv_wc wc;
+
+    memset(&wr, 0, sizeof(wr));
+    memset(&s, 0, sizeof(s));
+
+    s.addr = (uintptr_t)src;
+    s.length = (uint32_t)len;
+    s.lkey = ctx->lkey;
+
+    wr.sg_list = &s;
+    wr.num_sge = 1;
+    wr.opcode = imm ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = remote_rkey;
+    if (imm) wr.imm_data = htonl(imm);
+
+    bad = NULL;
+    ibv_post_send(ctx->qp, &wr, &bad);
+    poll_one_cqe(ctx, &wc);
+}
+#elif 0
+
+#include "dsm.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <time.h>
+
+#define RDMA_PORT 1
+
+#define DIE_IF(cond, msg) \
+    do { if (cond) { perror(msg); exit(EXIT_FAILURE); } } while (0)
+
+int rdma_context_init(rdma_context *c)
+{
+    struct ibv_device **devs;
+    int n;
+    struct ibv_qp_init_attr qia;
+    struct ibv_qp_attr a;
+    int ret;
+
+    memset(c, 0, sizeof(*c));
+
+    devs = ibv_get_device_list(&n);
+    DIE_IF(!devs || !n, "no RDMA devices");
+
+    c->ctx = ibv_open_device(devs[0]);
+    DIE_IF(!c->ctx, "ibv_open_device");
+    ibv_free_device_list(devs);
+
+    DIE_IF(ibv_query_port(c->ctx, RDMA_PORT, &c->port_attr), "ibv_query_port");
+    DIE_IF(ibv_query_gid(c->ctx, RDMA_PORT, 0, &c->gid), "ibv_query_gid");
+
+    c->pd = ibv_alloc_pd(c->ctx);
+    DIE_IF(!c->pd, "ibv_alloc_pd");
+
+    c->cq = ibv_create_cq(c->ctx, 16, NULL, NULL, 0);
+    DIE_IF(!c->cq, "ibv_create_cq");
+
+    DIE_IF(posix_memalign(&c->base_addr, 4096, 4096) != 0, "memalign");
+    c->length = 4096;
+    c->mr = ibv_reg_mr(c->pd, c->base_addr, c->length,
+                       IBV_ACCESS_LOCAL_WRITE |
+                       IBV_ACCESS_REMOTE_WRITE |
+                       IBV_ACCESS_REMOTE_READ);
+    DIE_IF(!c->mr, "ibv_reg_mr");
+    c->rkey = c->mr->rkey;
+    c->lkey = c->mr->lkey;
+
+    memset(&qia, 0, sizeof(qia));
+    qia.send_cq = c->cq;
+    qia.recv_cq = c->cq;
+    qia.qp_type = IBV_QPT_RC;
+    qia.cap.max_send_wr = 16;
+    qia.cap.max_recv_wr = 16;
+    qia.cap.max_send_sge = 1;
+    qia.cap.max_recv_sge = 1;
+    qia.cap.max_inline_data = 128;
+
+    c->qp = ibv_create_qp(c->pd, &qia);
+    DIE_IF(!c->qp, "ibv_create_qp");
+
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_INIT;
+    a.port_num = RDMA_PORT;
+    a.pkey_index = 0;
+    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
+                        IBV_ACCESS_REMOTE_WRITE |
+                        IBV_ACCESS_REMOTE_READ;
+    ret = ibv_modify_qp(c->qp, &a,
+                        IBV_QP_STATE |
+                        IBV_QP_PKEY_INDEX |
+                        IBV_QP_PORT |
+                        IBV_QP_ACCESS_FLAGS);
+    DIE_IF(ret, "INIT");
+
+    srand((unsigned)time(NULL));
+    c->psn = rand() & 0xffffff;
+    c->max_inline = qia.cap.max_inline_data;
+
+    return 0;
+}
+
+void rdma_cleanup(rdma_context *c)
+{
+    if (!c) return;
+    if (c->qp) ibv_destroy_qp(c->qp);
+    if (c->cq) ibv_destroy_cq(c->cq);
+    if (c->mr) ibv_dereg_mr(c->mr);
+    if (c->pd) ibv_dealloc_pd(c->pd);
+    if (c->ctx) ibv_close_device(c->ctx);
+    free(c->base_addr);
+}
+int pick_valid_sgid_index(struct ibv_context *ctx, uint8_t port,
+                                 uint8_t *out_idx, union ibv_gid *out_gid)
+{
+    int idx;
+    union ibv_gid g;
+
+    for (idx = 0; idx < 16; idx++) {
+        if (ibv_query_gid(ctx, port, idx, &g) != 0)
+            continue;
+
+        /* skip all-zero gid */
+        if (((uint64_t*)g.raw)[0] == 0 && ((uint64_t*)g.raw)[1] == 0)
+            continue;
+
+        *out_idx = (uint8_t)idx;
+        if (out_gid) *out_gid = g;
+        printf("[RDMA] pick_valid_sgid_index: using gid_index=%d "
+               "gid=%02x:%02x:%02x:%02x:%02x:%02x:... (port=%u)\n",
+               idx,
+               g.raw[0], g.raw[1], g.raw[2], g.raw[3], g.raw[4], g.raw[5],
+               (unsigned)port);
+        return 0;
+    }
+    fprintf(stderr, "[RDMA] No valid GID found on port %u\n", (unsigned)port);
+    return -1;
+}
+
+/* dsm.c */
+void qp_to_rtr_rts(struct ibv_qp *qp,
+                   const struct ibv_port_attr *pa,
+                   const rdma_wire_info *peer,
+                   uint32_t local_psn,
+                   uint8_t sgid_idx,
+                   uint8_t port)
+{
+    struct ibv_qp_attr a;
+    int flags;
+
+    memset(&a, 0, sizeof(a));
+    /* --- RTR --- */
+    a.qp_state           = IBV_QPS_RTR;
+    a.path_mtu           = pa->active_mtu;
+    a.dest_qp_num        = ntohl(peer->qp_num);
+    a.rq_psn             = ntohl(peer->psn);        /* expect peer’s SQ PSN */
+    a.max_dest_rd_atomic = 1;
+    a.min_rnr_timer      = 12;
+    a.ah_attr.port_num   = port;
+
+    if (pa->link_layer == IBV_LINK_LAYER_INFINIBAND) {
+        a.ah_attr.is_global = 0;
+        a.ah_attr.dlid      = ntohs(peer->lid);
+    } else {
+        a.ah_attr.is_global        = 1;
+        a.ah_attr.grh.hop_limit    = 1;
+        a.ah_attr.grh.sgid_index   = sgid_idx;
+        memcpy(&a.ah_attr.grh.dgid, peer->gid, 16);
+    }
+
+    flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+            IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+
+    if (ibv_modify_qp(qp, &a, flags)) { perror("RTR"); exit(1); }
+
+    /* --- RTS --- */
+    memset(&a, 0, sizeof(a));
+    a.qp_state      = IBV_QPS_RTS;
+    a.timeout       = 14;
+    a.retry_cnt     = 7;
+    a.rnr_retry     = 7;
+    a.sq_psn        = local_psn & 0xFFFFFF;   /* MUST match what you sent in local.psn */
+    a.max_rd_atomic = 1;
+
+    flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
+
+    if (ibv_modify_qp(qp, &a, flags)) { perror("RTS"); exit(1); }
+}
+
+
+
+void post_one_recv(rdma_context *ctx)
+{
+    struct ibv_sge s;
+    struct ibv_recv_wr wr;
+    struct ibv_recv_wr *bad;
+
+    memset(&s, 0, sizeof(s));
+    s.addr = (uintptr_t)ctx->base_addr;
+    s.length = 4;
+    s.lkey = ctx->lkey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.sg_list = &s;
+    wr.num_sge = 1;
+
+    bad = NULL;
+    ibv_post_recv(ctx->qp, &wr, &bad);
+}
+
+void poll_one_cqe(rdma_context *ctx, struct ibv_wc *wc)
+{
+    int n;
+    for (;;) {
+        n = ibv_poll_cq(ctx->cq, 1, wc);
+        if (n == 1) break;
+    }
+}
+
+void rdma_write_core(rdma_context *ctx,
+                     uint64_t remote_addr, uint32_t remote_rkey,
+                     const void *src, size_t len, uint32_t imm)
+{
+    struct ibv_send_wr wr;
+    struct ibv_send_wr *bad;
+    struct ibv_sge s;
+    struct ibv_wc wc;
+
+    memset(&wr, 0, sizeof(wr));
+    memset(&s, 0, sizeof(s));
+
+    s.addr = (uintptr_t)src;
+    s.length = (uint32_t)len;
+    s.lkey = ctx->lkey;
+
+    wr.sg_list = &s;
+    wr.num_sge = 1;
+    wr.opcode = imm ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = remote_rkey;
+    if (imm) wr.imm_data = htonl(imm);
+
+    bad = NULL;
+    ibv_post_send(ctx->qp, &wr, &bad);
+    poll_one_cqe(ctx, &wc);
+}
+
+int readn_all_exact(int fd, void *buf, size_t n) {
+    char *p = (char*)buf; size_t left = n; ssize_t r;
+    while (left) { r = recv(fd, p, left, 0);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1; 
+        p += r; left -= (size_t)r; }
+    return 0;
+}
+int writen_all_exact(int fd, const void *buf, size_t n) {
+    const char *p = (const char*)buf; size_t left = n; ssize_t w;
+    while (left) { w = send(fd, p, left, 0);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w == 0) return -1; 
+        p += w; left -= (size_t)w; }
+    return 0;
+}
+
+
+#endif
+
 
 /*********************************** VMA RECONSTRUCTION ********************* */
 
@@ -1814,6 +2362,41 @@ fail:
 #define SYS_process_madvise 440
 #endif
 
+int init_pidfd(int restored_pid) {
+    int pidfd = syscall(SYS_pidfd_open, restored_pid, 0);
+    if (pidfd < 0) {
+        perror("pidfd_open");
+        return -1;
+    }
+    PRINT("[DSM] pidfd for PID %d created: %d\n", restored_pid, pidfd);
+    return pidfd;
+}
+
+
+int run_proc_MADVISE(int pidfd, int restored_pid, void *addr, size_t len) {
+    struct iovec iov;
+    long ret;
+
+    PRINT("[DSM] Sending remote process_madvise(MADV_DONTNEED) with pidfd %d request to pid %d at %p (len=%zu)...\n",
+          pidfd, restored_pid, addr, len);
+
+    
+    // Prepare iovec for the target memory region
+    iov.iov_base = addr;
+    iov.iov_len = len;
+
+    // Call process_madvise on the target mm
+    ret = syscall(SYS_process_madvise, pidfd, &iov, 1, MADV_DONTNEED, 0);
+    if (ret < 0) {
+        fprintf(stderr, "❌ process_madvise failed: %s (errno=%d)\n", strerror(errno), errno);
+        close(pidfd);
+        return -1;
+    }
+
+    PRINT("✅ process_madvise succeeded (ret=%ld)\n", ret);
+    return 0;
+}
+
 int runMADVISE(int restored_pid, void *addr, size_t len) {
     int pidfd;
     struct iovec iov;
@@ -2544,8 +3127,10 @@ int send_all(int fd, const void *buf, size_t len) {
 #include <string.h>
 #endif
 
+#if RDMA_ENABLE && 0
 
-#if 1
+
+#elif 1
 int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg) {
     unsigned char page_content[PAGE_SIZE];
     struct iovec local_iov, remote_iov;
@@ -2586,13 +3171,14 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
     // --- Post-transfer page management ---
     if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
         PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
-        if (madvise((void*)dsm_msg->page_addr, PAGE_SIZE, MADV_DONTNEED) == -1)
+        if (run_proc_MADVISE(pidfd, restored_pid, (void*)dsm_msg->page_addr, PAGE_SIZE) == 0)
+            PRINT("process_madvise to invalidate page %p\n", (void*)dsm_msg->page_addr);
+        else{
             PRINT("❌ MADV_DONTNEED failed: %s\n", strerror(errno));
-        else
-            PRINT("Madvise to invalidate page %p\n", (void*)dsm_msg->page_addr);
-        //update_page_info(dsm_msg->page_addr, 1, INVALID, -2);
+            kill_and_exit(restored_pid);
+        }
         PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n",
-                   			dsm_msg->page_addr, page_list_data[dsm_msg->msg_id].state, INVALID, dsm_msg->msg_id);
+            dsm_msg->page_addr, page_list_data[dsm_msg->msg_id].state, INVALID, dsm_msg->msg_id);
         page_list_data[dsm_msg->msg_id].state = INVALID;	
     } else {
         PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n");
@@ -2601,8 +3187,8 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
             kill_and_exit(restored_pid);
         }
         //update_page_info(dsm_msg->page_addr, 1, SHARED, -2);
-          PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n",
-                   			dsm_msg->page_addr, page_list_data[dsm_msg->msg_id].state, SHARED, dsm_msg->msg_id);
+        PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n",
+            dsm_msg->page_addr, page_list_data[dsm_msg->msg_id].state, SHARED, dsm_msg->msg_id);
         page_list_data[dsm_msg->msg_id].state = SHARED;	
     }
 
@@ -3591,7 +4177,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 	(void) args;	
 	(void) dsm_msg;	
 
-    if( !DBG ){
+    if( 0 && !DBG ){
         sleep(8);
         pr_info("Waking up thread\n");
         send_sigcont(restored_pid);
@@ -3996,3 +4582,47 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 /******************************** TESTING FUNCTIONS *******************************/
 
 
+
+void register_ranges_from_file(int uffd) {
+    FILE *f2 = fopen("/tmp/ranges.txt", "r");
+    char line[256];
+    unsigned long start_address, end_address;
+    size_t page_size;
+    int num_pages;
+    void *rdma_base;
+
+    if (!f2) {
+        fprintf(stderr, "[dsm] /tmp/ranges.txt not found\n");
+        return;
+    }
+
+
+    while (fgets(line, sizeof(line), f2)) {
+        if (sscanf(line, "base=%lx page_size=%zu num_pages=%d",
+                   &start_address, &page_size, &num_pages) != 3) {
+            fprintf(stderr, "[dsm] failed to parse line: %s", line);
+            continue;
+        }
+        rdma_base = mmap(NULL, num_pages * page_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+        for (int i = 0; i < num_pages; i++) {
+            unsigned long aux = start_address + i * page_size;
+            printf("Registering page %d at address %lx\n", i, aux);
+            page_list_data[total_pages].saddr = aux;
+            page_list_data[total_pages].owner = -1;
+            page_list_data[total_pages].state = SHARED;
+            page_list_data[total_pages].rdma_addr = rdma_base + i * PAGE_SIZE;
+
+            total_pages++;
+        }
+
+        end_address = start_address + page_size * num_pages;
+        printf("/tmp/ranges.txt: start addr:%lx, end:%lx\n", start_address, end_address);
+
+        register_region_with_uffd(uffd, (void *)start_address, page_size * num_pages);
+        enable_region_wp(uffd, (void *)start_address, page_size * num_pages);
+
+    }
+
+    fclose(f2);
+}
