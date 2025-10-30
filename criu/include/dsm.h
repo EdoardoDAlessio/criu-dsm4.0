@@ -18,7 +18,7 @@
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
 
-#define RDMA_ENABLE 1
+#define RDMA_ENABLE 0
 #define DBG 0
 #define COMMAND_LOOP 0
 #define ENABLE_SERVER 1
@@ -251,8 +251,9 @@ typedef struct {
 
 typedef struct __attribute__((packed))  {
     uint64_t target_addr;   /* client's RDMA buffer addr */
-    uint64_t example_addr;  /* e.g. 0xDEADBEEF */
+    uint64_t faulting_addr;  /* e.g. 0xDEADBEEF */
     uint32_t id;            /* some tag, e.g. 10 */
+    uint32_t index;         
 } rdma_cmd_msg;
 
 /* ---------------- Bundle of THREE zones ---------------- */

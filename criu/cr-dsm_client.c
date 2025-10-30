@@ -353,13 +353,14 @@ static void *handler(void *arg) {
 	/* 2) Build command asking server to write into OUR handler */
 	my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
 	cmd.target_addr   = htobe64(my_handler_addr);
-	cmd.example_addr  = htobe64((uint64_t)0xDEADBEEF);
+	cmd.faulting_addr  = htobe64((uint64_t)0xDEADBEEF);
 	cmd.id           = htonl(MSG_WAKE_THREAD);
 
-	DSM_EVENT_HANDLER("[CLIENT] Sending rdma barrier hit: target_addr=%#llx example_addr=%#llx id=%u\n\r",
+	DSM_EVENT_HANDLER("[CLIENT] Sending rdma barrier hit: target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
 		(unsigned long long)be64toh(cmd.target_addr),
-		(unsigned long long)be64toh(cmd.example_addr),
-		(unsigned)ntohl(cmd.id));
+		(unsigned long long)be64toh(cmd.faulting_addr),
+		(unsigned)ntohl(cmd.id),
+		(unsigned)ntohl(cmd.index));
 
 	/* 3) Copy CMD into TX buffer (handler_data MR) */
 	memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
@@ -421,13 +422,14 @@ static void *handler(void *arg) {
 			/* 2) Build command asking server to write into OUR handler */
 			my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
 			cmd.target_addr   = htobe64(my_handler_addr);
-			cmd.example_addr  = htobe64((uint64_t)addr);
+			cmd.faulting_addr  = htobe64((uint64_t)addr);
 			cmd.id           = htonl(MSG_BARRIER_HIT);
 
-			DSM_EVENT_HANDLER("[CLIENT] Sending rdma barrier hit: target_addr=%#llx example_addr=%#llx id=%u\n\r",
+			DSM_EVENT_HANDLER("[CLIENT] Sending rdma barrier hit: target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
 				(unsigned long long)be64toh(cmd.target_addr),
-				(unsigned long long)be64toh(cmd.example_addr),
-				(unsigned)ntohl(cmd.id));
+				(unsigned long long)be64toh(cmd.faulting_addr),
+				(unsigned)ntohl(cmd.id),
+				(unsigned)ntohl(cmd.index));
 
 			/* 3) Copy CMD into TX buffer (handler_data MR) */
     		memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
@@ -460,7 +462,7 @@ static void *handler(void *arg) {
 			/*Cheking if fault address match*/
 			if( remote_barrier_addr != local_barrier_addr ){
 				DSM_EVENT_HANDLER(" remote_barrier_addr != local_barrier_addr !\n\r");
-				//kill_and_exit(restored_pid);
+				kill_and_exit(restored_pid);
 			}
 
 			DSM_DEBUG_HANDLER("[CLIENT] remote threads barrier arrived\n\r");
@@ -501,13 +503,15 @@ static void *handler(void *arg) {
 			/* 2) Build command asking server to write into OUR handler */
 			my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
 			cmd.target_addr   = htobe64(my_handler_addr);
-			cmd.example_addr  = htobe64((uint64_t)addr);
+			cmd.faulting_addr  = htobe64((uint64_t)addr);
 			cmd.id           = htonl(MSG_SEND_INVALIDATE);
+			cmd.index           = htonl(index);
 
-			DSM_EVENT_HANDLER("[CLIENT] Sending rdma : target_addr=%#llx example_addr=%#llx id=%u\n\r",
+			DSM_EVENT_HANDLER("[CLIENT] Sending rdma : target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
 				(unsigned long long)be64toh(cmd.target_addr),
-				(unsigned long long)be64toh(cmd.example_addr),
-				(unsigned)ntohl(cmd.id));
+				(unsigned long long)be64toh(cmd.faulting_addr),
+				(unsigned)ntohl(cmd.id),
+				(unsigned)ntohl(cmd.index));
 
 			/* 3) Copy CMD into TX buffer (handler_data MR) */
     		memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
@@ -558,13 +562,16 @@ static void *handler(void *arg) {
 			/* 2) Build command asking server to write into OUR handler */
 			my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
 			cmd.target_addr   = htobe64(my_handler_addr);
-			cmd.example_addr  = htobe64((uint64_t)addr);
-			cmd.id           = htonl(MSG_SEND_INVALIDATE);
+			cmd.faulting_addr  = htobe64((uint64_t)addr);
+			cmd.id           = htonl(dsm_msg.msg_type);
+			cmd.index           = htonl(index);
 
-			DSM_EVENT_HANDLER("[CLIENT] Sending rdma : target_addr=%#llx example_addr=%#llx id=%u\n\r",
+			DSM_EVENT_HANDLER("[CLIENT] Sending rdma : target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
 				(unsigned long long)be64toh(cmd.target_addr),
-				(unsigned long long)be64toh(cmd.example_addr),
-				(unsigned)ntohl(cmd.id));
+				(unsigned long long)be64toh(cmd.faulting_addr),
+				(unsigned)ntohl(cmd.id),
+				(unsigned)ntohl(cmd.index));
+
 
 			/* 3) Copy CMD into TX buffer (handler_data MR) */
     		memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
@@ -714,14 +721,15 @@ void dsm_client_main_loop(int fd_command) {
 			DSM_EVENT_CLIENT("[SERVER] Unexpected CQE opcode=%d\n\r", wc.opcode);
 		}
 		memcpy(&cmd, z_receiver.base_addr, sizeof(cmd));
-		DSM_EVENT_CLIENT("[SERVER] Command CMD: target_addr=%#llx fault addr=%#llx id=%u\n\r",
+		DSM_EVENT_CLIENT("[SERVER] Command CMD: target_addr=%#llx fault addr=%#llx id=%u, index:%u\n\r",
 			(unsigned long long)be64toh(cmd.target_addr),
-			(unsigned long long)be64toh(cmd.example_addr),
-			ntohl(cmd.id));
+			(unsigned long long)be64toh(cmd.faulting_addr),
+			ntohl(cmd.id),
+			ntohl(cmd.index));
 
 		msg.msg_type = ntohl(cmd.id); //abusing msg_type to store the command type
-		msg.page_addr = be64toh(cmd.example_addr);
-		msg.msg_id = 0;
+		msg.page_addr = be64toh(cmd.faulting_addr);
+		msg.msg_id = ntohl(cmd.index);
 		post_one_recv(&z_receiver);
 
         DSM_DEBUG_CLIENT("[DSM Client] Received message: type=%d, addr=0x%lx, id=%ld\n\r",
@@ -730,8 +738,9 @@ void dsm_client_main_loop(int fd_command) {
         switch (msg.msg_type) {
 			case MSG_BARRIER_HIT:
                 DSM_DEBUG_CLIENT("[DSM Client] Remote barrier hit.\n\r");
-			#if 1
 
+			#if 1
+				
 
 				DSM_EVENT_CLIENT("[SERVER] Sending ACK_CMD to client.handler (imm=0xB1)\n\r");
 				rdma_write_core(&z_receiver_data,
@@ -745,10 +754,6 @@ void dsm_client_main_loop(int fd_command) {
 					//means that the handler thread has not process the barrier yet, let's wait until it does
 					pthread_cond_wait(&barrier.cond, &barrier.lock);
 				}
-				
-				
-
-
 				remote_threads_barrier_arrived = 1; 
 				remote_barrier_addr = msg.page_addr;
 				pthread_cond_broadcast(&barrier.cond);
@@ -786,7 +791,7 @@ void dsm_client_main_loop(int fd_command) {
 					restored_pid, (void*)msg.page_addr);
 				
 				  // --- Prepare iovecs ---
-				local_iov.iov_base = z_receiver.base_addr; //RDMA 
+				local_iov.iov_base = z_receiver_data.base_addr; //RDMA 
 				local_iov.iov_len  = PAGE_SIZE;
 				remote_iov.iov_base = (void*)msg.page_addr;
 				remote_iov.iov_len  = PAGE_SIZE;	
@@ -805,10 +810,10 @@ void dsm_client_main_loop(int fd_command) {
 				DSM_EVENT_CLIENT("✅ Read %ld bytes from target process memory\n", nread);
 
 				// --- Send page data to client ---
-				rdma_write_core(&z_handler,
-					be64toh(remote_all.receiver.vaddr), //client's handler 
-					ntohl(remote_all.receiver.rkey),   /* client’s data rkey (from bundle) */
-					z_handler.base_addr, 4096, 0xBEEF);
+				rdma_write_core(&z_receiver_data,
+								be64toh(remote_all.handler.vaddr),
+								ntohl(remote_all.handler.rkey),
+								z_receiver_data.base_addr, 4096, 0xB1);
 					
    				DSM_EVENT_CLIENT("✅ Page_transfer_complete to client (addr=%p)\n", (void*)msg.page_addr);
 				// --- Post-transfer page management ---
@@ -929,19 +934,19 @@ void dsm_client_main_loop(int fd_command) {
 				break;
 			case MSG_GET_PAGE_DATA:
 				//pthread_mutex_lock(&pagefaults_mutex);
-				DSM_EVENT_CLIENT("→ Handling GET_PAGE_DATA\n\r");
-                handle_page_data_request(restored_pid, uffd, fd_command, &msg, pidfd);
+				DSM_EVENT_CLIENT("→ Handling TCP GET_PAGE_DATA on status:%d\n\r", page_list_data[msg.msg_id].state);
+                handle_page_data_request(restored_pid, uffd, fd_command, &msg);
 				//pthread_mutex_unlock(&pagefaults_mutex);
                 break;
             case MSG_GET_PAGE_DATA_INVALID:
 				//pthread_mutex_lock(&pagefaults_mutex);
-                DSM_EVENT_CLIENT("→ Handling GET_PAGE_DATA_INVALID\n\r");
-                handle_page_data_request(restored_pid, uffd, fd_command, &msg, pidfd);
+                DSM_EVENT_CLIENT("→ Handling TCP GET_PAGE_DATA_INVALID\n\r", page_list_data[msg.msg_id].state);
+                handle_page_data_request(restored_pid, uffd, fd_command, &msg);
 				//pthread_mutex_unlock(&pagefaults_mutex);
                 break;
             case MSG_SEND_INVALIDATE:
 				//pthread_mutex_lock(&pagefaults_mutex);
-				DSM_EVENT_CLIENT("→ Handling remote invalidation request. Madvise(MADV_DONTNEED) on page at %p\n\r", (void *)msg.page_addr);
+				DSM_EVENT_CLIENT("→ Handling TCP remote invalidation request. Madvise(MADV_DONTNEED) on page at %p\n\r", (void *)msg.page_addr);
 
 				if (run_proc_MADVISE(pidfd, restored_pid, (void *)msg.page_addr, 4096) == 0) {
 					DSM_EVENT_SERVER("Successfully ran process madvise on page at %p\n", (void *)msg.page_addr);
@@ -1195,7 +1200,7 @@ void start_dsm_client(const char *server_ip)
 		/* 2) Build command asking server to write into OUR handler */
 		my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
 		cmd.target_addr   = htobe64(my_handler_addr);
-		cmd.example_addr  = htobe64((uint64_t)0xDEADBEEF);
+		cmd.faulting_addr  = htobe64((uint64_t)0xDEADBEEF);
 		cmd.id            = htonl(MSG_BARRIER_HIT);
 
 		/* 3) Copy CMD into TX buffer (handler_data MR) */
