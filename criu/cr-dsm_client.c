@@ -31,7 +31,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
-//#include "user.h"
+#include "user.h"
 #include "page.h" //this takes the page size
 // Setup global variable address 
 extern unsigned long global_addr;
@@ -48,6 +48,7 @@ int total_threads = 2; //total threads (local + remote)
 #include "dsm_log.h"
 #include <stdbool.h>
 #include <time.h>
+
 
 #if !RDMA_ENABLE 
 	static void *handler(void *arg) {
@@ -66,6 +67,9 @@ int total_threads = 2; //total threads (local + remote)
 		int index;
 		struct uffdio_range r;
 		size_t n;
+		//int e;
+		//uintptr_t next;
+
 		(void) n;
 		DSM_EVENT_HANDLER("[handler] started, uffd = %d\n\r", p->uffd);
 
@@ -76,10 +80,9 @@ int total_threads = 2; //total threads (local + remote)
 	#if !DBG //&& 0
 		sleep(10);
 		DSM_EVENT_HANDLER("[handler] Sending SIGCONT to restored process %d\n\r", restored_pid);
-		send_sigcont(restored_pid);
-		dsm_msg.msg_type = MSG_WAKE_THREAD;
+		send_sigcont(restored_pid);		/*dsm_msg.msg_type = MSG_WAKE_THREAD;
 		send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0);
-		printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n\r");
+		printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n\r");*/
 	#endif
 		while (1) {
 			int pollres = poll(pollfd, 1, -1);
@@ -103,7 +106,7 @@ int total_threads = 2; //total threads (local + remote)
 			if( msg.arg.pagefault.address >= barrier_start_address && msg.arg.pagefault.address < barrier_end_address){
 				
 				pthread_mutex_lock(&barrier.lock);
-
+				#if 1
 				DSM_EVENT_HANDLER("[barrier] Local barrier hit: tid=%d page=%p", msg.arg.pagefault.feat.ptid, (void*)msg.arg.pagefault.address);
 				local_barrier_addr = msg.arg.pagefault.address;
 				//all local threads arrived, send the message to remote 
@@ -136,6 +139,37 @@ int total_threads = 2; //total threads (local + remote)
 				enable_wp(uffd, (void*) dsm_msg.page_addr ); //enable next
 				disable_wp(uffd, (void*) msg.arg.pagefault.address); //disable current
 				pthread_mutex_unlock(&barrier.lock);
+				#else
+				e = barrier.epoch;
+				barrier.local_barrier_addr = addr;
+				pthread_mutex_unlock(&barrier.lock);
+
+				// Rep-only notify? If yes, gate this with is_rep()
+				dsm_msg.msg_type = MSG_BARRIER_HIT;
+				dsm_msg.msg_id   = 1001;
+				dsm_msg.page_addr = addr;
+				if (send_all(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg)) != 0) {
+					perror("[CLIENT] send MSG_BARRIER_HIT");
+					kill_and_exit(restored_pid);
+				}
+
+				// Now wait for release of *this* epoch
+				pthread_mutex_lock(&barrier.lock);
+				while (barrier.released_epoch != e) {
+					pthread_cond_wait(&barrier.cond, &barrier.lock);
+				}
+
+				// advance epoch for next barrier locally (rep or all—pick one policy; usually rep)
+				barrier.epoch++;
+				// (released_epoch will be set by server receiver on next round)
+
+				next = addr + PAGE_SIZE;
+				if (next >= barrier_end_address) next = barrier_start_address;
+				pthread_mutex_unlock(&barrier.lock);
+
+				enable_wp(uffd, (void*)next);
+				disable_wp(uffd, (void*)addr);
+				#endif
 				continue;
 			}
 
@@ -171,7 +205,6 @@ int total_threads = 2; //total threads (local + remote)
 					continue;
 				}
 				
-
 				// Send invalidate request
 				if (send_all(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg)) != 0) {
 					perror("[CLIENT] Failed to send MSG_SEND_INVALIDATE");
@@ -221,9 +254,6 @@ int total_threads = 2; //total threads (local + remote)
 
 	#if ENABLE_SERVER
 
-		//#if RDMA_ENABLE
-				
-		//#else
 				dsm_msg.page_addr = addr;
 				dsm_msg.page_size = PAGE_SIZE;
 				dsm_msg.msg_id = index;
@@ -240,7 +270,6 @@ int total_threads = 2; //total threads (local + remote)
 					continue;
 				}
 				copy.src  = (unsigned long)page_data;
-		//#endif
 	#else
 				copy.src  = (unsigned long)zero_page;
 				DSM_EVENT_HANDLER("[handler] Creating zero page for MISSING PAGE FAULT on READ on an ALREADY SHARED PAGE (debug mode)\n\r");
@@ -909,6 +938,13 @@ void dsm_client_main_loop(int fd_command) {
 				pthread_cond_broadcast(&barrier.cond);
 				DSM_EVENT_CLIENT("[DSM Client] Remote hit barrier, releasing...\n\r");
 				pthread_mutex_unlock(&barrier.lock);
+				#else
+				pthread_mutex_lock(&barrier.lock);
+				// Signal that barrier #2 for current epoch is released
+				barrier.released_epoch = barrier.epoch;
+				pthread_cond_broadcast(&barrier.cond);
+				pthread_mutex_unlock(&barrier.lock);
+				break;
 				#endif
 				break;
 			case MSG_BARRIER_RELEASE:
@@ -1440,7 +1476,6 @@ kill_and_exit(restored_pid);
 				unsigned long aux = start_address + i*page_size;
 				PRINT("Registering page %d at address %lx\n\r", i, aux);
 				page_list_data[total_pages].saddr = aux;
-				page_list_data[total_pages].owner = -1;
 				page_list_data[total_pages].state = SHARED;
 				//register_page(uffd, (void*)aux);
 				//enable_wp(uffd, (void*)aux);

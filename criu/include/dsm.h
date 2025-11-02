@@ -7,14 +7,14 @@
 #include "vma.h" 
 #include <linux/types.h>
 
-#include <infiniband/verbs.h> //RDMA
+//#include <infiniband/verbs.h> //RDMA
 /****************** Constants ******************/
 
 #include "page.h" //this takes the page size #define PAGE_SIZE 4096
 #define HANDSHAKE_MSG "READY"
 #define PORT_COMMAND 7777
 #define PORT_HANDLER 7778
-#define NUM_THREADS 1
+#define N_CLIENTS 3
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
 
@@ -22,7 +22,7 @@
 #define DBG 0
 #define COMMAND_LOOP 0
 #define ENABLE_SERVER 1
-#define COMMAND_THREAD ENABLE_SERVER & COMMAND_LOOP
+#define COMMAND_THREAD 0
 #define EP 0
 
 #define ENABLE_LOGGING 0
@@ -89,12 +89,12 @@ struct thread_param {
     int uffd;
     int server_pipe;      // read end for handler
     int uffd_pipe;        // write end for handler
-    int fd_handler[NUM_THREADS];
+    int fd_handler[N_CLIENTS];
 };
 
 typedef struct {
     unsigned long saddr;
-    int owner;
+    uint64_t owner_mask;
     int state;
 	int page_numbers; //if you have a continuous range, each page will tell how many pages are toghether
 	int index_of_allocs; // != 0 if it's from malloc, the value gives the index of PageAlloc in allocs array
@@ -109,13 +109,28 @@ typedef struct {
     char symbol_name[32];
 } PageAlloc;
 
-
+#if !N_CLIENTS
 typedef struct barrier_state {
     pthread_mutex_t lock;
     pthread_cond_t cond;     // signal resolver when all arrived
 } barrier_state_t;
 
+extern barrier_state_t barrier;
+#else
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
 
+    int epoch;                // current barrier generation
+    int released_epoch;       // epoch that has been globally released (barrier #2)
+    uintptr_t local_barrier_addr;  // optional, per-epoch
+    uintptr_t remote_barrier_addr; // optional, per-epoch
+}barrier_state;
+
+
+
+extern barrier_state barrier;
+#endif
 void barrier_init(void);
 /****************** Extern Variables ******************/
 extern void *zero_page;
@@ -132,7 +147,6 @@ extern unsigned long barrier_end_address;
 extern unsigned long remote_barrier_addr;
 extern unsigned long local_barrier_addr;
 extern int remote_threads_barrier_arrived;
-extern barrier_state_t barrier;
 extern pthread_mutex_t fault_lock;
 extern unsigned long active_fault_addr;
 extern int active_fault_tid;

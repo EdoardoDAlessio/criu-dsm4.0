@@ -30,7 +30,7 @@ struct vm_area_list* my_vm_area_list;
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
-//#include "user.h"
+#include "user.h"
 #include "page.h" //this takes the page size
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 // Setup global variable address 
@@ -42,7 +42,13 @@ unsigned long barrier_start_address = 0;
 unsigned long barrier_end_address = 0;
 unsigned long page_thread0 = 0;
 unsigned long page_thread1 = 0;
-barrier_state_t barrier = {0};
+//barrier_state_t barrier = {0};
+barrier_state barrier = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+    .epoch = 0,
+    .released_epoch = -1,
+};
 int remote_threads_barrier_arrived = 0;
 unsigned long global_addr = 0x555555558080;
 unsigned long aligned = 0x555555558080 & ~(PAGE_SIZE - 1);
@@ -1015,7 +1021,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
 
             /**/
             for (size_t i = 0; i < npages; i++) {
-                page_list_data[total_pages + i].owner = 0;
+                page_list_data[total_pages + i].owner_mask = 0;
                 page_list_data[total_pages + i].index_of_allocs = 0;
                 page_list_data[total_pages + i].state = status;
                 page_list_data[total_pages + i].saddr = start + i * PAGE_SIZE;
@@ -1202,7 +1208,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
                         //else if( status == MODIFIED ) disable( uffd, (void *) addr );
 
                         page_list_data[total_pages].saddr = addr;
-                        page_list_data[total_pages].owner = 0;
+                        page_list_data[total_pages].owner_mask = 0;
                         page_list_data[total_pages].state = status;
                         total_pages++;
 
@@ -1287,7 +1293,7 @@ void reconstruct_vm_area_list(int uffd, int restored_pid, struct vm_area_list *l
 
             for (size_t i = 0; i < npages; i++) {
                 page_list_data[total_pages + i].saddr = start + i * PAGE_SIZE;
-                page_list_data[total_pages + i].owner = 0;
+                page_list_data[total_pages + i].owner_mask = 0;
                 page_list_data[total_pages + i].index_of_allocs = 0;
                 page_list_data[total_pages + i].state = status;
             }
@@ -1420,7 +1426,7 @@ void scan_and_prepare_coalesced_globals(unsigned long base_addr, pid_t restored_
                     //else if( status == INVALID )       madvise(  );
 
                     page_list_data[total_pages].saddr = addr;
-                    page_list_data[total_pages].owner = 0;
+                    page_list_data[total_pages].owner_mask = 0;
                     page_list_data[total_pages].state = status;
                     total_pages++;
 
@@ -1551,7 +1557,7 @@ int get_list_page_index(unsigned long addr){
           /*PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld (range 0x%lx - 0x%lx)\n",
                    addr, page_list_data[i].state, new_state, i, start, end - 1);
 
-            if (new_owner  != -2) page_list_data[i].owner = new_owner;
+            if (new_owner  != -2) page_list_data[i].owner_mask = new_owner;
             if (new_state  != -2) page_list_data[i].state = new_state;
             if (new_index  != -2) page_list_data[i].index_of_allocs = new_index;*/
 
@@ -1578,7 +1584,7 @@ int update_page_info(unsigned long addr, int new_owner, int new_state, int new_i
                 return -2;
             }
 
-            if (new_owner  != -2) page_list_data[i].owner = new_owner;
+            if (new_owner  != -2) page_list_data[i].owner_mask = new_owner;
             if (new_state  != -2) page_list_data[i].state = new_state;
             if (new_index  != -2) page_list_data[i].index_of_allocs = new_index;
 
@@ -4334,7 +4340,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             // ✅ Now list all registered pages
             printf("\n📋 Registered pages in page_list_data:\n");
             for (int i = 0; i < total_pages; ++i) {
-                printf("  [%03d] %p, owner:%d, state(SH/MOD/INV/DIV):%d\n", i, (void *)page_list_data[i].saddr, page_list_data[i].owner, page_list_data[i].state);
+                printf("  [%03d] %p, owner:%ld, state(SH/MOD/INV/DIV):%d\n", i, (void *)page_list_data[i].saddr, page_list_data[i].owner_mask, page_list_data[i].state);
             }
         }else if( choice == 65 ){
             // Full page dump test (interactive)
@@ -4609,7 +4615,7 @@ void register_ranges_from_file(int uffd) {
             unsigned long aux = start_address + i * page_size;
             printf("Registering page %d at address %lx\n", i, aux);
             page_list_data[total_pages].saddr = aux;
-            page_list_data[total_pages].owner = -1;
+            page_list_data[total_pages].owner_mask = (1ULL << (N_CLIENTS + 1)) - 1ULL; //all owners, starting shared
             page_list_data[total_pages].state = SHARED;
             page_list_data[total_pages].rdma_addr = rdma_base + i * PAGE_SIZE;
 

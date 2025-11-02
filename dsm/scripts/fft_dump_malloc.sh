@@ -54,4 +54,24 @@ scp -r ~/${app} "$client":~/
 scp /tmp/mmapalloc_log "$client":/tmp || true
 scp /tmp/dsm_barrier_pages.txt "$client":/tmp || true
 scp /tmp/ranges.txt "$client":/tmp || true
-echo "✅ Transfer complete"
+echo "✅ Transfer complete $client"
+
+client=dsm_client-2
+# 🚚 Copy to client
+echo "🚚 Transferring app and images to $client..."
+ssh "$client" "rm -rf ~/${app}"
+scp -r ~/${app} "$client":~/
+scp /tmp/mmapalloc_log "$client":/tmp || true
+scp /tmp/dsm_barrier_pages.txt "$client":/tmp || true
+scp /tmp/ranges.txt "$client":/tmp || true
+echo "✅ Transfer complete $client"
+
+client=dsm_client-3
+# 🚚 Copy to client
+echo "🚚 Transferring app and images to $client..."
+ssh "$client" "rm -rf ~/${app}"
+scp -r ~/${app} "$client":~/
+scp /tmp/mmapalloc_log "$client":/tmp || true
+scp /tmp/dsm_barrier_pages.txt "$client":/tmp || true
+scp /tmp/ranges.txt "$client":/tmp || true
+echo "✅ Transfer complete $client"
