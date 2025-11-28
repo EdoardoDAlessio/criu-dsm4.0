@@ -19,7 +19,7 @@
 
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define err_and_ret(msg) do { fprintf(stderr, msg);  return -1; } while (0)
+#define err_and_ret(msg) do { PRINT( msg);  return -1; } while (0)
 //#include "../compel/include/infect-priv.h" needed if  low-level register access or context setup manually.
 #include "util-pie.h"
 #include "asm/types.h"
@@ -36,7 +36,7 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
 //#undef uffdio_range
-#include "user.h"
+//#include "user.h"
 
 //#include "parsemap.h"
 
@@ -74,11 +74,11 @@ pthread_mutex_t handler_locks[N_CLIENTS]; //mutual exclusion on differents
 
 void print_owner_mask(uint64_t mask)
 {
-    printf("owner_mask = 0b");
+    PRINT("owner_mask = 0b");
     for (int i = N_CLIENTS; i >= 0; i--) {
-        printf("%d", (int)((mask >> i) & 1));
+        PRINT("%d", (int)((mask >> i) & 1));
     }
-    printf("\n");
+    PRINT("\n");
 }
 
 
@@ -98,6 +98,7 @@ void fault_start(unsigned long addr, const char *who, int tid)
 {
 	int conflict;
     pthread_mutex_lock(&fault_lock);
+	fault_counter++;
 
     // Wait if another thread is already handling the same page
     conflict = 1;
@@ -106,7 +107,7 @@ void fault_start(unsigned long addr, const char *who, int tid)
         for (int i = 0; i <= N_CLIENTS; i++) {
             if (i == tid) continue;
             if (active_addr[i] == addr) {
-                fprintf(stderr,
+                PRINT(
                     "⚠️  [%s:t%d] waiting, page %lx handled by t%d\n",
                     who, tid, addr, i);
                 pthread_cond_wait(&fault_cond[i], &fault_lock);
@@ -118,7 +119,7 @@ void fault_start(unsigned long addr, const char *who, int tid)
 
     // No conflict: mark myself as active
     active_addr[tid] = addr;
-    fprintf(stderr, "🟢 [%s:t%d] started page %lx\n", who, tid, addr);
+    PRINT( "🟢 [%s:t%d] started page %lx\n", who, tid, addr);
 
     pthread_mutex_unlock(&fault_lock);
 }
@@ -129,7 +130,7 @@ void fault_end(unsigned long addr, const char *who, int tid)
 
     if (active_addr[tid] == addr) {
         active_addr[tid] = 0;
-        fprintf(stderr, "✅ [%s:t%d] finished page %lx\n", who, tid, addr);
+        PRINT( "✅ [%s:t%d] finished page %lx\n", who, tid, addr);
 
         // Wake up everyone who might be waiting on me
         pthread_cond_broadcast(&fault_cond[tid]);
@@ -142,7 +143,7 @@ void dump_fault_status(void) {
     pthread_mutex_lock(&fault_lock);
     for (int i = 0; i <= N_CLIENTS; i++) {
         if (active_addr[i])
-            fprintf(stderr, "[STATUS] t%d → page %lx\n", i, active_addr[i]);
+            PRINT( "[STATUS] t%d → page %lx\n", i, active_addr[i]);
     }
     pthread_mutex_unlock(&fault_lock);
 }
@@ -266,11 +267,12 @@ static void *handler(void *arg) {
 	struct uffdio_range r;
 	size_t n;
 
-
+	#if ENABLE_SERVER
 	struct ibv_wc wc;
 	rdma_cmd_msg cmd; /* temporary on stack, but we will copy it into MR */
 	uint64_t my_handler_addr;
-
+	#endif
+	int owner_id;
 
 	(void) n;
 	(void) ack;
@@ -321,56 +323,52 @@ static void *handler(void *arg) {
 			local_barrier_addr = msg.arg.pagefault.address;
 		#if ENABLE_SERVER
 
-			//all local threads arrived, send the message to remote 
+			//all local threads arrived, send the message to remotes
 			//RDMA BARRIER HIT
-			/* 2) Build command asking server to write into OUR handler */
-			my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
-			cmd.target_addr   = htobe64(my_handler_addr);
 			cmd.faulting_addr  = htobe64((uint64_t)addr);
 			cmd.id           = htonl(MSG_BARRIER_HIT);
 
-			DSM_EVENT_HANDLER("[SERVER] Sending rdma barrier hit: target_addr=%#llx faulting_addr=%#llx id=%u\n\r",
-				(unsigned long long)be64toh(cmd.target_addr),
-				(unsigned long long)be64toh(cmd.faulting_addr),
-				(unsigned)ntohl(cmd.id),
-				(unsigned)ntohl(cmd.index));
-
-			/* 3) Copy CMD into TX buffer (handler_data MR) */
-    		memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
-
-			//Prepare for response 
-			post_one_recv(&z_handler);
-
-			/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
-			DSM_EVENT_HANDLER("[SERVER] Sending CMD to client.receiver (imm=0xCAFE)\n\r");
-			rdma_write_core(&z_handler_data,
-							be64toh(remote_all.receiver.vaddr),
-							ntohl(remote_all.receiver.rkey),
-							z_handler_data.base_addr, sizeof(cmd), 0xCAFE);
-
-			/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
-			for (;;) {
-				if (ibv_poll_cq(z_handler.cq, 1, &wc) > 0) {
-					if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-						if (wc.wc_flags & IBV_WC_WITH_IMM)
-							DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
-						break;
-					}
-				}
-			}
+			
 
 			//and let's see if remote threads have already arrived
-			if (remote_threads_barrier_arrived == 0) {
+			if (remote_threads_barrier_arrived < N_CLIENTS ) {
 				pthread_cond_wait(&barrier.cond, &barrier.lock);
 			}
 
-			/*Cheking if fault address match*/
-			if( remote_barrier_addr != local_barrier_addr ){
-				DSM_EVENT_HANDLER("Error!\n\r");
-				kill_and_exit(restored_pid);
+			DSM_DEBUG_HANDLER("[SERVER] all threads barrier arrived\n\r");
+			// Send BARRIER HIT
+			dsm_msg.msg_type = MSG_BARRIER_HIT;
+			for( int i=0; i<N_CLIENTS; i++ ){
+				pthread_mutex_lock(&handler_locks[i]);
+				PRINT("handler locked fd_handler of client:%d\n", i);
+				/* 3) Copy CMD into TX buffer (handler_data MR) */
+				memcpy(endpoints[i].handler_data.base_addr, &cmd, sizeof(cmd));
+
+				//Prepare for response 
+				post_one_recv(&endpoints[i].handler);
+
+				/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
+				DSM_EVENT_HANDLER("[SERVER] Sending RELEASE BARRIER to client.receiver %d (imm=0xCAFE)\n\r", i);
+				rdma_write_core(&endpoints[i].handler_data,
+								be64toh(endpoints[i].remote_all.receiver.vaddr),
+								ntohl(endpoints[i].remote_all.receiver.rkey),
+								endpoints[i].handler_data.base_addr, sizeof(cmd), 0xCAFE);
+
+				/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+				for (;;) {
+					if (ibv_poll_cq(endpoints[i].handler.cq, 1, &wc) > 0) {
+						if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+							if (wc.wc_flags & IBV_WC_WITH_IMM)
+								DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+							break;
+						}
+					}
+				}
+
+				pthread_mutex_unlock(&handler_locks[i]);
+				PRINT("handler unlocked fd_handler of client:%d\n", i);
 			}
 
-			DSM_DEBUG_HANDLER("[SERVER] remote threads barrier arrived\n\r");
 			//remote threads arrived, resolve fault and exit
 			remote_threads_barrier_arrived = 0; //reset for next barrier
 			pthread_cond_broadcast(&barrier.cond); //notify the other thread if it was waiting 
@@ -383,7 +381,8 @@ static void *handler(void *arg) {
 			pthread_mutex_unlock(&barrier.lock);
 			continue;
 		}
-		//pthread_mutex_lock(&pagefaults_mutex);
+		
+
 
 		index = -1;
 		for (int i=0; i < total_pages; i++) {
@@ -395,10 +394,12 @@ static void *handler(void *arg) {
 		}
 		if(index == -1 ) {
 			PRINT("[DSM] ❌ Address 0x%lx not found in page_list_data[]\n\r", addr);
-			continue;
+			kill_and_exit(restored_pid);
+			// continue;
 		}
-		//mark_fault_start(addr, "LOCAL_HANDLER", msg.arg.pagefault.feat.ptid);
-
+		fault_start(addr, "LOCAL_HANDLER", N_CLIENTS );
+		print_owner_mask(page_list_data[index].owner_mask);
+			
 		if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
 			
 			DSM_DEBUG_HANDLER("[handler] WRITE-PROTECT fault on page\n\r");
@@ -411,113 +412,179 @@ static void *handler(void *arg) {
 			dsm_msg.msg_id = index;
 
 			/* 2) Build command asking server to write into OUR handler */
-			my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
+			my_handler_addr   = (uint64_t)(uintptr_t)endpoints[0].handler.base_addr;
 			cmd.target_addr   = htobe64(my_handler_addr);
 			cmd.faulting_addr  = htobe64((uint64_t)addr);
 			cmd.id           = htonl(MSG_SEND_INVALIDATE);
 			cmd.index = htonl(index);
 
-			DSM_EVENT_HANDLER("[SERVER] Sending rdma : target_addr=%#llx faulting_addr=%#llx id=%u\n\r",
-				(unsigned long long)be64toh(cmd.target_addr),
-				(unsigned long long)be64toh(cmd.faulting_addr),
-				(unsigned)ntohl(cmd.id),
-				(unsigned)ntohl(cmd.index));
+			owner_id = -1;
+			for (int i = 1; i <= N_CLIENTS; i++) {
+				if (page_list_data[index].owner_mask & (1ULL << i)) {
+					owner_id = i - 1;
+					pthread_mutex_lock(&handler_locks[owner_id]);
+					PRINT("handler locked fd_handler of client:%d\n", owner_id);
+					
+					
+					// Send invalidate request
+					DSM_EVENT_HANDLER("[SERVER] Sending rdma MSG_SEND_INVALIDATE : target_addr=%#llx faulting_addr=%#llx id=%u index:%d client:%d\n\r",
+						(unsigned long long)be64toh(cmd.target_addr),
+						(unsigned long long)be64toh(cmd.faulting_addr),
+						(unsigned)ntohl(cmd.id),
+						(unsigned)ntohl(cmd.index), 
+						owner_id);
 
-			/* 3) Copy CMD into TX buffer (handler_data MR) */
-    		memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
+					/* 3) Copy CMD into TX buffer (handler_data MR) */
+					memcpy(endpoints[owner_id].handler_data.base_addr, &cmd, sizeof(cmd));
 
-			//Prepare for response 
-			post_one_recv(&z_handler);
+					//Prepare for response 
+					post_one_recv(&endpoints[owner_id].handler);
 
-			/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
-			DSM_EVENT_HANDLER("[SERVER] Sending CMD to client.receiver (imm=0xCAFE)\n\r");
-			rdma_write_core(&z_handler_data,
-							be64toh(remote_all.receiver.vaddr),
-							ntohl(remote_all.receiver.rkey),
-							z_handler_data.base_addr, sizeof(cmd), 0xCAFE);
+					/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
+					DSM_EVENT_HANDLER("[SERVER] Sending MSG_SEND_INVALIDATE to client.receiver (imm=0xCAFE)\n\r");
+					rdma_write_core(&endpoints[owner_id].handler_data,
+									be64toh(endpoints[owner_id].remote_all.receiver.vaddr),
+									ntohl(endpoints[owner_id].remote_all.receiver.rkey),
+									endpoints[owner_id].handler_data.base_addr, sizeof(cmd), 0xCAFE);
 
-			/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
-			for (;;) {
-				if (ibv_poll_cq(z_handler.cq, 1, &wc) > 0) {
-					if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-						if (wc.wc_flags & IBV_WC_WITH_IMM)
-							DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
-						break;
+					/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+					for (;;) {
+						if (ibv_poll_cq(endpoints[owner_id].handler.cq, 1, &wc) > 0) {
+							if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+								if (wc.wc_flags & IBV_WC_WITH_IMM)
+									DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+								break;
+							}
+						}
 					}
+					
+					/*switch ( all_read(p->fd_handler[owner_id], &ack, 1)) {
+						case -2:
+							PRINT( "[SERVER] Connection closed before ACK\n\r");
+							kill_and_exit(restored_pid);
+						case -1:
+							fprintf( stderr, "[SERVER] all_read(ACK) failed");
+							kill_and_exit(restored_pid);
+						case 0: 
+							DSM_EVENT_HANDLER("[SERVER] Received MSG_INVALIDATE_ACK on INVALIDATION from client:%d\n\r", owner_id);
+							break;
+						default:
+							fprintf( stderr, "Unknown value for handler all__read(ACK)\n\r");
+							kill_and_exit(restored_pid);
+					}*/
+
+					pthread_mutex_unlock(&handler_locks[owner_id]);	
+					PRINT("handler unlocked fd_handler of client:%d\n", owner_id);
 				}
 			}
+
+		
+
+		
 			#endif
 			// Now you can safely disable WP
 			disable_wp(uffd, (void *)addr);
 			//update_page_info(addr, 0, MODIFIED, -2);
 			PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %d \n\r", page_list_data[index].saddr, page_list_data[index].state, MODIFIED, index);
 			page_list_data[index].state = MODIFIED;	
+			page_list_data[index].owner_mask = (1ULL << 0); //server exclusive owner
 			
-		} else {
+		} else if ( !(page_list_data[index].owner_mask & (1ULL << 0)) ){ //if server owns it, it means that some one requested it 
+
+			//find owner
+			// 2. find which client currently owns it
+			owner_id = -1;
+			for (int i = 1; i <= N_CLIENTS; i++) {
+				if (page_list_data[index].owner_mask & (1ULL << i)) {
+					owner_id = i - 1; // convert bit to client index
+					break;
+				}
+			}
+
+
 			if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WRITE) {
-				DSM_EVENT_HANDLER("[handler] MISSING fault on tracked page for WRITE: %p\n\r", (void*)msg.arg.pagefault.address);
+				DSM_EVENT_HANDLER("[handler] MISSING fault on tracked page for WRITE: %p, owner_id:%d\n\r", (void*)msg.arg.pagefault.address, owner_id);
 				dsm_msg.msg_type = MSG_GET_PAGE_DATA_INVALID;
 				copy.mode = 0; 
 				//update_page_info(addr, 0, MODIFIED, -2);
 				PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %d \n\r",
 							page_list_data[index].saddr, page_list_data[index].state, MODIFIED, index);
 				page_list_data[index].state = MODIFIED;	
+				page_list_data[index].owner_mask = (1ULL << 0); //server exclusive owner
 			} else {
-				DSM_EVENT_HANDLER("[handler] MISSING fault on tracked page for READ: %p\n\r", (void*)msg.arg.pagefault.address);
+				DSM_EVENT_HANDLER("[handler] MISSING fault on tracked page for READ: %p, owner_id:%d\n\r", (void*)msg.arg.pagefault.address, owner_id);
 				dsm_msg.msg_type = MSG_GET_PAGE_DATA;
 				copy.mode = UFFDIO_COPY_MODE_WP;
 				//update_page_info(addr, -1, SHARED, -2);
 				PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %d \n\r",
 							page_list_data[index].saddr, page_list_data[index].state, SHARED, index);
 				page_list_data[index].state = SHARED;		
+				page_list_data[index].owner_mask |= (1ULL << 0); //add server to current owners
 			}
 
 			
 		#if ENABLE_SERVER
-			dsm_msg.msg_id = index;
 			
-			/* 2 Build command asking server to write into OUR handler */
-			my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
-			cmd.target_addr   = htobe64(my_handler_addr);
-			cmd.faulting_addr  = htobe64((uint64_t)addr);
-			cmd.id           = htonl(dsm_msg.msg_type);
-			cmd.index = htonl(index);
+			
+			// 3. If a client owns it, request the page from them
+			if (owner_id >= 0) {
+				
+				//let's take fd_handler mutex
+				pthread_mutex_lock(&handler_locks[owner_id]);						
+				PRINT("handler locked RDMA of client:%d\n", owner_id);
 
-			DSM_EVENT_HANDLER("[SERVER] Sending rdma : target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
-				(unsigned long long)be64toh(cmd.target_addr),
-				(unsigned long long)be64toh(cmd.faulting_addr),
-				(unsigned)ntohl(cmd.id),
-				(unsigned)ntohl(cmd.index));
+				/* 2 Build command asking server to write into OUR handler */
+				my_handler_addr   = (uint64_t)(uintptr_t)endpoints[owner_id].handler.base_addr;
+				cmd.target_addr   = htobe64(my_handler_addr);
+				cmd.faulting_addr  = htobe64((uint64_t)addr);
+				cmd.id           = htonl(dsm_msg.msg_type);
+				cmd.index = htonl(index);
 
-			/* 3) Copy CMD into TX buffer (handler_data MR) */
-    		memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
+				DSM_EVENT_HANDLER("[SERVER] Sending rdma : target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
+					(unsigned long long)be64toh(cmd.target_addr),
+					(unsigned long long)be64toh(cmd.faulting_addr),
+					(unsigned)ntohl(cmd.id),
+					(unsigned)ntohl(cmd.index));
 
-			//Prepare for response 
-			post_one_recv(&z_handler);
+				/* 3) Copy CMD into TX buffer (handler_data MR) */
+				memcpy(endpoints[owner_id].handler_data.base_addr, &cmd, sizeof(cmd));
 
-			/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
-			DSM_EVENT_HANDLER("[SERVER] Sending CMD to client.receiver (imm=0xCAFE)\n\r");
-			rdma_write_core(&z_handler_data,
-							be64toh(remote_all.receiver.vaddr),
-							ntohl(remote_all.receiver.rkey),
-							z_handler_data.base_addr, sizeof(cmd), 0xCAFE);
+				//Prepare for response 
+				post_one_recv(&endpoints[owner_id].handler);
 
-			/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
-			for (;;) {
-				if (ibv_poll_cq(z_handler.cq, 1, &wc) > 0) {
-					if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-						if (wc.wc_flags & IBV_WC_WITH_IMM )
-							DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
-						else{
-							fprintf(stderr, "[SERVER] z_handler != MSG_GET_PAGE/GET_PAGE_INVALIDATE:%d\n\r", MSG_INVALIDATE_ACK);
-							kill_and_exit(restored_pid);
+				/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
+				DSM_EVENT_HANDLER("[SERVER] Sending CMD to client.receiver (imm=0xCAFE)\n\r");
+				rdma_write_core(&endpoints[owner_id].handler_data,
+								be64toh(endpoints[owner_id].remote_all.receiver.vaddr),
+								ntohl(endpoints[owner_id].remote_all.receiver.rkey),
+								endpoints[owner_id].handler_data.base_addr, sizeof(cmd), 0xCAFE);
+
+				/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+				for (;;) {
+					if (ibv_poll_cq(endpoints[owner_id].handler.cq, 1, &wc) > 0) {
+						if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+							if (wc.wc_flags & IBV_WC_WITH_IMM )
+								DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+							else{
+								PRINT( "[SERVER] endpoints[owner_id].handler != MSG_GET_PAGE/GET_PAGE_INVALIDATE:%d\n\r", MSG_INVALIDATE_ACK);
+								kill_and_exit(restored_pid);
+							}
+							break;
 						}
-						break;
 					}
 				}
+
+
+				
+				pthread_mutex_unlock(&handler_locks[owner_id]);
+				PRINT("handler unlocked RDMA of client:%d\n", owner_id);
+
+			}else{
+				DSM_EVENT_HANDLER("[handler] Page %d has no valid owner, bug\n\r", addr);
+				kill_and_exit(restored_pid);
 			}
 			
-			copy.src  = (unsigned long)z_handler.base_addr;
+			copy.src  = (unsigned long)endpoints[owner_id].handler.base_addr;
 		#else
 			copy.src  = (unsigned long)zero_page;
 			DSM_EVENT_HANDLER("[handler] Creating zero page for MISSING PAGE FAULT on READ on an ALREADY SHARED PAGE (debug mode)\n\r");
@@ -569,7 +636,7 @@ static void *handler(void *arg) {
 			} else if (copy.copy < 0) {
 				int e = -(int)copy.copy;
 				// You can decide to log & continue, or treat as fatal
-				fprintf(stderr, "[handler] UFFDIO_COPY semantic error %s (%d) on %lx\n\r",
+				PRINT( "[handler] UFFDIO_COPY semantic error %s (%d) on %lx\n\r",
 						strerror(e), e, addr);
 				// Optional: wake anyone waiting so they don’t hang
 				r.start = addr;
@@ -578,14 +645,14 @@ static void *handler(void *arg) {
 				kill_and_exit(restored_pid);
 			} else {
 				// Short copy – shouldn’t happen for anonymous pages
-				fprintf(stderr, "[handler] UFFDIO_COPY short copy (%lld bytes) on %lx\n\r",
+				PRINT( "[handler] UFFDIO_COPY short copy (%lld bytes) on %lx\n\r",
 						(long long)copy.copy, addr);
 				kill_and_exit(restored_pid);
 			}
 		}
 		DSM_EVENT_HANDLER("[handler] done handling fault at 0x%lx\n\r", addr);
-		//mark_fault_end(addr, "LOCAL_HANDLER", msg.arg.pagefault.feat.ptid);
-		//pthread_mutex_unlock(&pagefaults_mutex);
+		fault_end(addr, "LOCAL_HANDLER", N_CLIENTS);
+		print_owner_mask(page_list_data[dsm_msg.msg_id].owner_mask);
 	}
 
 	return NULL;
@@ -689,13 +756,13 @@ static void *handler(void *arg) {
 				dsm_msg.msg_type = MSG_BARRIER_HIT;
 				for( int i=0; i<N_CLIENTS; i++ ){
 					pthread_mutex_lock(&handler_locks[i]);
-					printf("handler locked fd_handler of client:%d\n", i);
+					PRINT("handler locked fd_handler of client:%d\n", i);
 					if (send_all(p->fd_handler[i], &dsm_msg, sizeof(dsm_msg)) != 0) {
 						perror("[SERVER] Failed to send MSG_BARRIER_HIT");
 						kill_and_exit(restored_pid);
 					}else DSM_DEBUG_HANDLER("[SERVER] Sent MSG_BARRIER_HIT to client:%d\n\r", i);
 					pthread_mutex_unlock(&handler_locks[i]);
-					printf("handler unlocked fd_handler of client:%d\n", i);
+					PRINT("handler unlocked fd_handler of client:%d\n", i);
 				}
 
 
@@ -740,13 +807,74 @@ static void *handler(void *arg) {
 
 				#endif
 	#endif
-				/**/dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
-				if( dsm_msg.page_addr >= barrier_end_address ) dsm_msg.page_addr = barrier_start_address;// + dsm_msg.page_addr - barrier_end_address;
+				dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
+				if( dsm_msg.page_addr >= barrier_end_address ) dsm_msg.page_addr = barrier_start_address;
 				enable_wp(uffd, (void*) dsm_msg.page_addr ); //enable next
 				disable_wp(uffd, (void*) msg.arg.pagefault.address); //disable current
 				pthread_mutex_unlock(&barrier.lock);
 				continue;
 			}
+
+			/* Local LOCK via page fault */
+		else if (msg.arg.pagefault.address >= mutex_lock_start_address && msg.arg.pagefault.address < mutex_lock_end_address) {
+
+			unsigned long my_ticket;
+
+			pthread_mutex_lock(&mutex_l);
+
+			my_ticket = ticket_next++;
+			DSM_EVENT_HANDLER("[mutex] local LOCK fault from ptid=%d, ticket=%lu (serving=%lu)\n",
+							msg.arg.pagefault.feat.ptid,
+							(unsigned long)my_ticket,
+							(unsigned long)ticket_serving);
+
+			/* Wait until our ticket is being served */
+			while (my_ticket != ticket_serving) {
+				pthread_cond_wait(&mutex_cond, &mutex_l);
+			}
+
+			/* At this point, this thread owns the lock. Resolve the fault. */
+
+			dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
+			if (dsm_msg.page_addr >= mutex_lock_end_address) {
+				dsm_msg.page_addr = mutex_lock_start_address;
+			}
+
+			enable_wp(uffd, (void *)dsm_msg.page_addr);              /* enable next lock page */
+			disable_wp(uffd, (void *)msg.arg.pagefault.address);     /* unlock current page */
+
+			pthread_mutex_unlock(&mutex_l);
+			continue;
+		}
+
+		/* Local UNLOCK via page fault */
+		if (msg.arg.pagefault.address >= mutex_unlock_start_address && msg.arg.pagefault.address <  mutex_unlock_end_address) {
+
+			pthread_mutex_lock(&mutex_l);
+
+			/* Release the lock: advance the ticket and wake up waiters */
+			ticket_serving++;
+			DSM_EVENT_HANDLER("[mutex] local UNLOCK fault from ptid=%d, now serving=%lu\n",
+							msg.arg.pagefault.feat.ptid,
+							(unsigned long)ticket_serving);
+
+			pthread_cond_broadcast(&mutex_cond);
+
+			/* Move write-protect to next unlock page (if you’re rotating them) */
+			dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
+			if (dsm_msg.page_addr >= mutex_unlock_end_address) {
+				dsm_msg.page_addr = mutex_unlock_start_address;
+			}
+
+			enable_wp(uffd, (void *)dsm_msg.page_addr);
+			disable_wp(uffd, (void *)msg.arg.pagefault.address);
+
+			pthread_mutex_unlock(&mutex_l);
+			continue;
+		}
+
+
+			
 			//pthread_mutex_lock(&pagefaults_mutex);
 
 			index = -1;
@@ -761,8 +889,7 @@ static void *handler(void *arg) {
 				PRINT("[DSM] ❌ Address 0x%lx not found in page_list_data[]\n\r", addr);
 				continue;
 			}
-			//mark_fault_start(addr, "LOCAL_HANDLER", msg.arg.pagefault.feat.ptid);
-			fault_start(addr, "LOCAL_HANDLER", N_CLIENTS + 1);
+			fault_start(addr, "LOCAL_HANDLER", N_CLIENTS );
 			print_owner_mask(page_list_data[index].owner_mask);
 			
 			
@@ -787,7 +914,7 @@ static void *handler(void *arg) {
 					if (page_list_data[index].owner_mask & (1ULL << i)) {
 						owner_id = i - 1;
 						pthread_mutex_lock(&handler_locks[owner_id]);
-						printf("handler locked fd_handler of client:%d\n", owner_id);
+						PRINT("handler locked fd_handler of client:%d\n", owner_id);
 						// Send invalidate request
 						if (send_all(p->fd_handler[owner_id], &dsm_msg, sizeof(dsm_msg)) != 0) {
 							perror("[SERVER] Failed to send MSG_SEND_INVALIDATE");
@@ -797,7 +924,7 @@ static void *handler(void *arg) {
 						DSM_EVENT_HANDLER("[Handler] Sent MSG_SEND_INVALIDATE to client:%d. With address:0x%lx\n\r", owner_id, addr);
 						switch ( all_read(p->fd_handler[owner_id], &ack, 1)) {
 							case -2:
-								fprintf(stderr, "[SERVER] Connection closed before ACK\n\r");
+								PRINT( "[SERVER] Connection closed before ACK\n\r");
 								kill_and_exit(restored_pid);
 							case -1:
 								fprintf( stderr, "[SERVER] all_read(ACK) failed");
@@ -811,7 +938,7 @@ static void *handler(void *arg) {
 						}
 
 						pthread_mutex_unlock(&handler_locks[owner_id]);	
-						printf("handler unlocked fd_handler of client:%d\n", owner_id);
+						PRINT("handler unlocked fd_handler of client:%d\n", owner_id);
 					}
 				}
 
@@ -825,9 +952,6 @@ static void *handler(void *arg) {
 				page_list_data[index].owner_mask = (1ULL << 0); //server exclusive owner
 				
 			} else if ( !(page_list_data[index].owner_mask & (1ULL << 0)) ){ //if server owns it, it means that some one requested it 
-
-
-				
 
 
 				//find owner
@@ -875,23 +999,21 @@ static void *handler(void *arg) {
 						
 						//let's take fd_handler mutex
 						pthread_mutex_lock(&handler_locks[owner_id]);						
-						printf("handler locked fd_handler of client:%d\n", owner_id);
+						PRINT("handler locked fd_handler of client:%d\n", owner_id);
 
 						if (send_get_page(dsm_msg, p->fd_handler[owner_id], page_data) != 0) {
-							fprintf(stderr, "[handler] Failed to fetch page from remote\n\r");
+							PRINT( "[handler] Failed to fetch page from remote\n\r");
 							kill_and_exit(restored_pid);
 						}
 						pthread_mutex_unlock(&handler_locks[owner_id]);
-						printf("handler unlocked fd_handler of client:%d\n", owner_id);
+						PRINT("handler unlocked fd_handler of client:%d\n", owner_id);
 
 					}else{
 						DSM_EVENT_HANDLER("[handler] Page %d has no valid owner, bug\n\r", addr);
 						kill_and_exit(restored_pid);
-					}
-
-
-					
+					}			
 					copy.src  = (unsigned long)page_data;
+
 				}else{ //meaning we are in debug mode without the client
 					// Create a zero page for missing fault
 					//memset(page_data, 0, PAGE_SIZE);
@@ -947,7 +1069,7 @@ static void *handler(void *arg) {
 				} else if (copy.copy < 0) {
 					int e = -(int)copy.copy;
 					// You can decide to log & continue, or treat as fatal
-					fprintf(stderr, "[handler] UFFDIO_COPY semantic error %s (%d) on %lx\n\r",
+					PRINT( "[handler] UFFDIO_COPY semantic error %s (%d) on %lx\n\r",
 							strerror(e), e, addr);
 					// Optional: wake anyone waiting so they don’t hang
 					r.start = addr;
@@ -956,13 +1078,13 @@ static void *handler(void *arg) {
 					kill_and_exit(restored_pid);
 				} else {
 					// Short copy – shouldn’t happen for anonymous pages
-					fprintf(stderr, "[handler] UFFDIO_COPY short copy (%lld bytes) on %lx\n\r",
+					PRINT( "[handler] UFFDIO_COPY short copy (%lld bytes) on %lx\n\r",
 							(long long)copy.copy, addr);
 					kill_and_exit(restored_pid);
 				}
 			}
 			DSM_EVENT_HANDLER("[handler] done handling fault at 0x%lx\n\r", addr);
-			fault_end(addr, "LOCAL_HANDLER", N_CLIENTS+1);
+			fault_end(addr, "LOCAL_HANDLER", N_CLIENTS);
 			print_owner_mask(page_list_data[dsm_msg.msg_id].owner_mask);
 			//pthread_mutex_unlock(&pagefaults_mutex);
 		}
@@ -972,11 +1094,12 @@ static void *handler(void *arg) {
 #endif
 
 #if RDMA_ENABLE
-void dsm_command_main_loop(int fd_command) {
+void dsm_command_main_loop(command_thread_args *a){
     struct msg_info msg;
     //ssize_t n;
 	//unsigned char ack;
-	
+	//int client_id  = a->client_id;
+	//int fd_command  = a->conn[client_id].fd_command;
 	//RDMA
 	struct ibv_wc wc;
 	rdma_cmd_msg cmd;
@@ -986,26 +1109,27 @@ void dsm_command_main_loop(int fd_command) {
     //unsigned char rawbuf[sizeof(rdma_wire_all)];
     //size_t i;
 	//int got = 0;
-
-
+	int client_id  = a->client_id;
+	int owner_id = -1;
+	struct uffdio_copy copy;
 	//unsigned char page_content[PAGE_SIZE];
     struct iovec local_iov, remote_iov;
 	
     ssize_t nread;
 
 	/* 1) Wait for client's CMD on client.receiver */
-	post_one_recv(&z_receiver);
+	post_one_recv(&endpoints[client_id].receiver);
 
     while (1) {
-        DSM_EVENT_SERVER("[SERVER] Waiting for RDMA message on z_receiver...\n\r");
+        DSM_EVENT_SERVER("[SERVER] Waiting for RDMA message on endpoints[client_id].receiver...\n\r");
 
 
 		/* 1. Wait for WRITE_WITH_IMM from client */
-		poll_one_cqe(&z_receiver, &wc);
+		poll_one_cqe(&endpoints[client_id].receiver, &wc);
 		if (!(wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM)) {
 			DSM_EVENT_SERVER("[SERVER] Unexpected CQE opcode=%d\n\r", wc.opcode);
 		}
-		memcpy(&cmd, z_receiver.base_addr, sizeof(cmd));
+		memcpy(&cmd, endpoints[client_id].receiver.base_addr, sizeof(cmd));
 		DSM_EVENT_SERVER("[SERVER] Command CMD: target_addr=%#llx fault addr=%#llx id=%u, index:%u\n\r",
 			(unsigned long long)be64toh(cmd.target_addr),
 			(unsigned long long)be64toh(cmd.faulting_addr),
@@ -1015,21 +1139,50 @@ void dsm_command_main_loop(int fd_command) {
 		msg.msg_type = ntohl(cmd.id); //abusing msg_type to store the command type
 		msg.page_addr = be64toh(cmd.faulting_addr);
 		msg.msg_id = ntohl(cmd.index);
-		post_one_recv(&z_receiver);
+		post_one_recv(&endpoints[client_id].receiver);
         DSM_DEBUG_SERVER("[DSM Server] Received message: type=%d, addr=0x%lx, id=%ld\n\r",
                msg.msg_type, msg.page_addr, msg.msg_id);
 		
-		//mark_fault_start(msg.page_addr, "REMOTE_FAULT", msg.msg_id);
+		if( msg.msg_type != MSG_BARRIER_HIT ) {
+			fault_start(msg.page_addr, "SERVER", client_id);
+			print_owner_mask( page_list_data[msg.msg_id].owner_mask );
+		}	
         switch (msg.msg_type) {
 			case MSG_BARRIER_HIT:
-                DSM_DEBUG_SERVER("[DSM Server] Remote barrier hit.\n\r");
-				#if 1
+			#if N_CLIENTS 
+				pthread_mutex_lock(&barrier.lock);
+
+
+				DSM_EVENT_SERVER("[SERVER] Sending ACK_CMD to client.handler (imm=0xBB)\n\r");
+				rdma_write_core(&endpoints[client_id].receiver_data,
+								be64toh(endpoints[client_id].remote_all.handler.vaddr),
+								ntohl(endpoints[client_id].remote_all.handler.rkey),
+								endpoints[client_id].receiver_data.base_addr, 0, 0xBB);
+
+				if( remote_threads_barrier_arrived == N_CLIENTS){
+					//means that the handler thread has not process the barrier yet, let's wait until it does
+					pthread_cond_wait(&barrier.cond, &barrier.lock);
+				}
+
+				// mark that remote threads have arrived, this is useful if we come before the local threads have, 
+				//so that we don't care if the signal was lost since we can check the variable
+				remote_threads_barrier_arrived++; 
+				remote_barrier_addr = msg.page_addr;
+				DSM_DEBUG_SERVER("[DSM Server] Remote barrier hit. %d/%d\n\r",remote_threads_barrier_arrived, N_CLIENTS);
+				if( remote_threads_barrier_arrived == N_CLIENTS ){
+					DSM_EVENT_SERVER("[DSM Server] All remote threads have arrived! \n\r");
+					pthread_cond_broadcast(&barrier.cond); 
+					//releasing local handler if it was waiting, if not it will not wait due to remote_threads_barrier_arrived being already N_Clients
+				}
+				pthread_mutex_unlock(&barrier.lock);
+				continue;
+			#else
 				
 				DSM_EVENT_SERVER("[SERVER] Sending ACK_CMD to client.handler (imm=0xB1)\n\r");
-				rdma_write_core(&z_receiver_data,
-								be64toh(remote_all.handler.vaddr),
-								ntohl(remote_all.handler.rkey),
-								z_receiver_data.base_addr, 0, 0xB1);
+				rdma_write_core(&endpoints[client_id].receiver_data,
+								be64toh(endpoints[client_id].remote_all.handler.vaddr),
+								ntohl(endpoints[client_id].remote_all.handler.rkey),
+								endpoints[client_id].receiver_data.base_addr, 0, 0xB1);
 				pthread_mutex_lock(&barrier.lock);
 
 				if( remote_threads_barrier_arrived == 1 ){
@@ -1044,14 +1197,14 @@ void dsm_command_main_loop(int fd_command) {
 				pthread_cond_broadcast(&barrier.cond);
 				DSM_EVENT_SERVER("[DSM Server] Remote hit barrier, releasing...\n\r");
 				pthread_mutex_unlock(&barrier.lock);
-				#endif
+			#endif
 				break;
 			case MSG_WAKE_THREAD:
 				DSM_EVENT_SERVER("[SERVER] Sending ACK_CMD to client.handler (imm=0xB1)\n\r");
-				rdma_write_core(&z_receiver_data,
-								be64toh(remote_all.handler.vaddr),
-								ntohl(remote_all.handler.rkey),
-								z_receiver_data.base_addr, 0, 0xB1);
+				rdma_write_core(&endpoints[client_id].receiver_data,
+								be64toh(endpoints[client_id].remote_all.handler.vaddr),
+								ntohl(endpoints[client_id].remote_all.handler.rkey),
+								endpoints[client_id].receiver_data.base_addr, 0, 0xB1);
 
 
 				send_sigcont(restored_pid);
@@ -1060,80 +1213,333 @@ void dsm_command_main_loop(int fd_command) {
 				send_sigstop(restored_pid);
 				break;
 			case MSG_GET_PAGE_DATA:
-			case MSG_GET_PAGE_DATA_INVALID:
-			
-				DSM_EVENT_SERVER("→ Handling GET_PAGE_DATA/GET_PAGE_DATA_INVALID\n\r");
-				PRINT("[DSM] Using process_vm_readv() to fetch remote page (pid=%d, addr=%p)\n\r",
+				DSM_EVENT_SERVER("→ Handling RDMA GET_PAGE_DATA\n\r");
+				//We already have fault start, therefore we have permission to handle this address 
+				//Now we have to check the owner and request the page from him
+				owner_id = -2; //-2 means no owner, -1 means server owns it
+				for (int i = 0; i <= N_CLIENTS; i++) {
+					if (page_list_data[msg.msg_id].owner_mask & (1ULL << i)) {
+						owner_id = i - 1; // convert bit to client index
+						break;
+					}
+				}
+				if( owner_id == -1){
+					//server owns the page, we can serve it directly
+					PRINT("[DSM] Using process_vm_readv() to fetch remote page (pid=%d, addr=%p)\n\r",
 					restored_pid, (void*)msg.page_addr);
 				
-				// --- Prepare iovecs ---
-				local_iov.iov_base = z_receiver_data.base_addr; //RDMA 
-				local_iov.iov_len  = PAGE_SIZE;
-				remote_iov.iov_base = (void*)msg.page_addr;
-				remote_iov.iov_len  = PAGE_SIZE;	
-				// --- Read the page directly from target process ---
-				nread = process_vm_readv(restored_pid,
-										&local_iov, 1,
-										&remote_iov, 1,
-										0);	
-				if (nread != PAGE_SIZE) {
-					if (nread < 0)
-						PRINT("❌ process_vm_readv failed: %s\n\r", strerror(errno));
-					else
-						PRINT("⚠️ process_vm_readv read partial data: %ld bytes\n\r", nread);
-					kill_and_exit(restored_pid);	
-				}	
-				PRINT("✅ Read %ld bytes from target process memory\n\r", nread);
+					// --- Prepare iovecs ---
+					local_iov.iov_base = endpoints[client_id].receiver_data.base_addr; //RDMA 
+					local_iov.iov_len  = PAGE_SIZE;
+					remote_iov.iov_base = (void*)msg.page_addr;
+					remote_iov.iov_len  = PAGE_SIZE;	
+					// --- Read the page directly from target process ---
+					nread = process_vm_readv(restored_pid,
+											&local_iov, 1,
+											&remote_iov, 1,
+											0);	
+					if (nread != PAGE_SIZE) {
+						if (nread < 0)
+							PRINT("❌ process_vm_readv failed: %s\n\r", strerror(errno));
+						else
+							PRINT("⚠️ process_vm_readv read partial data: %ld bytes\n\r", nread);
+						kill_and_exit(restored_pid);	
+					}	
+					PRINT("✅ Read %ld bytes from target process memory\n\r", nread);
+				}
+				else if( owner_id == -2 ){
+					DSM_EVENT_SERVER("[SERVER] Page %d has no valid owner, bug\n\r", msg.msg_id);
+					kill_and_exit(restored_pid);
+				}else{
+					//we first need to request it from the owner client
+					//let's take fd_handler mutex
+					pthread_mutex_lock(&handler_locks[owner_id]);
+					PRINT("receiver:%d locked RDMA handler of client:%d\n", client_id, owner_id);
+					//now we can send to the client receiver our request
+					//1. copy message GET PAGE_DATA to the owner receiver buffer
+					memcpy(endpoints[owner_id].handler_data.base_addr, endpoints[client_id].receiver.base_addr, sizeof(cmd));
+					//Prepare for response 
+					post_one_recv(&endpoints[owner_id].handler);
+					/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
+					DSM_EVENT_HANDLER("[SERVER] Sending CMD to client.receiver (imm=0xCAFE)\n\r");
+					rdma_write_core(&endpoints[owner_id].handler_data,
+									be64toh(endpoints[owner_id].remote_all.receiver.vaddr),
+									ntohl(endpoints[owner_id].remote_all.receiver.rkey),
+									endpoints[owner_id].handler_data.base_addr, sizeof(cmd), 0xCAFE);
 
-				// --- Send page data to client ---
-				rdma_write_core(&z_receiver_data,
-								be64toh(remote_all.handler.vaddr),
-								ntohl(remote_all.handler.rkey),
-								z_receiver_data.base_addr, 4096, 0xB1);
+					/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+					for (;;) {
+						if (ibv_poll_cq(endpoints[owner_id].handler.cq, 1, &wc) > 0) {
+							if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+								if (wc.wc_flags & IBV_WC_WITH_IMM )
+									DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+								else{
+									PRINT( "[SERVER] endpoints[owner_id].handler != MSG_GET_PAGE/GET_PAGE_INVALIDATE:%d\n\r", MSG_INVALIDATE_ACK);
+									kill_and_exit(restored_pid);
+								}
+								break;
+							}
+						}
+					}
 					
-   				PRINT("✅ Page_transfer_complete to client (addr=%p)\n\r", (void*)msg.page_addr);
-				// --- Post-transfer page management ---
-				if (msg.msg_type == MSG_GET_PAGE_DATA_INVALID) {
-					PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n\r");
+					pthread_mutex_unlock(&handler_locks[owner_id]);
+					PRINT("handler unlocked RDMA of client:%d\n", owner_id);
+
+					//Now we locally update the page and then send it to the client requesting it
+					copy.src  = (unsigned long)endpoints[owner_id].handler.base_addr;
+					copy.mode = UFFDIO_COPY_MODE_WP;
+					copy.dst = msg.page_addr;
+					copy.len = PAGE_SIZE;  
+					if (ioctl(uffd, UFFDIO_COPY, &copy) == -1) {
+						// Kernel-level failure (not the EEXIST race, that shows up in copy.copy)
+						DSM_EVENT_SERVER("[receiver:%d] ", client_id);
+						perror("UFFDIO_COPY ioctl failed\n");
+						kill_and_exit(restored_pid);
+					}
+					if( copy.copy  ){
+						DSM_EVENT_SERVER("[Receiver:%d] Page copied back to missing region\n\r", client_id);
+					}
+					//changing ownership
+					page_list_data[msg.msg_id].owner_mask |= (1ULL << 0);  //adding server as owner
+					page_list_data[msg.msg_id].state = SHARED;
+
+					//now we have the page in the correct RDMA buffer, we can send it to the client
+					memcpy(endpoints[client_id].receiver_data.base_addr, endpoints[owner_id].handler.base_addr, PAGE_SIZE);
+
+				}
+				//now we have the page in the RDMA buffer, we can send it to the client
+				// --- Send page data to client ---
+				rdma_write_core(&endpoints[client_id].receiver_data,
+								be64toh(endpoints[client_id].remote_all.handler.vaddr),
+								ntohl(endpoints[client_id].remote_all.handler.rkey),
+								endpoints[client_id].receiver_data.base_addr, 4096, 0xB1);
+				PRINT("✅ Page_transfer_complete to client (addr=%p)\n\r", (void*)msg.page_addr);
+				
+				page_list_data[msg.msg_id].owner_mask |= (1ULL << (client_id + 1)); //adding requesting client as owner
+				if( page_list_data[msg.msg_id].state != SHARED ){
+					enable_wp(uffd, (void*)msg.page_addr);
+					page_list_data[msg.msg_id].state = SHARED;	
+				}
+
+				break;
+			case MSG_GET_PAGE_DATA_INVALID:
+				DSM_EVENT_SERVER("→ Handling RDMA GET_PAGE_DATA_INVALID\n\r");
+				//We already have fault start, therefore we have permission to handle this address 
+				//Now we have to check the owner and request the page from him
+				owner_id = -2; //-2 means no owner, -1 means server owns it
+				for (int i = 0; i <= N_CLIENTS; i++) {
+					if (page_list_data[msg.msg_id].owner_mask & (1ULL << i)) {
+						owner_id = i - 1; // convert bit to client index
+						break;
+					}
+				}
+				if( owner_id == -1){
+					//server owns the page, we can serve it directly
+					PRINT("[DSM] Using process_vm_readv() to fetch remote page (pid=%d, addr=%p)\n\r",
+					restored_pid, (void*)msg.page_addr);
+				
+					// --- Prepare iovecs ---
+					local_iov.iov_base = endpoints[client_id].receiver_data.base_addr; //RDMA 
+					local_iov.iov_len  = PAGE_SIZE;
+					remote_iov.iov_base = (void*)msg.page_addr;
+					remote_iov.iov_len  = PAGE_SIZE;	
+					// --- Read the page directly from target process ---
+					nread = process_vm_readv(restored_pid,
+											&local_iov, 1,
+											&remote_iov, 1,
+											0);	
+					if (nread != PAGE_SIZE) {
+						if (nread < 0)
+							PRINT("❌ process_vm_readv failed: %s\n\r", strerror(errno));
+						else
+							PRINT("⚠️ process_vm_readv read partial data: %ld bytes\n\r", nread);
+						kill_and_exit(restored_pid);	
+					}	
+					PRINT("✅ Read %ld bytes from target process memory\n\r", nread);
+
+					//AND invalidate the page
+					page_list_data[msg.msg_id].owner_mask &= ~(1ULL << 0);  //removing server as owner
+					PRINT("Message is GET_PAGE_INVALIDATE → SERVER Drops the page to INVALIDATE\n\r");
 					if (run_proc_MADVISE(pidfd, restored_pid, (void*)msg.page_addr, PAGE_SIZE) == 0)
 						PRINT("process_madvise to invalidate page %p\n\r", (void*)msg.page_addr);
 					else{
 						PRINT("❌ MADV_DONTNEED failed: %s\n\r", strerror(errno));
 						kill_and_exit(restored_pid);
 					}
-					PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n\r",
-						msg.page_addr, page_list_data[msg.msg_id].state, INVALID, msg.msg_id);
-					page_list_data[msg.msg_id].state = INVALID;	
-				} else {
-					PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n\r");
-					if (enable_wp(uffd, (void*)msg.page_addr)){
-						PRINT("⚠️ enable_wp failed\n\r");
-						kill_and_exit(restored_pid);
+				}
+				else if( owner_id == -2 ){
+					DSM_EVENT_SERVER("[SERVER] Page %d has no valid owner, bug\n\r", msg.msg_id);
+					kill_and_exit(restored_pid);
+				}else{
+					//we first need to request it from the owner client
+					//let's take fd_handler mutex
+					pthread_mutex_lock(&handler_locks[owner_id]);
+					PRINT("receiver:%d locked RDMA handler of client:%d\n", client_id, owner_id);
+					//now we can send to the client receiver our request
+					//1. copy message GET PAGE_DATA to the owner receiver buffer
+					memcpy(endpoints[owner_id].handler_data.base_addr, endpoints[client_id].receiver.base_addr, sizeof(cmd));
+					//Prepare for response 
+					post_one_recv(&endpoints[owner_id].handler);
+					/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
+					DSM_EVENT_HANDLER("[SERVER] Sending CMD to client.receiver (imm=0xCAFE)\n\r");
+					rdma_write_core(&endpoints[owner_id].handler_data,
+									be64toh(endpoints[owner_id].remote_all.receiver.vaddr),
+									ntohl(endpoints[owner_id].remote_all.receiver.rkey),
+									endpoints[owner_id].handler_data.base_addr, sizeof(cmd), 0xCAFE);
+
+					/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+					for (;;) {
+						if (ibv_poll_cq(endpoints[owner_id].handler.cq, 1, &wc) > 0) {
+							if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+								if (wc.wc_flags & IBV_WC_WITH_IMM )
+									DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+								else{
+									PRINT( "[SERVER] endpoints[owner_id].handler != MSG_GET_PAGE/GET_PAGE_INVALIDATE:%d\n\r", MSG_INVALIDATE_ACK);
+									kill_and_exit(restored_pid);
+								}
+								break;
+							}
+						}
 					}
-					PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n\r",
-						msg.page_addr, page_list_data[msg.msg_id].state, SHARED, msg.msg_id);
-					page_list_data[msg.msg_id].state = SHARED;	
+					
+					pthread_mutex_unlock(&handler_locks[owner_id]);
+					PRINT("handler unlocked RDMA of client:%d\n", owner_id);
+
+					//this client (owner_id) has the page, we need to copy it to the client requesting it (client_id)
+					
+					//also it already did the invalidation, remove the owner from the owner mask
+					page_list_data[msg.msg_id].owner_mask &= ~(1ULL << (owner_id + 1));
+
+					//now we have the page in the correct RDMA buffer, we can send it to the client
+					memcpy(endpoints[client_id].receiver_data.base_addr, endpoints[owner_id].handler.base_addr, PAGE_SIZE);
+
+				}
+				//now we have the page in the RDMA buffer, we can send it to the client
+				// --- Send page data to client ---
+				rdma_write_core(&endpoints[client_id].receiver_data,
+								be64toh(endpoints[client_id].remote_all.handler.vaddr),
+								ntohl(endpoints[client_id].remote_all.handler.rkey),
+								endpoints[client_id].receiver_data.base_addr, 4096, 0xB1);
+				PRINT("✅ Page_transfer_complete to client (addr=%p)\n\r", (void*)msg.page_addr);
+				
+				
+				//check if we may have to invalidate other shares
+				if( page_list_data[msg.msg_id].state == SHARED ){ //its shared, we may have some clients to invalidate
+					//prepare the invalidate message
+					cmd.id = htonl(MSG_SEND_INVALIDATE);
+					
+					
+					for (int i = 1; i <= N_CLIENTS; i++) {
+						if( i - 1 == client_id ) continue; //skip to not invalidate requesting client
+						if (page_list_data[msg.msg_id].owner_mask & (1ULL << i)) {
+							owner_id = i - 1;
+							//let's take fd_handler mutex
+							pthread_mutex_lock(&handler_locks[owner_id]);						
+							PRINT("handler locked RDMA of client:%d\n", owner_id);
+							
+							/* 3) Copy CMD into TX buffer (handler_data MR) */
+							memcpy(endpoints[owner_id].handler_data.base_addr, &cmd, sizeof(cmd));
+							
+							//Prepare for response 
+							post_one_recv(&endpoints[owner_id].handler);
+
+							/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
+							DSM_EVENT_HANDLER("[SERVER] Sending INVALIDATE to client.receiver (imm=0xCAFE)\n\r");
+							rdma_write_core(&endpoints[owner_id].handler_data,
+											be64toh(endpoints[owner_id].remote_all.receiver.vaddr),
+											ntohl(endpoints[owner_id].remote_all.receiver.rkey),
+											endpoints[owner_id].handler_data.base_addr, sizeof(cmd), 0xCAFE);
+
+							/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+							for (;;) {
+								if (ibv_poll_cq(endpoints[owner_id].handler.cq, 1, &wc) > 0) {
+									if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+										if (wc.wc_flags & IBV_WC_WITH_IMM )
+											DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+										else{
+											PRINT( "[SERVER] endpoints[owner_id].handler != MSG_GET_PAGE/GET_PAGE_INVALIDATE:%d\n\r", MSG_INVALIDATE_ACK);
+											kill_and_exit(restored_pid);
+										}
+										break;
+									}
+								}
+							}
+							pthread_mutex_unlock(&handler_locks[owner_id]);
+							PRINT("handler unlocked RDMA of client:%d\n", owner_id);
+						}
+					}
 				}
 
-                break;
-            case MSG_SEND_INVALIDATE:
-				DSM_EVENT_SERVER("→ Handling remote RDMA invalidation request. Madvise(MADV_DONTNEED) on page at %p\n\r", (void *)msg.page_addr);
-				//pthread_mutex_lock(&pagefaults_mutex);
-				if (run_proc_MADVISE(pidfd, restored_pid, (void *)msg.page_addr, 4096) == 0){
-					DSM_EVENT_SERVER("Successfully ran madvise on page at %p\n\r", (void *)msg.page_addr);
-					
-					DSM_EVENT_SERVER("[SERVER] Sending ACK_CMD to client.handler on INVALIDATE (imm=0xB1)\n\r");
-					rdma_write_core(&z_receiver_data,
-									be64toh(remote_all.handler.vaddr),
-									ntohl(remote_all.handler.rkey),
-									z_receiver_data.base_addr, 0, 0xB1);
 
-					PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n\r",	msg.page_addr, page_list_data[msg.msg_id].state, INVALID, msg.msg_id);
-					page_list_data[msg.msg_id].state = INVALID;		
-				}else {
-					perror("run_proc_MADVISE RDMA command loop");
-					kill_and_exit(restored_pid);
-				} 
+				page_list_data[msg.msg_id].owner_mask = (1ULL << (client_id + 1)); //adding requesting client as owner
+				page_list_data[msg.msg_id].state = INVALID; 
+				break;
+            case MSG_SEND_INVALIDATE:
+				//Just send this message to all owners 
+				DSM_EVENT_SERVER("→ Handling remote RDMA invalidation request. Madvise(MADV_DONTNEED) on page at %p\n\r", (void *)msg.page_addr);
+				for (int i = 1; i <= N_CLIENTS; i++) {
+					if( i - 1 == client_id ) continue; //skip to not invalidate requesting client
+					if (page_list_data[msg.msg_id].owner_mask & (1ULL << i)) {
+						owner_id = i - 1;
+						//let's take fd_handler mutex
+						pthread_mutex_lock(&handler_locks[owner_id]);						
+						PRINT("handler locked RDMA of client:%d\n", owner_id);
+						
+						/* 3) Copy CMD into TX buffer (handler_data MR) */
+						memcpy(endpoints[owner_id].handler_data.base_addr, &cmd, sizeof(cmd));
+						
+						//Prepare for response 
+						post_one_recv(&endpoints[owner_id].handler);
+
+						/* 4) WRITE_WITH_IMM to client.receiver using that registered buffer */
+						DSM_EVENT_HANDLER("[SERVER] Sending INVALIDATE to client.receiver (imm=0xCAFE)\n\r");
+						rdma_write_core(&endpoints[owner_id].handler_data,
+										be64toh(endpoints[owner_id].remote_all.receiver.vaddr),
+										ntohl(endpoints[owner_id].remote_all.receiver.rkey),
+										endpoints[owner_id].handler_data.base_addr, sizeof(cmd), 0xCAFE);
+
+						/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+						for (;;) {
+							if (ibv_poll_cq(endpoints[owner_id].handler.cq, 1, &wc) > 0) {
+								if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+									if (wc.wc_flags & IBV_WC_WITH_IMM )
+										DSM_EVENT_HANDLER("[SERVER] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+									else{
+										PRINT( "[SERVER] endpoints[owner_id].handler != MSG_GET_PAGE/GET_PAGE_INVALIDATE:%d\n\r", MSG_INVALIDATE_ACK);
+										kill_and_exit(restored_pid);
+									}
+									break;
+								}
+							}
+						}
+						pthread_mutex_unlock(&handler_locks[owner_id]);
+						PRINT("handler unlocked RDMA of client:%d\n", owner_id);
+					}
+				}
+				
+				// then invalidate server if owner
+				if (page_list_data[msg.msg_id].owner_mask & (1ULL << 0)) {
+					if (run_proc_MADVISE(pidfd, restored_pid, (void *)msg.page_addr, 4096) == 0){
+						DSM_EVENT_SERVER("Successfully ran madvise on page at %p\n\r", (void *)msg.page_addr);
+						
+						DSM_EVENT_SERVER("[SERVER] Sending ACK_CMD to client.handler on INVALIDATE (imm=0xB1)\n\r");
+						rdma_write_core(&endpoints[client_id].receiver_data,
+										be64toh(endpoints[client_id].remote_all.handler.vaddr),
+										ntohl(endpoints[client_id].remote_all.handler.rkey),
+										endpoints[client_id].receiver_data.base_addr, 0, 0xB1);
+
+						PRINT("[DSM] Updating page at 0x%lx state:%d→%d, entry %ld \n\r",	msg.page_addr, page_list_data[msg.msg_id].state, INVALID, msg.msg_id);
+						page_list_data[msg.msg_id].state = INVALID;		
+					}else {
+						perror("run_proc_MADVISE RDMA command loop");
+						kill_and_exit(restored_pid);
+					} 
+				}
+				
+
+				PRINT("Changing state and owner\n");
+				page_list_data[msg.msg_id].state = INVALID;		
+				page_list_data[msg.msg_id].owner_mask = (1ULL << (client_id + 1)); 
 				//pthread_mutex_unlock(&pagefaults_mutex);
 				break;
 
@@ -1142,12 +1548,12 @@ void dsm_command_main_loop(int fd_command) {
                 continue;
 			
             default:
-                fprintf(stderr, "⚠️ Unknown message type: %d\n\r", msg.msg_type);
+                PRINT( "⚠️ Unknown message type: %d\n\r", msg.msg_type);
                 kill_and_exit(restored_pid);  // shutdown the server on protocol error
                 break;
         }
+		fault_end(msg.page_addr, "SERVER", client_id);
 		PRINT("\n\r");
-		//mark_fault_end(msg.page_addr, "REMOTE_FAULT", msg.msg_id);
     }
 }
 #else
@@ -1171,19 +1577,79 @@ void dsm_command_main_loop(int fd_command) {
 				perror("[DSM Server] recv failed or connection closed");
 				break;
 			} else if (n != sizeof(msg)) {
-				fprintf(stderr, "[DSM Server] Incomplete message received (got %zd bytes)\n\r", n);
+				PRINT( "[DSM Server] Incomplete message received (got %zd bytes)\n\r", n);
 				continue;
 			}
 
 			DSM_DEBUG_SERVER("[DSM Server Client:%d] Received message: type=%d, addr=0x%lx, id=%ld\n\r", client_id, msg.msg_type, msg.page_addr, msg.msg_id);
 			
-			//mark_fault_start(msg.page_addr, "REMOTE_FAULT", msg.msg_id);
-			if( msg.msg_type != MSG_BARRIER_HIT ) {
+			if( msg.msg_type != MSG_BARRIER_HIT &&  msg.msg_type != MSG_LOCK_REQUEST && msg.msg_type != MSG_UNLOCK && msg.msg_type != MSG_JOIN_THREAD ) {
 				fault_start(msg.page_addr, "SERVER", client_id);
 				print_owner_mask( page_list_data[msg.msg_id].owner_mask );
 			}
 		
 			switch (msg.msg_type) {
+
+				case MSG_LOCK_REQUEST: 
+					unsigned long my_ticket;
+
+					pthread_mutex_lock(&mutex_l);
+
+					my_ticket = ticket_next++;
+					DSM_EVENT_SERVER("[mutex] remote LOCK from client=%d, ticket=%lu (serving=%lu)\n",
+									client_id,
+									(unsigned long)my_ticket,
+									(unsigned long)ticket_serving);
+
+					while (my_ticket != ticket_serving) {
+						pthread_cond_wait(&mutex_cond, &mutex_l);
+					}
+
+					/* Now this client is granted the lock */
+					pthread_mutex_unlock(&mutex_l);
+					ack = MSG_GRANT_LOCK;
+					if (send_all(fd_command, &ack, 1) != 0) {
+						perror("send MSG_GRANT_LOCK");
+						kill_and_exit(restored_pid);
+					} else {
+						DSM_EVENT_SERVER("[SERVER] Sent MSG_GRANT_LOCK to client.\n\r");
+					}
+					continue;
+					break;
+
+				case MSG_UNLOCK: 
+					pthread_mutex_lock(&mutex_l);
+
+					ticket_serving++;
+					DSM_EVENT_SERVER("[mutex] remote UNLOCK from client=%d, now serving=%lu\n",
+									client_id,
+									(unsigned long)ticket_serving);
+
+					pthread_cond_broadcast(&mutex_cond);
+
+					pthread_mutex_unlock(&mutex_l);
+					continue;
+					break;
+				case MSG_JOIN_THREAD:
+					DSM_EVENT_SERVER("Server received JOIN_THREAD from client:%d, tid:%d\n\r", client_id, msg.msg_id);
+					{
+						char path[256];
+						int fd ;
+						snprintf(path, sizeof(path), "/tmp/thread_%ld_dead", msg.msg_id);
+
+						fd = open(path, O_CREAT | O_WRONLY, 0666);
+						if (fd < 0) {
+							perror("open dead thread file");
+						} else {
+							close(fd);
+						}
+
+					}
+
+					continue;
+					break;
+
+
 				case MSG_BARRIER_HIT:
 					
 					#if N_CLIENTS 
@@ -1233,8 +1699,7 @@ void dsm_command_main_loop(int fd_command) {
 				case MSG_GET_PAGE_DATA:
 					//We already have fault start, therefore we have permission to handle this address 
 					//Now we have to check the owner and request the page from him
-					
-					
+					owner_id = -1;
 					// 1. Check if the server already has the page
 					if (page_list_data[msg.msg_id].owner_mask & (1ULL << 0)) {
 						// Server owns the page -> serve it directly
@@ -1245,7 +1710,6 @@ void dsm_command_main_loop(int fd_command) {
 						break;
 					}
 					// 2. Otherwise, find which client currently owns it
-					owner_id = -1;
 					for (int i = 1; i <= N_CLIENTS; i++) {
 						if (page_list_data[msg.msg_id].owner_mask & (1ULL << i)) {
 							owner_id = i - 1; // convert bit to client index
@@ -1258,10 +1722,10 @@ void dsm_command_main_loop(int fd_command) {
 						
 						//let's take fd_handler mutex
 						pthread_mutex_lock(&handler_locks[owner_id]);
-						printf("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
+						PRINT("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
 						//now we can send to the client receiver our request
 						if (send_get_page(msg, a->conn[owner_id].fd_handler, page_data) != 0) {
-							fprintf(stderr, "[handler] Failed to fetch page from remote\n\r");
+							PRINT( "[handler] Failed to fetch page from remote\n\r");
 							kill_and_exit(restored_pid);
 						}
 						//we have the page
@@ -1297,7 +1761,7 @@ void dsm_command_main_loop(int fd_command) {
 						
 						enable_wp(uffd, (void*) copy.dst);
 						pthread_mutex_unlock(&handler_locks[owner_id]);
-						printf("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
+						PRINT("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
 						break;
 					}
 					
@@ -1333,7 +1797,7 @@ void dsm_command_main_loop(int fd_command) {
 							if (page_list_data[msg.msg_id].owner_mask & (1ULL << i)) {
 								owner_id = i - 1;
 								pthread_mutex_lock(&handler_locks[owner_id]);
-								printf("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
+								PRINT("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
 								// Send invalidate request
 								
 								if (send_all( a->conn[owner_id].fd_handler, &msg, sizeof(msg)) != 0) {
@@ -1344,7 +1808,7 @@ void dsm_command_main_loop(int fd_command) {
 
 								switch ( all_read(a->conn[owner_id].fd_handler, &ack, 1) ) {
 									case -2:
-										fprintf(stderr, "[SERVER] Connection closed before ACK\n\r");
+										PRINT( "[SERVER] Connection closed before ACK\n\r");
 										kill_and_exit(restored_pid);
 									case -1:
 										fprintf( stderr, "[SERVER] all_read(ACK) failed");
@@ -1352,7 +1816,7 @@ void dsm_command_main_loop(int fd_command) {
 									case 0: 
 										DSM_EVENT_SERVER("[SERVER] Received MSG_INVALIDATE_ACK on INVALIDATION\n\r");
 										pthread_mutex_unlock(&handler_locks[owner_id]);	
-										printf("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
+										PRINT("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
 										continue;
 									default:
 										fprintf( stderr, "Unknown value for handler all_read(ACK)\n\r");
@@ -1376,11 +1840,11 @@ void dsm_command_main_loop(int fd_command) {
 
 							//let's take fd_handler mutex
 							pthread_mutex_lock(&handler_locks[owner_id]);
-							printf("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
+							PRINT("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
 							//now we can send to the client receiver our request
 
 							if (send_get_page(msg, a->conn[owner_id].fd_handler, page_data) != 0) {
-								fprintf(stderr, "[handler] Failed to fetch page from remote\n\r");
+								PRINT( "[handler] Failed to fetch page from remote\n\r");
 								kill_and_exit(restored_pid);
 							}
 							DSM_EVENT_SERVER("[SERVER:%d] Sent GET_PAGE_DATA_INVALID to Client:%d. With address:0x%lx\n\r", client_id, owner_id, msg.page_addr);
@@ -1398,7 +1862,7 @@ void dsm_command_main_loop(int fd_command) {
 
 
 							pthread_mutex_unlock(&handler_locks[owner_id]);
-							printf("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
+							PRINT("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
 
 						}else{
 							DSM_EVENT_SERVER("[DSM] Page %d has no valid owner, bug\n\r", msg.page_addr);
@@ -1409,8 +1873,6 @@ void dsm_command_main_loop(int fd_command) {
 					break;
 				case MSG_SEND_INVALIDATE:
 					//Just send this message to all owners 
-
-					
 					//first invalidate remote
 					owner_id = -1;
 					for (int i = 1; i <= N_CLIENTS; i++) {
@@ -1419,33 +1881,33 @@ void dsm_command_main_loop(int fd_command) {
 							owner_id = i - 1;
 							DSM_EVENT_SERVER("→ Receiver:%d, Handling TCP invalidation request on client:%d. Madvise(MADV_DONTNEED) on page at %p\n\r", client_id, owner_id,  (void *)msg.page_addr);
 							pthread_mutex_lock(&handler_locks[owner_id]);
-							printf("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
+							PRINT("receiver:%d locked fd_handler of client:%d\n", client_id, owner_id);
 							// Send invalidate request
 						
 							if (send_all( a->conn[owner_id].fd_handler, &msg, sizeof(msg)) != 0) {
-								fprintf(stderr,"[SERVER:%d] Failed to send MSG_SEND_INVALIDATE", client_id);
+								PRINT("[SERVER:%d] Failed to send MSG_SEND_INVALIDATE", client_id);
 								kill_and_exit(restored_pid);
 							}
 							DSM_EVENT_SERVER("[SERVER:%d] Sent MSG_SEND_INVALIDATE to Client:%d. With address:0x%lx\n\r", client_id, owner_id, msg.page_addr);
 
 							switch ( all_read(a->conn[owner_id].fd_handler, &ack, 1) ) {
 								case -2:
-									fprintf(stderr, "[SERVER] Connection closed before ACK\n\r");
+									PRINT( "[SERVER] Connection closed before ACK\n\r");
 									kill_and_exit(restored_pid);
 								case -1:
-									fprintf(stderr,"[SERVER] all_read(ACK) failed");
+									PRINT("[SERVER] all_read(ACK) failed");
 									kill_and_exit(restored_pid);
 								case 0: 
 									DSM_EVENT_SERVER("[SERVER] Received MSG_INVALIDATE_ACK on INVALIDATION from client:%d\n\r", owner_id);
 									pthread_mutex_unlock(&handler_locks[owner_id]);	
-									printf("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
+									PRINT("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
 									continue;
 								default:
-									fprintf(stderr,"Unknown value for handler alll_read(ACK)\n\r");
+									PRINT("Unknown value for handler alll_read(ACK)\n\r");
 									kill_and_exit(restored_pid);
 							}
 							pthread_mutex_unlock(&handler_locks[owner_id]);	
-							printf("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
+							PRINT("receiver:%d unlocked fd_handler of client:%d\n", client_id, owner_id);
 						}
 					}
 					if( owner_id == -1 ) DSM_EVENT_SERVER("Receiver:%d, No other owner other than server\n", client_id);
@@ -1475,7 +1937,7 @@ void dsm_command_main_loop(int fd_command) {
 
 
 
-					printf("Changing state and owner\n");
+					PRINT("Changing state and owner\n");
 					page_list_data[msg.msg_id].state = INVALID;		
 					page_list_data[msg.msg_id].owner_mask = (1ULL << (client_id + 1)); 	
 					break;
@@ -1485,12 +1947,11 @@ void dsm_command_main_loop(int fd_command) {
 					continue;
 				
 				default:
-					fprintf(stderr, "⚠️ Unknown message type: %d\n\r", msg.msg_type);
+					PRINT( "⚠️ Unknown message type: %d\n\r", msg.msg_type);
 					kill_and_exit(restored_pid);  // shutdown the server on protocol error
 					break;
 			}
 			PRINT("\n\r");
-			//mark_fault_end(msg.page_addr, "REMOTE_FAULT", msg.msg_id);
 			fault_end(msg.page_addr, "SERVER", client_id);			
 			print_owner_mask(page_list_data[msg.msg_id].owner_mask);
 		}
@@ -1549,10 +2010,6 @@ void start_dsm_server(void)
 
 #if ENABLE_SERVER
 	struct dsm_connection conn[N_CLIENTS];
-#endif
-
-#if 1
-
 	pthread_attr_t attr;
 	//pthread_t command_thread;
 	pthread_t *command_threads;
@@ -1566,6 +2023,7 @@ void start_dsm_server(void)
 	char line[256]; 
 
 	FILE *f = fopen("/tmp/dsm_barrier_pages.txt", "r");
+	FILE *f_mutex = fopen("/tmp/dsm_mutex.txt", "r");
 #if RDMA_ENABLE && 0
 	struct ibv_port_attr port_attr = {};
 	union ibv_gid gid;	
@@ -1605,19 +2063,19 @@ void start_dsm_server(void)
 #if ENABLE_SERVER
 	for (i = 0; i < N_CLIENTS; i++) {
 		if (dsm_setup_dual_connections(&conn[i]) < 0) {
-			fprintf(stderr, "Failed to set up DSM connections\n\r");
+			PRINT( "Failed to set up DSM connections\n\r");
 			kill_and_exit(restored_pid);
 		}
 
 		param.fd_handler[i] = conn[i].fd_handler;
 		
-		printf("[DSM-CONN] [%s] handler_fd=%d command_fd=%d\n\r",
+		PRINT("[DSM-CONN] [%s] handler_fd=%d command_fd=%d\n\r",
       		 "SERVER" , conn[i].fd_handler, conn[i].fd_command);
 
 
 		PRINT("[DSM] Checking connectivity on handler connection...\n\r");
 		if (dsm_connectivity_test(&conn[i], true) < 0) {
-			fprintf(stderr, "[DSM] Connectivity test failed for thread %d\n\r", i);
+			PRINT( "[DSM] Connectivity test failed for thread %d\n\r", i);
 			kill_and_exit(restored_pid);
 		}
 		PRINT("[DSM] Connectivity OK for node: %d ✅\n\r", i);
@@ -1625,147 +2083,205 @@ void start_dsm_server(void)
 #endif
 
 
-#if RDMA_ENABLE
+#if RDMA_ENABLE && ENABLE_SERVER
 {
     union ibv_gid sgid;
-    uint8_t sgid_idx;
-    unsigned char rawbuf[sizeof(rdma_wire_all)];
-    size_t i;
-
-    /* --- init three zones (each one page) --- */
-    if (rdma_context_init(&z_handler)  ||
-		rdma_context_init(&z_handler_data)  ||
-		rdma_context_init(&z_receiver_data)  ||
-        rdma_context_init(&z_receiver) ||
-        rdma_context_init(&z_data)) {
-        fprintf(stderr, "[RDMA][SERVER] rdma_context_init failed\n\r");
-        kill_and_exit(restored_pid);
-    }
-
-    if (init_rdma_zone(&z_handler,  NULL, 4096, 0) ||
-        init_rdma_zone(&z_receiver, NULL, 4096, 0) ||
-		init_rdma_zone(&z_handler_data,  NULL, 4096, 0) ||
-        init_rdma_zone(&z_receiver_data, NULL, 4096, 0) ||
-        init_rdma_zone(&z_data,     NULL, 4096, 0)) {
-        fprintf(stderr, "[RDMA][SERVER] init_rdma_zone failed\n\r");
-        kill_and_exit(restored_pid);
-    }
-
-    sgid_idx = 0;
+    uint8_t sgid_idx = 0;
+	/* We share the same HCA/port across all endpoints; we only need
+		* to pick a non-zero GID once (for RoCE). */
+	int first_gid_done = 0;
     memset(&sgid, 0, sizeof(sgid));
-    if (z_data.port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
-        if (pick_valid_sgid_index(z_data.ctx, 1, &sgid_idx, &sgid) != 0) {
-            fprintf(stderr, "[RDMA] pick_valid_sgid_index failed\n\r");
+
+    
+
+    for (int cid = 0; cid < N_CLIENTS; cid++) {
+        rdma_endpoint *ep = &endpoints[cid];
+        unsigned char rawbuf[sizeof(rdma_wire_all)];
+        size_t k;
+
+        /* --- init five zones (each one page) --- */
+        if (rdma_context_init(&ep->handler)       ||
+            rdma_context_init(&ep->receiver)      ||
+            rdma_context_init(&ep->data)          ||
+            rdma_context_init(&ep->handler_data)  ||
+            rdma_context_init(&ep->receiver_data)) {
+            PRINT( "[RDMA][SERVER] rdma_context_init failed for client %d\n\r", cid);
             kill_and_exit(restored_pid);
         }
-        z_handler.gid  = sgid;
-        z_receiver.gid = sgid;
-        z_data.gid     = sgid;
-		z_receiver_data.gid = sgid;
-		z_handler_data.gid  = sgid;
+
+        if (init_rdma_zone(&ep->handler,      NULL, 4096, 0) ||
+            init_rdma_zone(&ep->receiver,     NULL, 4096, 0) ||
+            init_rdma_zone(&ep->data,         NULL, 4096, 0) ||
+            init_rdma_zone(&ep->handler_data, NULL, 4096, 0) ||
+            init_rdma_zone(&ep->receiver_data,NULL, 4096, 0)) {
+            PRINT( "[RDMA][SERVER] init_rdma_zone failed for client %d\n\r", cid);
+            kill_and_exit(restored_pid);
+        }
+
+        /* --- GID setup (RoCE) --- */
+        if (ep->data.port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+            if (!first_gid_done) {
+                if (pick_valid_sgid_index(ep->data.ctx, 1, &sgid_idx, &sgid) != 0) {
+                    PRINT( "[RDMA] pick_valid_sgid_index failed\n\r");
+                    kill_and_exit(restored_pid);
+                }
+                first_gid_done = 1;
+            }
+            ep->handler.gid       = sgid;
+            ep->receiver.gid      = sgid;
+            ep->data.gid          = sgid;
+            ep->receiver_data.gid = sgid;
+            ep->handler_data.gid  = sgid;
+        }
+
+        /* --- fill per-client bundle --- */
+        memset(&ep->local_all, 0, sizeof(ep->local_all));
+        fill_conn_info_from_ctx(&ep->handler,
+                                ep->data.port_attr.lid,
+                                ep->handler.gid.raw,
+                                &ep->local_all.handler);
+        fill_conn_info_from_ctx(&ep->receiver,
+                                ep->data.port_attr.lid,
+                                ep->receiver.gid.raw,
+                                &ep->local_all.receiver);
+        fill_conn_info_from_ctx(&ep->data,
+                                ep->data.port_attr.lid,
+                                ep->data.gid.raw,
+                                &ep->local_all.data);
+        fill_conn_info_from_ctx(&ep->receiver_data,
+                                ep->data.port_attr.lid,
+                                ep->receiver_data.gid.raw,
+                                &ep->local_all.receiver_data);
+        fill_conn_info_from_ctx(&ep->handler_data,
+                                ep->data.port_attr.lid,
+                                ep->handler_data.gid.raw,
+                                &ep->local_all.handler_data);
+
+        /* --- exchange: server SEND first on handler fd, RECV on command fd --- */
+        if (writen_all_exact(conn[cid].fd_handler,
+                             &ep->local_all, sizeof(ep->local_all)) < 0) {
+            perror("[RDMA][SERVER] send bundle");
+            kill_and_exit(restored_pid);
+        }
+        if (readn_all_exact(conn[cid].fd_command,
+                            rawbuf, sizeof(rawbuf)) < 0) {
+            perror("[RDMA][SERVER] recv bundle");
+            kill_and_exit(restored_pid);
+        }
+
+        PRINT("[RDMA][DEBUG] SERVER[%d] read %u bytes bundle\n\r",
+               cid, (unsigned)sizeof(rawbuf));
+        PRINT("[RDMA][DEBUG] Raw[%d]: ", cid);
+        for (k = 0; k < sizeof(rawbuf); k++)
+            PRINT("%02x ", rawbuf[k]);
+        PRINT("\n\r");
+
+        memcpy(&ep->remote_all, rawbuf, sizeof(ep->remote_all));
+
+        /* --- bring all 5 QPs to RTR/RTS --- */
+        qp_to_rtr_rts(ep->handler.qp,
+                      &ep->handler.port_attr,
+                      &ep->remote_all.receiver_data,
+                      ep->handler.psn, sgid_idx, 1);
+
+        qp_to_rtr_rts(ep->receiver.qp,
+                      &ep->receiver.port_attr,
+                      &ep->remote_all.handler_data,
+                      ep->receiver.psn, sgid_idx, 1);
+
+        qp_to_rtr_rts(ep->handler_data.qp,
+                      &ep->handler_data.port_attr,
+                      &ep->remote_all.receiver,
+                      ep->handler_data.psn, sgid_idx, 1);
+
+        qp_to_rtr_rts(ep->receiver_data.qp,
+                      &ep->receiver_data.port_attr,
+                      &ep->remote_all.handler,
+                      ep->receiver_data.psn, sgid_idx, 1);
+
+        qp_to_rtr_rts(ep->data.qp,
+                      &ep->data.port_attr,
+                      &ep->remote_all.data,
+                      ep->data.psn, sgid_idx, 1);
+
+        /* --- post one RECV on each zone (ready to receive from that client) --- */
+        post_one_recv(&ep->handler);
+        post_one_recv(&ep->receiver);
+        post_one_recv(&ep->data);
+
+        PRINT("[RDMA][SERVER] handshake complete for client %d: "
+               "handler=%u receiver=%u data=%u\n\r",
+               cid,
+               ep->handler.qp->qp_num,
+               ep->receiver.qp->qp_num,
+               ep->data.qp->qp_num);
     }
 
-    /* --- fill bundle --- */
-    memset(&local_all, 0, sizeof(local_all));
-    fill_conn_info_from_ctx(&z_handler,  		z_data.port_attr.lid, z_handler.gid.raw, 		&local_all.handler);
-    fill_conn_info_from_ctx(&z_receiver, 		z_data.port_attr.lid, z_receiver.gid.raw,		&local_all.receiver);
-    fill_conn_info_from_ctx(&z_data,     		z_data.port_attr.lid, z_data.gid.raw,     		&local_all.data);
-	fill_conn_info_from_ctx(&z_receiver_data,	z_data.port_attr.lid, z_receiver_data.gid.raw,  &local_all.receiver_data);
-	fill_conn_info_from_ctx(&z_handler_data,    z_data.port_attr.lid, z_handler_data.gid.raw,   &local_all.handler_data);
-	
-    /* --- exchange: server SEND first on handler fd, RECV on command fd --- */
-    if (writen_all_exact(conn[0].fd_handler, &local_all, sizeof(local_all)) < 0) {
-        perror("[RDMA][SERVER] send bundle"); kill_and_exit(restored_pid);
-    }
-    if (readn_all_exact(conn[0].fd_command, rawbuf, sizeof(rawbuf)) < 0) {
-        perror("[RDMA][SERVER] recv bundle"); kill_and_exit(restored_pid);
-    }
-    printf("[RDMA][DEBUG] SERVER read %u bytes bundle\n\r", (unsigned)sizeof(rawbuf));
-    printf("[RDMA][DEBUG] Raw: ");
-    for (i=0;i<sizeof(rawbuf);i++) printf("%02x ", rawbuf[i]); 
-	printf("\n\r");
-    memcpy(&remote_all, rawbuf, sizeof(remote_all));
-
-    /* --- bring all 5 QPs to RTR/RTS --- */
-    qp_to_rtr_rts(z_handler.qp,       &z_handler.port_attr,       &remote_all.receiver_data,  z_handler.psn,       sgid_idx, 1);
-	qp_to_rtr_rts(z_receiver.qp,      &z_receiver.port_attr,      &remote_all.handler_data,   z_receiver.psn,      sgid_idx, 1);
-	qp_to_rtr_rts(z_handler_data.qp,  &z_handler_data.port_attr,  &remote_all.receiver,       z_handler_data.psn,  sgid_idx, 1);
-	qp_to_rtr_rts(z_receiver_data.qp, &z_receiver_data.port_attr, &remote_all.handler,        z_receiver_data.psn, sgid_idx, 1);
-	qp_to_rtr_rts(z_data.qp,          &z_data.port_attr,          &remote_all.data,           z_data.psn,          sgid_idx, 1);
-
-    /* --- post one RECV on each zone (so we’re ready to receive on any) --- */
-    post_one_recv(&z_handler);
-    post_one_recv(&z_receiver);
-    post_one_recv(&z_data);
-
-    printf("[RDMA][SERVER] triple handshake complete: handler=%u receiver=%u data=%u\n\r",
-        z_handler.qp->qp_num, z_receiver.qp->qp_num, z_data.qp->qp_num);
-
-
+	#if 0
 	{
 		struct ibv_wc wc;
 		int got = 0;
 		char *buf;
 
-		printf("[SERVER] Waiting on client WRITEs…\n\r");
+		PRINT("[SERVER] Waiting on client WRITEs…\n\r");
 
-		/* Post receives for incoming messages */
+		// Post receives for incoming messages 
 		post_one_recv(&z_handler);
-		post_one_recv(&z_receiver);
+		post_one_recv(&endpoints[client_id].receiver);
 		post_one_recv(&z_data);
 
-		/* Wait for all 3 client WRITEs */
+		// Wait for all 3 client WRITEs 
 		while (got < 3) {
 			if (ibv_poll_cq(z_handler.cq, 1, &wc) > 0) {
-				printf("[SERVER] handler got: '%s'\n\r", (char*)z_handler.base_addr);
+				PRINT("[SERVER] handler got: '%s'\n\r", (char*)z_handler.base_addr);
 				got++;
 			}
-			if (ibv_poll_cq(z_receiver.cq, 1, &wc) > 0) {
-				printf("[SERVER] receiver got: '%s'\n\r", (char*)z_receiver.base_addr);
+			if (ibv_poll_cq(endpoints[client_id].receiver.cq, 1, &wc) > 0) {
+				PRINT("[SERVER] receiver got: '%s'\n\r", (char*)endpoints[client_id].receiver.base_addr);
 				got++;
 			}
 			if (ibv_poll_cq(z_data.cq, 1, &wc) > 0) {
-				printf("[SERVER] data got: '%s'\n\r", (char*)z_data.base_addr);
+				PRINT("[SERVER] data got: '%s'\n\r", (char*)z_data.base_addr);
 				got++;
 			}
 		}
 
-		printf("[SERVER] ✅ Received all 3 client messages.\n\r");
+		PRINT("[SERVER] ✅ Received all 3 client messages.\n\r");
 
 		/* --- Now send responses back --- */
 		
 
 		/* ZONE 1: receiver_data -> client.handler */
-		buf = (char*)z_receiver_data.base_addr;
+		buf = (char*)endpoints[client_id].receiver_data.base_addr;
 		strcpy(buf, "ACK_CMD");
-		printf("[SERVER] Sending ACK_CMD to client.handler (imm=0xB1)\n\r");
-		rdma_write_core(&z_receiver_data,
-						be64toh(remote_all.handler.vaddr),
-						ntohl(remote_all.handler.rkey),
+		PRINT("[SERVER] Sending ACK_CMD to client.handler (imm=0xB1)\n\r");
+		rdma_write_core(&endpoints[client_id].receiver_data,
+						be64toh(endpoints[client_id].remote_all.handler.vaddr),
+						ntohl(endpoints[client_id].remote_all.handler.rkey),
 						buf, strlen(buf) + 1, 0xB1);
-		printf("[SERVER] receiver_data WRITE done ✅\n\r");
+		PRINT("[SERVER] receiver_data WRITE done ✅\n\r");
 
 		/* ZONE 2: handler_data -> client.receiver */
 		buf = (char*)z_handler_data.base_addr;
 		strcpy(buf, "ACK_HELLO");
-		printf("[SERVER] Sending ACK_HELLO to client.receiver (imm=0xB2)\n\r");
+		PRINT("[SERVER] Sending ACK_HELLO to client.receiver (imm=0xB2)\n\r");
 		rdma_write_core(&z_handler_data,
-						be64toh(remote_all.receiver.vaddr),
-						ntohl(remote_all.receiver.rkey),
+						be64toh(endpoints[client_id].remote_all.receiver.vaddr),
+						ntohl(endpoints[client_id].remote_all.receiver.rkey),
 						buf, strlen(buf) + 1, 0xB2);
-		printf("[SERVER] handler_data WRITE done ✅\n\r");
+		PRINT("[SERVER] handler_data WRITE done ✅\n\r");
 
 		/* Optional: respond via data channel too */
 		buf = (char*)z_data.base_addr;
 		strcpy(buf, "PONG");
-		printf("[SERVER] Sending PONG to client.data (imm=0xB3)\n\r");
+		PRINT("[SERVER] Sending PONG to client.data (imm=0xB3)\n\r");
 		rdma_write_core(&z_data,
-						be64toh(remote_all.data.vaddr),
-						ntohl(remote_all.data.rkey),
+						be64toh(endpoints[client_id].remote_all.data.vaddr),
+						ntohl(endpoints[client_id].remote_all.data.rkey),
 						buf, strlen(buf) + 1, 0xB3);
-		printf("[SERVER] data WRITE done ✅\n\r");
+		PRINT("[SERVER] data WRITE done ✅\n\r");
 
-		printf("[SERVER] ✅ All responses sent.\n\r");
+		PRINT("[SERVER] ✅ All responses sent.\n\r");
 	}
 
 
@@ -1775,18 +2291,18 @@ void start_dsm_server(void)
 		rdma_cmd_msg cmd;
 		uint64_t tgt;
 
-		printf("[SERVER] --- Waiting CMD on receiver; replying from receiver_data -> client.handler ---\n\r");
+		PRINT("[SERVER] --- Waiting CMD on receiver; replying from receiver_data -> client.handler ---\n\r");
 
 		/* 1) Wait for client's CMD on client.receiver */
-		post_one_recv(&z_receiver);
-		poll_one_cqe(&z_receiver, &wc);
+		post_one_recv(&endpoints[client_id].receiver);
+		poll_one_cqe(&endpoints[client_id].receiver, &wc);
 		if (!(wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM))
-			printf("[SERVER] Unexpected CQE opcode=%d\n\r", wc.opcode);
+			PRINT("[SERVER] Unexpected CQE opcode=%d\n\r", wc.opcode);
 
 		/* 2) Parse CMD */
-		memcpy(&cmd, z_receiver.base_addr, sizeof(cmd));
+		memcpy(&cmd, endpoints[client_id].receiver.base_addr, sizeof(cmd));
 		tgt = be64toh(cmd.target_addr);
-		printf("[SERVER] CMD: target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
+		PRINT("[SERVER] CMD: target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
 			(unsigned long long)tgt,
 			(unsigned long long)be64toh(cmd.faulting_addr),
 			(unsigned)ntohl(cmd.id),
@@ -1794,20 +2310,20 @@ void start_dsm_server(void)
 
 		
 		/* 3) Prepare zero page in TX buffer (server.receiver_data MR) */
-		memset(z_receiver_data.base_addr, 0x00, 4096);
+		memset(endpoints[client_id].receiver_data.base_addr, 0x00, 4096);
 
 		/* 4) RDMA WRITE_WITH_IMM into client's handler */
-		printf("[SERVER] Writing zero page into client.handler at %#llx\n\r",
+		PRINT("[SERVER] Writing zero page into client.handler at %#llx\n\r",
 			(unsigned long long)tgt);
 
-		rdma_write_core(&z_receiver_data,
+		rdma_write_core(&endpoints[client_id].receiver_data,
 						tgt,
-						ntohl(remote_all.handler.rkey),  /* client's handler rkey */
-						z_receiver_data.base_addr, 4096, 0xBEEF);
+						ntohl(endpoints[client_id].remote_all.handler.rkey),  /* client's handler rkey */
+						endpoints[client_id].receiver_data.base_addr, 4096, 0xBEEF);
 
-		printf("[SERVER] ✅ Wrote zero page into client.handler\n\r");
+		PRINT("[SERVER] ✅ Wrote zero page into client.handler\n\r");
 	}
-
+	#endif
 
 
 }
@@ -1826,7 +2342,7 @@ void start_dsm_server(void)
 	uffd = stealUFFD(restored_pid);
 
 	if (init_userfaultfd_api(uffd) < 0) {
-		fprintf(stderr, "Failed to initialize userfaultfd API\n\r");
+		PRINT( "Failed to initialize userfaultfd API\n\r");
 		exit(EXIT_FAILURE);
 	}
 	else PRINT("Success initialize userfaultfd API\n\r");
@@ -1834,6 +2350,10 @@ void start_dsm_server(void)
 
 #if VMA_REC	
 	read_proc_maps(restored_pid);
+	//num_remote_tids = read_all_tids(restored_pid, tids, MAX_THREADS);
+
+
+
 #endif	
 
 
@@ -1852,7 +2372,7 @@ void start_dsm_server(void)
 
 	if( f ){
 		if (fscanf(f, "base=%lx page_size=%zu num_pages=%d", &barrier_start_address, &page_size, &num_pages) != 3) {
-			fprintf(stderr, "[dsm] failed to parse barrier info file\n\r");
+			PRINT( "[dsm] failed to parse barrier info file\n\r");
 		}
 		fclose(f);
 
@@ -1863,7 +2383,34 @@ void start_dsm_server(void)
 		register_region_with_uffd(uffd, (void*) barrier_start_address, page_size * num_pages);
 		enable_region_wp(uffd, (void*) barrier_start_address, page_size * num_pages);
 	}else{
-		fprintf(stderr, "[dsm] barrier info file not found, no pthread barrier support\n\r");	
+		PRINT( "[dsm] barrier info file not found, no pthread barrier support\n\r");	
+	}
+
+
+	if( f_mutex ){
+		if (fscanf(f_mutex, "base=%lx page_size=%zu num_pages=%d\n", &mutex_lock_start_address, &page_size, &num_pages) != 3) {
+			PRINT( "[dsm] failed to parse mutex info file\n\r");
+		}		
+		mutex_lock_end_address = mutex_lock_start_address + page_size * num_pages;
+		PRINT("/tmp/dsm_mutex.txt: start addr:%lx, end:%lx\n\r", mutex_lock_start_address, mutex_lock_end_address);
+
+		register_region_with_uffd(uffd, (void*) mutex_lock_start_address, page_size * num_pages);
+		enable_region_wp(uffd, (void*) mutex_lock_start_address, page_size * num_pages);
+
+
+		if (fscanf(f_mutex, "base=%lx page_size=%zu num_pages=%d", &mutex_unlock_start_address, &page_size, &num_pages) != 3) {
+			PRINT( "[dsm] failed to parse mutex info file\n\r");
+		}
+		fclose(f_mutex);
+
+		
+		mutex_unlock_end_address = mutex_unlock_start_address + page_size * num_pages;
+		PRINT("/tmp/dsm_mutex.txt: start addr:%lx, end:%lx\n\r", mutex_unlock_start_address, mutex_unlock_end_address);
+
+		register_region_with_uffd(uffd, (void*) mutex_unlock_start_address, page_size * num_pages);
+		enable_region_wp(uffd, (void*) mutex_unlock_start_address, page_size * num_pages);
+	}else{
+		PRINT( "[dsm] mutex info file not found, no pthread mutex support\n\r");	
 	}
    
 
@@ -1883,7 +2430,12 @@ void start_dsm_server(void)
 
 
 #if 1
-	#if N_CLIENTS == 0
+	#if ENABLE_SERVER == 0
+	
+	send_sigcont(restored_pid);
+	
+	
+	#elif N_CLIENTS == 0
 		PRINT("[DSM Server] Connections established. Creating thread for command loop\n\r");
 
 		args = malloc(sizeof(struct command_thread_args));
@@ -1936,7 +2488,7 @@ void start_dsm_server(void)
 
 		args->restored_pid = restored_pid;
 		args->uffd = uffd;
-		args->conn = conn;    // or conn[0] if shared
+		args->conn = conn;   
 		args->client_id = i;
 
 
@@ -1951,10 +2503,7 @@ void start_dsm_server(void)
 
 	pthread_attr_destroy(&attr);
 
-	// Wait for all threads to finish (optional)
-	for (int i = 0; i < N_CLIENTS; i++) {
-		pthread_join(command_threads[i], NULL);
-	}
+
 
 	free(command_threads);
 	PRINT("[DSM Server] All command threads created and joined.\n\r");
@@ -1962,26 +2511,29 @@ void start_dsm_server(void)
 	#endif
 #elif COMMAND_LOOP
 	PRINT("[DSM Server] Connections established. Entering command loop\n\r");
-	printf("PAge0x:%lx Page1:0x%lx\n\r", page_thread0, page_thread1);
+	PRINT("PAge0x:%lx Page1:0x%lx\n\r", page_thread0, page_thread1);
 	command_loop(restored_pid, uffd, &conn[0]);
 #elif ENABLE_SERVER
 	PRINT("[DSM Server] Connections established. Entering main loop...\n\r");
     dsm_command_main_loop(conn[0].fd_command);
 	//if(!DBG) send_sigcont(restored_pid);
 #endif
-
-
-
-
 	{
 		int ret;
 		struct pollfd pfd = { .fd = pidfd, .events = POLLIN };
-		printf("[DSM] Waiting for restored process %d to exit...\n\r", restored_pid);
+		PRINT("[DSM] Waiting for restored process %d to exit...\n\r", restored_pid);
 
 		ret = poll(&pfd, 1, -1);
 		if (ret > 0 && (pfd.revents & POLLIN))
-			printf("[DSM] Process %d exited.\n\r", restored_pid);
+			PRINT("[DSM] Process %d exited.\n\r", restored_pid);
 
+		
+
+	#if RDMA_ENABLE
+		printf("RDMA MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
+	#else
+		printf("TCP MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
+	#endif
 		close(pidfd);
 	}
 

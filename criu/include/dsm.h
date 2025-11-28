@@ -14,14 +14,14 @@
 #define HANDSHAKE_MSG "READY"
 #define PORT_COMMAND 7777
 #define PORT_HANDLER 7778
-#define N_CLIENTS 3
+#define N_CLIENTS 1
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
 
-#define RDMA_ENABLE 0
+#define RDMA_ENABLE 1
 #define DBG 0
 #define COMMAND_LOOP 0
-#define ENABLE_SERVER 1
+#define ENABLE_SERVER 0
 #define COMMAND_THREAD 0
 #define EP 0
 
@@ -33,7 +33,7 @@
 #include "log.h"
 #define PRINT(...) pr_info(__VA_ARGS__)
 #endif
-
+#define MAX_THREADS 512
 #define MAX_PAGE_COUNT 100000 //general pages
 #define MAX_PAGES 100 //malloc pages
 #define MAX_RDMA_REGIONS 128
@@ -46,6 +46,7 @@ extern int uffd;
 extern int restored_pid;
 extern int local_threads;
 extern int pidfd;
+extern int fault_counter;
 /****************** Enums ******************/
 
 enum msg_type {
@@ -61,6 +62,10 @@ enum msg_type {
 	MSG_ACK,
 	MSG_BARRIER_HIT,
 	MSG_BARRIER_RELEASE,
+    MSG_LOCK_REQUEST,
+    MSG_UNLOCK,
+    MSG_JOIN_THREAD,
+    MSG_GRANT_LOCK,
 };
 
 
@@ -129,6 +134,12 @@ typedef struct {
 
 
 
+extern pthread_mutex_t mutex_l;
+extern pthread_cond_t  mutex_cond;
+extern unsigned long ticket_next;
+extern unsigned long ticket_serving;
+
+
 extern barrier_state barrier;
 #endif
 void barrier_init(void);
@@ -143,7 +154,12 @@ extern unsigned long barrier_start_address;
 extern unsigned long barrier_end_address;
 extern unsigned long page_thread0;
 extern unsigned long page_thread1;
-extern unsigned long barrier_end_address;
+
+extern unsigned long mutex_lock_start_address;
+extern unsigned long mutex_lock_end_address;
+extern unsigned long mutex_unlock_start_address;
+extern unsigned long mutex_unlock_end_address;
+
 extern unsigned long remote_barrier_addr;
 extern unsigned long local_barrier_addr;
 extern int remote_threads_barrier_arrived;
@@ -279,11 +295,25 @@ typedef struct {
     rdma_wire_info receiver_data;
 } rdma_wire_all;
 
+typedef struct {
+    rdma_context handler;
+    rdma_context receiver;
+    rdma_context data;
+    rdma_context handler_data;
+    rdma_context receiver_data;
+
+    rdma_wire_all local_all;   // what server sends to client
+    rdma_wire_all remote_all;  // what client sends back
+}rdma_endpoint;
+
+extern rdma_endpoint endpoints[N_CLIENTS];
 
 /* ---------------- Global rdma decl ---------------- */
 extern rdma_context z_handler, z_receiver, z_data;
 extern rdma_context z_handler_data, z_receiver_data;
 extern rdma_wire_all local_all, remote_all;
+
+
 /* --------- Function prototypes --------- */
 int  rdma_context_init(rdma_context *ctx);
 int  init_rdma_zone(rdma_context *ctx, const char *path, size_t size, int use_huge);

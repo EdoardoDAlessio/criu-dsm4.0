@@ -30,7 +30,7 @@ struct vm_area_list* my_vm_area_list;
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
-#include "user.h"
+//#include "user.h"
 #include "page.h" //this takes the page size
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 // Setup global variable address 
@@ -40,6 +40,11 @@ unsigned long barrier_local = 0;
 unsigned long barrier_remote = 0;
 unsigned long barrier_start_address = 0;
 unsigned long barrier_end_address = 0;
+unsigned long mutex_lock_start_address = 0;
+unsigned long mutex_lock_end_address = 0;
+unsigned long mutex_unlock_start_address = 0;
+unsigned long mutex_unlock_end_address = 0;
+
 unsigned long page_thread0 = 0;
 unsigned long page_thread1 = 0;
 //barrier_state_t barrier = {0};
@@ -56,6 +61,11 @@ unsigned long aligned = 0x555555558080 & ~(PAGE_SIZE - 1);
 unsigned long start_address, end_address;
 pthread_mutex_t pagefaults_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+pthread_mutex_t mutex_l = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  mutex_cond   = PTHREAD_COND_INITIALIZER;
+unsigned long ticket_next = 0;
+unsigned long ticket_serving = 0;
+
 // Global or shared debug map
 pthread_mutex_t fault_lock = PTHREAD_MUTEX_INITIALIZER;
 unsigned long active_fault_addr = 0;
@@ -65,6 +75,7 @@ int active_fault_tid = -1;
 page_list page_list_data[MAX_PAGE_COUNT];
 int total_pages = 0;
 int uffd, restored_pid, local_threads, pidfd;
+int fault_counter = 0;
 /*
 unsigned long global_addr = 0x5555555580c0;
 unsigned long aligned = 0x5555555580c0 & ~(PAGE_SIZE - 1);
@@ -89,11 +100,11 @@ void barrier_init(void) {
 #include <sys/mman.h>
 #include <fcntl.h>
 #include "dsm.h"
-
 rdma_context z_handler, z_receiver, z_data;
 rdma_context z_handler_data, z_receiver_data;
 rdma_wire_all local_all;
 rdma_wire_all remote_all;
+rdma_endpoint endpoints[N_CLIENTS];
 
 int readn_all_exact(int fd, void *buf, size_t n)
 {
@@ -331,7 +342,7 @@ int pick_valid_sgid_index(struct ibv_context *ctx, uint8_t port,
 
         *out_idx = (uint8_t)idx;
         if (out_gid) *out_gid = g;
-        printf("[RDMA] pick_valid_sgid_index: using gid_index=%d "
+        PRINT("[RDMA] pick_valid_sgid_index: using gid_index=%d "
                "gid=%02x:%02x:%02x:%02x:%02x:%02x:... (port=%u)\n",
                idx,
                g.raw[0], g.raw[1], g.raw[2], g.raw[3], g.raw[4], g.raw[5],
@@ -482,7 +493,7 @@ int pick_valid_sgid_index(struct ibv_context *ctx, uint8_t port,
 
         *out_idx = (uint8_t)idx;
         if (out_gid) *out_gid = g;
-        printf("[RDMA] pick_valid_sgid_index: using gid_index=%d "
+        PRINT("[RDMA] pick_valid_sgid_index: using gid_index=%d "
                "gid=%02x:%02x:%02x:%02x:%02x:%02x:... (port=%u)\n",
                idx,
                g.raw[0], g.raw[1], g.raw[2], g.raw[3], g.raw[4], g.raw[5],
@@ -621,9 +632,7 @@ int writen_all_exact(int fd, const void *buf, size_t n) {
     return 0;
 }
 
-
 #endif
-
 
 /*********************************** VMA RECONSTRUCTION ********************* */
 
@@ -719,13 +728,13 @@ int register_region_with_uffd(int uffd, void *addr, size_t length) {
     //reg.mode = UFFDIO_REGISTER_MODE_WP;
     
     if (ioctl(uffd, UFFDIO_REGISTER, &reg) == -1) {
-        printf("Failing to register %p \n", addr);
+        PRINT("Failing to register %p \n", addr);
         perror("ioctl UFFDIO_REGISTERR");
         exit(-1);
         //return -1;
     }
     
-    printf("[DSM] Successfully registered region: %p - %p (%zu bytes)\n", addr, (char*)addr + length, length);
+    PRINT("[DSM] Successfully registered region: %p - %p (%zu bytes)\n", addr, (char*)addr + length, length);
     return 0;
 }
 
@@ -744,7 +753,7 @@ void enable_region_wp( int uffd, void *addr, size_t length) {
         exit(-1);
     }
 	else
-		printf("[DSM] Successfully ENABLE WP on region: %p - %p (%zu bytes)\n", addr, (char*)addr + length, length);
+		PRINT("[DSM] Successfully ENABLE WP on region: %p - %p (%zu bytes)\n", addr, (char*)addr + length, length);
 }
 
 void disable_region_wp( int uffd, void *addr, size_t length) {
@@ -760,7 +769,7 @@ void disable_region_wp( int uffd, void *addr, size_t length) {
 	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1)
 		perror("UFFDIO_WRITEPROTECT (disable_region)");
 	else
-		printf("[DSM] Successfully DISABLE WP on region: %p - %p (%zu bytes)\n", addr, (char*)addr + length, length);
+		PRINT("[DSM] Successfully DISABLE WP on region: %p - %p (%zu bytes)\n", addr, (char*)addr + length, length);
 }
 
 
@@ -835,9 +844,9 @@ void read_store_malloced_pages(void) {
     fclose(fp);
 
     // Debug print what we have left
-    printf("== Active mallocs ==\n");
+    PRINT("== Active mallocs ==\n");
     for (size_t i = 0; i < alloc_count; i++) {
-        printf("aligned_addr: 0x%lx, addr: 0x%lx, npages: %zu\n",
+        PRINT("aligned_addr: 0x%lx, addr: 0x%lx, npages: %zu\n",
                (unsigned long)allocs[i].aligned_addr, 
                (unsigned long)allocs[i].addr, 
                allocs[i].npages);
@@ -1028,7 +1037,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
                 
                 
                 if( !is_anon ){
-                    //printf("\t\tInfection to remapping anon\n");
+                    //PRINT("\t\tInfection to remapping anon\n");
                     //Infection for remapping to anonimous page to allow uffdio registerability
                     args = compel_parasite_args(ctl, long);
                     *args = (long) page_list_data[total_pages + i].saddr;
@@ -1047,7 +1056,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
             }
             total_pages += npages;
 
-            printf("%lx-%lx %4s %lx %5s %d 11%s11\n", start, end, perms, offset, dev, inode, mapname);
+            PRINT("%lx-%lx %4s %lx %5s %d 11%s11\n", start, end, perms, offset, dev, inode, mapname);
             
             //tracking
             register_region_with_uffd(uffd, (void*)start, end - start );
@@ -1112,7 +1121,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
             aligned_start = start & ~(PAGE_SIZE - 1);
             aligned_end   = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-            printf("---> Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Real address:%lx, Aligned page start:%lx\n", name, offset, size, start, aligned_start);
+            PRINT("---> Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Real address:%lx, Aligned page start:%lx\n", name, offset, size, start, aligned_start);
 
 
             malloced = 0;
@@ -1124,7 +1133,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
                 long candidate_ptr_val = 0;
                 
                 if (read_long_at_addr_infected(ctl, start, &candidate_ptr_val) == 0) {
-                    printf("🔎 8-byte value at 0x%lx = %ld (0x%lx, Aligned:0x%lx)\n", start, candidate_ptr_val, (unsigned long)candidate_ptr_val,  (unsigned long)candidate_ptr_val & ~(PAGE_SIZE - 1));
+                    PRINT("🔎 8-byte value at 0x%lx = %ld (0x%lx, Aligned:0x%lx)\n", start, candidate_ptr_val, (unsigned long)candidate_ptr_val,  (unsigned long)candidate_ptr_val & ~(PAGE_SIZE - 1));
                 }
 
 
@@ -1142,7 +1151,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
             }
             
             if( malloced ){
-                printf("✅ Looks like a pointer into a malloc region.\n");
+                PRINT("✅ Looks like a pointer into a malloc region.\n");
                 malloced--;
 
                 for (int i = 0; i < total_pages; i++) {
@@ -1164,10 +1173,10 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
                     }
                 }
 
-                printf("✅ Saved symbol:%s, aligned_address:%lx, pages:%ld allocs_index:%d\n\n", allocs[malloced].symbol_name,  allocs[malloced].aligned_addr , allocs[malloced].npages , malloced );
+                PRINT("✅ Saved symbol:%s, aligned_address:%lx, pages:%ld allocs_index:%d\n\n", allocs[malloced].symbol_name,  allocs[malloced].aligned_addr , allocs[malloced].npages , malloced );
             }
             else if(0) {
-                printf("Here\n");
+                PRINT("Here\n");
                 for (unsigned long addr = aligned_start; addr < aligned_end; addr += PAGE_SIZE) {
                     // Check for duplicates in page_list_data[]
                     int already_seen = 0;
@@ -1180,7 +1189,7 @@ void register_all(int uffd, int restored_pid, unsigned long base_addr, struct vm
 
                     if ( !already_seen) {
 
-                        printf("--> Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Addr:%lx, NEW PAGE, NOT IN page_list_data\n", name, offset, size, addr);
+                        PRINT("--> Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Addr:%lx, NEW PAGE, NOT IN page_list_data\n", name, offset, size, addr);
                 
                         //Prepare the addr to pass
                         args = compel_parasite_args(ctl, long);
@@ -1386,7 +1395,7 @@ void scan_and_prepare_coalesced_globals(unsigned long base_addr, pid_t restored_
             aligned_start = start & ~(PAGE_SIZE - 1);
             aligned_end   = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-            printf("✅ Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Aligned page start:%lx\n", name, offset, size, aligned_start);
+            PRINT("✅ Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Aligned page start:%lx\n", name, offset, size, aligned_start);
 
             for (unsigned long addr = aligned_start; addr < aligned_end; addr += PAGE_SIZE) {
                 // Check for duplicates in page_list_data[]
@@ -1400,7 +1409,7 @@ void scan_and_prepare_coalesced_globals(unsigned long base_addr, pid_t restored_
 
                 if ( !already_seen) {
 
-                    printf("✅ Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Addr:%lx, NEW PAGE, NOT IN page_list_data\n", name, offset, size, addr);
+                    PRINT("✅ Symbol: %-30s  Offset: 0x%10lx  Size: %10lu, Addr:%lx, NEW PAGE, NOT IN page_list_data\n", name, offset, size, addr);
                
                     //Prepare the addr to pass
                     args = compel_parasite_args(ctl, long);
@@ -2724,7 +2733,7 @@ int interactive_page_inspect(struct msg_info *dsm_msg, int fd_handler, int mode)
     float *page_floats;
     double *page_doubles;
 
-    printf("🔍 Enter target virtual page address (hex, e.g. 0x7f537a016000): ");
+    PRINT("🔍 Enter target virtual page address (hex, e.g. 0x7f537a016000): ");
     if (scanf("%lx", &addr) != 1) {
         fprintf(stderr, "❌ Invalid address input.\n");
         return -1;
@@ -2735,23 +2744,23 @@ int interactive_page_inspect(struct msg_info *dsm_msg, int fd_handler, int mode)
     dsm_msg->page_size = PAGE_SIZE;
     dsm_msg->msg_id = 1234; // arbitrary ID for tracking
 
-    printf("[DSM] Requesting page 0x%lx from remote node...\n", addr);
+    PRINT("[DSM] Requesting page 0x%lx from remote node...\n", addr);
 
     if (send_get_page(*dsm_msg, fd_handler, page_content) != 0) {
         fprintf(stderr, "❌ Failed to get page data.\n");
         return -1;
     }
 
-    printf("✅ Page 0x%lx successfully retrieved!\n", addr);
+    PRINT("✅ Page 0x%lx successfully retrieved!\n", addr);
   
 
-    printf("How many rows (4 values per row)? ");
+    PRINT("How many rows (4 values per row)? ");
     if (scanf("%d", &rows) != 1) {
-        printf("Invalid input. Defaulting to 16 rows.\n");
+        PRINT("Invalid input. Defaulting to 16 rows.\n");
         rows = 16;
     }
 
-    printf("\n");
+    PRINT("\n");
 
     // --------------------------------------------
     // MODE 1: Integers
@@ -2801,7 +2810,7 @@ int interactive_page_inspect(struct msg_info *dsm_msg, int fd_handler, int mode)
         }
     }
 
-    printf("\n✅ Page content inspection complete.\n");
+    PRINT("\n✅ Page content inspection complete.\n");
     return 0;
 }
 
@@ -2867,9 +2876,9 @@ int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg,
         // ✅ Print entire page as int[]
         page_ints = (int *)page_content;
 
-        printf("How many rows?\n");
+        PRINT("How many rows?\n");
         if (scanf("%d", &rows) != 1) {
-            printf("Invalid input\n");
+            PRINT("Invalid input\n");
             rows = 1024;
         }
 
@@ -2888,9 +2897,9 @@ int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg,
         // ✅ Print entire page as float[]
         page_floats = (float *)page_content;
 
-        printf("How many rows?\n");
+        PRINT("How many rows?\n");
         if (scanf("%d", &rows) != 1) {
-            printf("Invalid input\n");
+            PRINT("Invalid input\n");
             rows = 1024;
         }
 
@@ -2909,9 +2918,9 @@ int test_full_page_content(int restored_pid, int uffd, struct msg_info *dsm_msg,
         // ✅ Print entire page as double[]
         page_doubles = (double *)page_content;
 
-        printf("How many rows?\n");
+        PRINT("How many rows?\n");
         if (scanf("%d", &rows) != 1) {
-            printf("Invalid input\n");
+            PRINT("Invalid input\n");
             rows = 512; // 512 * 8 bytes * 4 = 16KB printed max
         }
 
@@ -3401,7 +3410,7 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
         PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n");
         enable_wp( uffd, (void *)dsm_msg->page_addr);
         if( update_page_info(dsm_msg->page_addr, 1, SHARED, -2) == -2){
-            printf("mah\n");
+            PRINT("mah\n");
             kill_and_exit(restored_pid);
         }
     }
@@ -3470,22 +3479,22 @@ int compare_local_remote_pages(int restored_pid, int uffd, struct msg_info *dsm_
     struct parasite_ctl *ctl;
     struct infect_ctx *ictx;
     
-    printf("[DSM] Requesting both local and remote pages for address: 0x%lx\n", dsm_msg->page_addr);
+    PRINT("[DSM] Requesting both local and remote pages for address: 0x%lx\n", dsm_msg->page_addr);
     
     // =========================
     // 1. GET REMOTE PAGE FIRST
     // =========================
-    printf("\n[DSM] Getting REMOTE page via network...\n");
+    PRINT("\n[DSM] Getting REMOTE page via network...\n");
     if (send_get_page(*dsm_msg, fd_handler, remote_page_content) != 0) {
-        printf("❌ Failed to get remote page at %lx\n", dsm_msg->page_addr);
+        PRINT("❌ Failed to get remote page at %lx\n", dsm_msg->page_addr);
         return -1;
     }
-    printf("✅ Remote page received successfully\n");
+    PRINT("✅ Remote page received successfully\n");
     
     // =========================
     // 2. GET LOCAL PAGE
     // =========================
-    printf("\n[DSM] Getting LOCAL page via parasite injection...\n");
+    PRINT("\n[DSM] Getting LOCAL page via parasite injection...\n");
     
     state = compel_stop_task(restored_pid);
     if (!(ctl = compel_prepare(restored_pid))) {
@@ -3531,7 +3540,7 @@ int compare_local_remote_pages(int restored_pid, int uffd, struct msg_info *dsm_
         goto fail_pipe;
     }
     
-    printf("✅ Local page retrieved successfully\n");
+    PRINT("✅ Local page retrieved successfully\n");
     
     // =========================
     // 3. PRINT BOTH PAGES AS FLOATS
@@ -3541,27 +3550,27 @@ int compare_local_remote_pages(int restored_pid, int uffd, struct msg_info *dsm_
     
     // Get number of rows to display
     rows = 0;
-    printf("\nHow many rows of floats to display? (each row = 4 floats): ");
+    PRINT("\nHow many rows of floats to display? (each row = 4 floats): ");
     if (scanf("%d", &rows) != 1 || rows <= 0) {
-        printf("Invalid input, defaulting to 256 rows\n");
+        PRINT("Invalid input, defaulting to 256 rows\n");
         rows = 256;
     }
     
     // Ensure we don't exceed page boundaries
     if (rows * 4 > 1024) {
-        printf("⚠️  Limiting to 256 rows (1024 floats max per page)\n");
+        PRINT("⚠️  Limiting to 256 rows (1024 floats max per page)\n");
         rows = 256;
     }
     
-    printf("\n================================================================================\n");
-    printf("COMPARISON: LOCAL vs REMOTE PAGE (Address: 0x%lx)\n", dsm_msg->page_addr);
-    printf("================================================================================\n");
-    printf("Format: [idx] LOCAL_val (hex) | REMOTE_val (hex) [MATCH/DIFF]\n");
-    printf("--------------------------------------------------------------------------------\n");
+    PRINT("\n================================================================================\n");
+    PRINT("COMPARISON: LOCAL vs REMOTE PAGE (Address: 0x%lx)\n", dsm_msg->page_addr);
+    PRINT("================================================================================\n");
+    PRINT("Format: [idx] LOCAL_val (hex) | REMOTE_val (hex) [MATCH/DIFF]\n");
+    PRINT("--------------------------------------------------------------------------------\n");
     
     differences = 0;
     for (int i = 0; i < rows * 4; i += 4) {
-        printf("\nRow %03d:\n", i/4);
+        PRINT("\nRow %03d:\n", i/4);
         
         for (int j = 0; j < 4; j++) {
             int idx = i + j;
@@ -3573,19 +3582,19 @@ int compare_local_remote_pages(int restored_pid, int uffd, struct msg_info *dsm_
             const char *status = (local_hex == remote_hex) ? "✅ MATCH" : "❌ DIFF ";
             if (local_hex != remote_hex) differences++;
             
-            printf("  [%03d] %12.6f (0x%08x) | %12.6f (0x%08x) %s\n",
+            PRINT("  [%03d] %12.6f (0x%08x) | %12.6f (0x%08x) %s\n",
                    idx, local_val, local_hex, remote_val, remote_hex, status);
         }
     }
     
-    printf("\n================================================================================\n");
-    printf("SUMMARY: %d differences found out of %d floats compared\n", differences, rows * 4);
+    PRINT("\n================================================================================\n");
+    PRINT("SUMMARY: %d differences found out of %d floats compared\n", differences, rows * 4);
     if (differences == 0) {
-        printf("🎉 Pages are IDENTICAL!\n");
+        PRINT("🎉 Pages are IDENTICAL!\n");
     } else {
-        printf("⚠️  Pages have %d different float values\n", differences);
+        PRINT("⚠️  Pages have %d different float values\n", differences);
     }
-    printf("================================================================================\n\n");
+    PRINT("================================================================================\n\n");
     
     // Cleanup parasite
     if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
@@ -3610,58 +3619,58 @@ fail_cleanup:
 // Function to perform bitwise OR between two pages and return result
 int or_pages(unsigned char *local_page, unsigned char *remote_page, unsigned char *result_page, int display_floats) {
     if (!local_page || !remote_page || !result_page) {
-        printf("❌ Invalid page pointers provided\n");
+        PRINT("❌ Invalid page pointers provided\n");
         return -1;
     }
     
-    printf("\n🔧 PERFORMING BITWISE OR OPERATION\n");
-    printf("==================================\n");
+    PRINT("\n🔧 PERFORMING BITWISE OR OPERATION\n");
+    PRINT("==================================\n");
     
     // Perform bitwise OR for each byte
     for (int i = 0; i < 4096; i++) {
         result_page[i] = local_page[i] | remote_page[i];
     }
     
-    printf("✅ OR operation completed successfully\n");
+    PRINT("✅ OR operation completed successfully\n");
     
     // Optional: Display result as floats
     if (display_floats) {
         float *result_floats = (float *)result_page;
         int rows = 0;
         
-        printf("\nHow many rows of OR'd floats to display? (each row = 4 floats): ");
+        PRINT("\nHow many rows of OR'd floats to display? (each row = 4 floats): ");
         if (scanf("%d", &rows) != 1 || rows <= 0) {
-            printf("Invalid input, defaulting to 64 rows\n");
+            PRINT("Invalid input, defaulting to 64 rows\n");
             rows = 64;
         }
         
         // Ensure we don't exceed page boundaries
         if (rows * 4 > 1024) {
-            printf("⚠️  Limiting to 256 rows (1024 floats max per page)\n");
+            PRINT("⚠️  Limiting to 256 rows (1024 floats max per page)\n");
             rows = 256;
         }
         
-        printf("\n================================================================================\n");
-        printf("BITWISE OR RESULT PAGE (LOCAL | REMOTE)\n");
-        printf("================================================================================\n");
-        printf("Format: [idx] OR_result (hex)\n");
-        printf("--------------------------------------------------------------------------------\n");
+        PRINT("\n================================================================================\n");
+        PRINT("BITWISE OR RESULT PAGE (LOCAL | REMOTE)\n");
+        PRINT("================================================================================\n");
+        PRINT("Format: [idx] OR_result (hex)\n");
+        PRINT("--------------------------------------------------------------------------------\n");
         
         for (int i = 0; i < rows * 4; i += 4) {
-            printf("\nRow %03d:\n", i/4);
+            PRINT("\nRow %03d:\n", i/4);
             
             for (int j = 0; j < 4; j++) {
                 int idx = i + j;
                 float or_val = result_floats[idx];
                 unsigned int or_hex = *(unsigned int*)&or_val;
                 
-                printf("  [%03d] %12.6f (0x%08x)\n", idx, or_val, or_hex);
+                PRINT("  [%03d] %12.6f (0x%08x)\n", idx, or_val, or_hex);
             }
         }
         
-        printf("\n================================================================================\n");
-        printf("OR operation display completed\n");
-        printf("================================================================================\n\n");
+        PRINT("\n================================================================================\n");
+        PRINT("OR operation display completed\n");
+        PRINT("================================================================================\n\n");
     }
     
     return 0;
@@ -3681,22 +3690,22 @@ int compare_and_or_pages(int restored_pid, int uffd,
     struct parasite_ctl *ctl;
     struct infect_ctx *ictx;
 
-    printf("[DSM] Requesting both local and remote pages for address: 0x%lx\n", dsm_msg->page_addr);
+    PRINT("[DSM] Requesting both local and remote pages for address: 0x%lx\n", dsm_msg->page_addr);
 
     // =========================
     // 1. GET REMOTE PAGE FIRST
     // =========================
-    printf("\n[DSM] Getting REMOTE page via network...\n");
+    PRINT("\n[DSM] Getting REMOTE page via network...\n");
     if (send_get_page(*dsm_msg, fd_handler, remote_page_content) != 0) {
-        printf("❌ Failed to get remote page at %lx\n", dsm_msg->page_addr);
+        PRINT("❌ Failed to get remote page at %lx\n", dsm_msg->page_addr);
         return -1;
     }
-    printf("✅ Remote page received successfully\n");
+    PRINT("✅ Remote page received successfully\n");
 
     // =========================
     // 2. GET LOCAL PAGE
     // =========================
-    printf("\n[DSM] Getting LOCAL page via parasite injection...\n");
+    PRINT("\n[DSM] Getting LOCAL page via parasite injection...\n");
 
     state = compel_stop_task(restored_pid);
     if (!(ctl = compel_prepare(restored_pid))) {
@@ -3741,31 +3750,31 @@ int compare_and_or_pages(int restored_pid, int uffd,
         goto fail_pipe;
     }
 
-    printf("✅ Local page retrieved successfully\n");
+    PRINT("✅ Local page retrieved successfully\n");
 
     // =========================
     // 3. PRINT BOTH PAGES (FLOAT or DOUBLE)
     // =========================
-    printf("\nHow many rows to display for comparison? (each row = 4 values): ");
+    PRINT("\nHow many rows to display for comparison? (each row = 4 values): ");
     if (scanf("%d", &rows) != 1 || rows <= 0) {
-        printf("Invalid input, defaulting to 64 rows\n");
+        PRINT("Invalid input, defaulting to 64 rows\n");
         rows = 64;
     }
 
-    printf("\n================================================================================\n");
-    printf("COMPARISON: LOCAL vs REMOTE PAGE (Address: 0x%lx)\n", dsm_msg->page_addr);
-    printf("================================================================================\n");
-    printf("Format: [idx] LOCAL_val (hex) | REMOTE_val (hex) [MATCH/DIFF]\n");
-    printf("--------------------------------------------------------------------------------\n");
+    PRINT("\n================================================================================\n");
+    PRINT("COMPARISON: LOCAL vs REMOTE PAGE (Address: 0x%lx)\n", dsm_msg->page_addr);
+    PRINT("================================================================================\n");
+    PRINT("Format: [idx] LOCAL_val (hex) | REMOTE_val (hex) [MATCH/DIFF]\n");
+    PRINT("--------------------------------------------------------------------------------\n");
 
     differences = 0;
 
     if(mode < 0 ){
-        printf("\nChoose print mode:\n");
-        printf("  [0] float (4 bytes)\n");
-        printf("  [] int (4 bytes)\n");
-        printf("  [1] double (8 bytes)\n");
-        printf("Enter mode: ");
+        PRINT("\nChoose print mode:\n");
+        PRINT("  [0] float (4 bytes)\n");
+        PRINT("  [] int (4 bytes)\n");
+        PRINT("  [1] double (8 bytes)\n");
+        PRINT("Enter mode: ");
 
         if (scanf("%d", &mode) != 1 || mode < 0 || mode > 2) {
             fprintf(stderr, "Invalid mode. Defaulting to float (0).\n");
@@ -3780,7 +3789,7 @@ int compare_and_or_pages(int restored_pid, int uffd,
         remote_page_floats = (float  *)remote_page_content;
 
         for (int i = 0; i < rows * 4; i += 4) {
-            printf("\nRow %03d:\n", i / 4);
+            PRINT("\nRow %03d:\n", i / 4);
             for (int j = 0; j < 4; j++) {
                 int idx = i + j;
                 float local_val  = local_page_floats[idx];
@@ -3789,7 +3798,7 @@ int compare_and_or_pages(int restored_pid, int uffd,
                 unsigned int remote_hex = *(unsigned int *)&remote_val;
                 const char *status = (local_hex == remote_hex) ? "✅ MATCH" : "❌ DIFF ";
                 if (local_hex != remote_hex) differences++;
-                printf("  [%03d] %12.6f (0x%08x) | %12.6f (0x%08x) %s\n",
+                PRINT("  [%03d] %12.6f (0x%08x) | %12.6f (0x%08x) %s\n",
                        idx, local_val, local_hex, remote_val, remote_hex, status);
             }
         }
@@ -3804,7 +3813,7 @@ int compare_and_or_pages(int restored_pid, int uffd,
         if (total_vals > 512) total_vals = 512;
 
         for (int i = 0; i < total_vals; i += 4) {
-            printf("\nRow %03d:\n", i / 4);
+            PRINT("\nRow %03d:\n", i / 4);
             for (int j = 0; j < 4; j++) {
                 int idx = i + j;
                 double local_val  = local_page_doubles[idx];
@@ -3813,38 +3822,38 @@ int compare_and_or_pages(int restored_pid, int uffd,
                 unsigned long remote_hex = *(unsigned long *)&remote_val;
                 const char *status = (local_hex == remote_hex) ? "✅ MATCH" : "❌ DIFF ";
                 if (local_hex != remote_hex) differences++;
-                printf("  [%03d] %14.8lf (0x%016lx) | %14.8lf (0x%016lx) %s\n",
+                PRINT("  [%03d] %14.8lf (0x%016lx) | %14.8lf (0x%016lx) %s\n",
                        idx, local_val, local_hex, remote_val, remote_hex, status);
             }
         }
 
     } else {
-        printf("❌ Unknown mode (%d). Use 0 = float, 1 = double.\n", mode);
+        PRINT("❌ Unknown mode (%d). Use 0 = float, 1 = double.\n", mode);
     }
 
-    printf("\n================================================================================\n");
+    PRINT("\n================================================================================\n");
     if (mode == 0)
-        printf("SUMMARY: %d differences found out of %d floats compared\n", differences, rows * 4);
+        PRINT("SUMMARY: %d differences found out of %d floats compared\n", differences, rows * 4);
     else
-        printf("SUMMARY: %d differences found out of %d doubles compared\n", differences, rows * 4);
+        PRINT("SUMMARY: %d differences found out of %d doubles compared\n", differences, rows * 4);
 
     if (differences == 0)
-        printf("🎉 Pages are IDENTICAL!\n");
+        PRINT("🎉 Pages are IDENTICAL!\n");
     else
-        printf("⚠️  Pages have %d differing values\n", differences);
-    printf("================================================================================\n\n");
+        PRINT("⚠️  Pages have %d differing values\n", differences);
+    PRINT("================================================================================\n\n");
 
     // =========================
     // 4. PERFORM OR OPERATION
     // =========================
     if (or_result != NULL) {
         char response;
-        printf("Do you want to perform bitwise OR operation? (y/n): ");
+        PRINT("Do you want to perform bitwise OR operation? (y/n): ");
         if (scanf(" %c", &response) == 1 && (response == 'y' || response == 'Y')) {
             if (or_pages(local_page_content, remote_page_content, or_result, 1) == 0)
-                printf("✅ OR operation completed and stored in result buffer\n");
+                PRINT("✅ OR operation completed and stored in result buffer\n");
             else
-                printf("❌ OR operation failed\n");
+                PRINT("❌ OR operation failed\n");
         }
     }
 
@@ -3877,17 +3886,17 @@ int fill_local_page_uffdio(int uffd, unsigned long addr, unsigned char *merged_p
     if( runMADVISE( restored_pid, (void *) addr, 4096))
             perror("runMADVISE command loop");
         else
-            printf("Successfully run madvise on page at %p\n", (void *) addr);
+            PRINT("Successfully run madvise on page at %p\n", (void *) addr);
     
     if (!merged_page_data) {
-        printf("❌ Invalid page data pointer\n");
+        PRINT("❌ Invalid page data pointer\n");
         return -1;
     }
     
-    printf("\n💾 FILLING LOCAL PAGE WITH REMOTE DATA\n");
-    printf("======================================\n");
-    printf("Target address: 0x%lx\n", addr);
-    printf("Data source: remote page (REMOTE)\n");
+    PRINT("\n💾 FILLING LOCAL PAGE WITH REMOTE DATA\n");
+    PRINT("======================================\n");
+    PRINT("Target address: 0x%lx\n", addr);
+    PRINT("Data source: remote page (REMOTE)\n");
     
     // Set up the copy structure
     copy.src  = (unsigned long)merged_page_data;
@@ -3895,11 +3904,11 @@ int fill_local_page_uffdio(int uffd, unsigned long addr, unsigned char *merged_p
     copy.len  = PAGE_SIZE;
     copy.mode = UFFDIO_COPY_MODE_WP;  // Copy with write protection
     
-    printf("Performing UFFDIO_COPY...\n");
-    printf("  src: 0x%llx (remote data)\n", copy.src);
-    printf("  dst: 0x%llx (target address)\n", copy.dst);
-    printf("  len: %llu bytes\n", copy.len);
-    printf("  mode: UFFDIO_COPY_MODE_WP\n");
+    PRINT("Performing UFFDIO_COPY...\n");
+    PRINT("  src: 0x%llx (remote data)\n", copy.src);
+    PRINT("  dst: 0x%llx (target address)\n", copy.dst);
+    PRINT("  len: %llu bytes\n", copy.len);
+    PRINT("  mode: UFFDIO_COPY_MODE_WP\n");
     
     // Perform the copy
     if (ioctl(uffd, UFFDIO_COPY, &copy) == -1) {
@@ -3907,10 +3916,10 @@ int fill_local_page_uffdio(int uffd, unsigned long addr, unsigned char *merged_p
         return -1;
     }
     
-    printf("✅ Successfully filled local page with remote data\n");
-    printf("   Bytes copied: %llu\n", copy.len);
-    printf("   Local page now contains: REMOTE\n");
-    printf("======================================\n\n");
+    PRINT("✅ Successfully filled local page with remote data\n");
+    PRINT("   Bytes copied: %llu\n", copy.len);
+    PRINT("   Local page now contains: REMOTE\n");
+    PRINT("======================================\n\n");
     
     return 0;
 }
@@ -3925,17 +3934,17 @@ int fill_local_page_with_merged_uffdio(int uffd, unsigned long addr, unsigned ch
     if( runMADVISE( restored_pid, (void *) addr, 4096))
             perror("runMADVISE command loop");
         else
-            printf("Successfully run madvise on page at %p\n", (void *) aligned);
+            PRINT("Successfully run madvise on page at %p\n", (void *) aligned);
 
     if (!merged_page_data) {
-        printf("❌ Invalid merged page data pointer\n");
+        PRINT("❌ Invalid merged page data pointer\n");
         return -1;
     }
     
-    printf("\n💾 FILLING LOCAL PAGE WITH MERGED DATA\n");
-    printf("======================================\n");
-    printf("Target address: 0x%lx\n", addr);
-    printf("Data source: merged page (LOCAL | REMOTE)\n");
+    PRINT("\n💾 FILLING LOCAL PAGE WITH MERGED DATA\n");
+    PRINT("======================================\n");
+    PRINT("Target address: 0x%lx\n", addr);
+    PRINT("Data source: merged page (LOCAL | REMOTE)\n");
     
     // Set up the copy structure
     copy.src  = (unsigned long)merged_page_data;
@@ -3943,11 +3952,11 @@ int fill_local_page_with_merged_uffdio(int uffd, unsigned long addr, unsigned ch
     copy.len  = PAGE_SIZE;
     copy.mode = UFFDIO_COPY_MODE_WP;  // Copy with write protection
     
-    printf("Performing UFFDIO_COPY...\n");
-    printf("  src: 0x%llx (merged data)\n", copy.src);
-    printf("  dst: 0x%llx (target address)\n", copy.dst);
-    printf("  len: %llu bytes\n", copy.len);
-    printf("  mode: UFFDIO_COPY_MODE_WP\n");
+    PRINT("Performing UFFDIO_COPY...\n");
+    PRINT("  src: 0x%llx (merged data)\n", copy.src);
+    PRINT("  dst: 0x%llx (target address)\n", copy.dst);
+    PRINT("  len: %llu bytes\n", copy.len);
+    PRINT("  mode: UFFDIO_COPY_MODE_WP\n");
     
     // Perform the copy
     if (ioctl(uffd, UFFDIO_COPY, &copy) == -1) {
@@ -3955,10 +3964,10 @@ int fill_local_page_with_merged_uffdio(int uffd, unsigned long addr, unsigned ch
         return -1;
     }
     
-    printf("✅ Successfully filled local page with merged data\n");
-    printf("   Bytes copied: %llu\n", copy.len);
-    printf("   Local page now contains: LOCAL | REMOTE\n");
-    printf("======================================\n\n");
+    PRINT("✅ Successfully filled local page with merged data\n");
+    PRINT("   Bytes copied: %llu\n", copy.len);
+    PRINT("   Local page now contains: LOCAL | REMOTE\n");
+    PRINT("======================================\n\n");
     
     return 0;
 }
@@ -3972,18 +3981,18 @@ int inject_merged_page_via_parasite(int restored_pid, int uffd, unsigned long ad
     struct infect_ctx *ictx;
     
     if (!merged_page_data) {
-        printf("❌ Invalid merged page data pointer\n");
+        PRINT("❌ Invalid merged page data pointer\n");
         return -1;
     }
     
-    printf("\n💉 INJECTING MERGED PAGE VIA PARASITE\n");
-    printf("====================================\n");
-    printf("Target address: 0x%lx\n", addr);
-    printf("Data source: merged page (LOCAL | REMOTE)\n");
-    printf("Method: Parasite injection (WRITE_SINGLE)\n");
+    PRINT("\n💉 INJECTING MERGED PAGE VIA PARASITE\n");
+    PRINT("====================================\n");
+    PRINT("Target address: 0x%lx\n", addr);
+    PRINT("Data source: merged page (LOCAL | REMOTE)\n");
+    PRINT("Method: Parasite injection (WRITE_SINGLE)\n");
     
     // Stop the target process
-    printf("🔹 Stopping target process...\n");
+    PRINT("🔹 Stopping target process...\n");
     state = compel_stop_task(restored_pid);
     if (!(ctl = compel_prepare(restored_pid))) {
         pr_err("❌ Compel prepare failed\n");
@@ -4000,20 +4009,20 @@ int inject_merged_page_via_parasite(int restored_pid, int uffd, unsigned long ad
         return -1;
     }
     
-    printf("✅ Parasite injected successfully\n");
+    PRINT("✅ Parasite injected successfully\n");
     
     // Set the target page address for the parasite
     args = compel_parasite_args(ctl, long);
     *args = addr;
     
-    printf("🔹 Setting up data pipe...\n");
+    PRINT("🔹 Setting up data pipe...\n");
     if (pipe(p) < 0) {
         perror("pipe");
         goto fail_cleanup;
     }
     
     // Call the WRITE_SINGLE RPC (you'll need to implement this command)
-    printf("🔹 Calling PARASITE_CMD_WRITE_SINGLE...\n");
+    PRINT("🔹 Calling PARASITE_CMD_WRITE_SINGLE...\n");
     if (compel_rpc_call(PARASITE_CMD_WRITE_SINGLE, ctl) < 0) {
         fprintf(stderr, "❌ RPC WRITE_SINGLE call failed\n");
         goto fail_pipe;
@@ -4026,7 +4035,7 @@ int inject_merged_page_via_parasite(int restored_pid, int uffd, unsigned long ad
     }
     
     // Write the merged page data to the pipe
-    printf("🔹 Sending merged page data (%ld bytes)...\n", PAGE_SIZE);
+    PRINT("🔹 Sending merged page data (%ld bytes)...\n", PAGE_SIZE);
     if (write(p[1], merged_page_data, PAGE_SIZE) != PAGE_SIZE) {
         perror("❌ Failed to write merged page data to pipe");
         goto fail_pipe;
@@ -4038,11 +4047,11 @@ int inject_merged_page_via_parasite(int restored_pid, int uffd, unsigned long ad
         goto fail_pipe;
     }
     
-    printf("✅ Merged page successfully injected into local process!\n");
-    printf("   Address 0x%lx now contains merged (LOCAL | REMOTE) data\n", addr);
+    PRINT("✅ Merged page successfully injected into local process!\n");
+    PRINT("   Address 0x%lx now contains merged (LOCAL | REMOTE) data\n", addr);
     
     // Cleanup parasite
-    printf("🔹 Cleaning up parasite...\n");
+    PRINT("🔹 Cleaning up parasite...\n");
     if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
     if (compel_cure(ctl)) pr_err("Can't cure\n");
     if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
@@ -4050,7 +4059,7 @@ int inject_merged_page_via_parasite(int restored_pid, int uffd, unsigned long ad
     close(p[0]);
     close(p[1]);
     
-    printf("====================================\n\n");
+    PRINT("====================================\n\n");
     return 0;
 
 fail_pipe:
@@ -4067,32 +4076,32 @@ fail_cleanup:
 int fill_local_page_with_merged_parasite(int uffd, unsigned long addr, unsigned char *merged_page_data, int restored_pid) {
     unsigned long page_addr = addr & ~(PAGE_SIZE - 1);
     if (!merged_page_data) {
-        printf("❌ Invalid merged page data pointer\n");
+        PRINT("❌ Invalid merged page data pointer\n");
         return -1;
     }
     
-    printf("\n💾 FILLING LOCAL PAGE WITH MERGED DATA\n");
-    printf("======================================\n");
-    printf("Target address: 0x%lx\n", addr);
-    printf("Data source: merged page (LOCAL | REMOTE)\n");
+    PRINT("\n💾 FILLING LOCAL PAGE WITH MERGED DATA\n");
+    PRINT("======================================\n");
+    PRINT("Target address: 0x%lx\n", addr);
+    PRINT("Data source: merged page (LOCAL | REMOTE)\n");
     
     // Check if address is page-aligned
     
     if (page_addr != addr) {
-        printf("⚠️  Address not page-aligned, using 0x%lx\n", page_addr);
+        PRINT("⚠️  Address not page-aligned, using 0x%lx\n", page_addr);
         addr = page_addr;
     }
     
-    printf("🔸 Using parasite injection method (recommended for present pages)\n");
+    PRINT("🔸 Using parasite injection method (recommended for present pages)\n");
     
     // Use parasite injection instead of UFFDIO_COPY
     if (inject_merged_page_via_parasite(restored_pid, uffd, addr, merged_page_data) == 0) {
-        printf("✅ Successfully filled local page using parasite injection!\n");
-        printf("   Local page now contains merged (LOCAL | REMOTE) data\n");
-        printf("======================================\n\n");
+        PRINT("✅ Successfully filled local page using parasite injection!\n");
+        PRINT("   Local page now contains merged (LOCAL | REMOTE) data\n");
+        PRINT("======================================\n\n");
         return 0;
     } else {
-        printf("❌ Parasite injection failed\n");
+        PRINT("❌ Parasite injection failed\n");
         return -1;
     }
 }
@@ -4102,31 +4111,31 @@ int complete_page_merge_workflow(int restored_pid, int uffd, struct msg_info *ds
     unsigned char or_result_page[4096];
     char response;
     
-    printf("\n🚀 COMPLETE PAGE MERGE WORKFLOW\n");
-    printf("===============================\n");
-    printf("Target address: 0x%lx\n", dsm_msg->page_addr);
-    printf("Steps: 1) Compare pages  2) OR merge  3) Fill local\n\n");
+    PRINT("\n🚀 COMPLETE PAGE MERGE WORKFLOW\n");
+    PRINT("===============================\n");
+    PRINT("Target address: 0x%lx\n", dsm_msg->page_addr);
+    PRINT("Steps: 1) Compare pages  2) OR merge  3) Fill local\n\n");
 
  
     
     // Step 1 & 2: Compare pages and create OR merge
     if (compare_and_or_pages(restored_pid, uffd, dsm_msg, fd_handler, or_result_page, -1) != 0) {
-        printf("❌ Page comparison and OR merge failed\n");
+        PRINT("❌ Page comparison and OR merge failed\n");
         return -1;
     }
     
     // Step 3: Ask user if they want to fill the local page
-    printf("Do you want to fill the local page with the merged data? (y/n): ");
+    PRINT("Do you want to fill the local page with the merged data? (y/n): ");
     if (scanf(" %c", &response) == 1 && (response == 'y' || response == 'Y')) {
         if (fill_local_page_with_merged_uffdio(uffd, dsm_msg->page_addr, or_result_page, restored_pid) == 0) {
-            printf("🎉 COMPLETE SUCCESS!\n");
-            printf("Local page at 0x%lx now contains merged (LOCAL | REMOTE) data\n", dsm_msg->page_addr);
+            PRINT("🎉 COMPLETE SUCCESS!\n");
+            PRINT("Local page at 0x%lx now contains merged (LOCAL | REMOTE) data\n", dsm_msg->page_addr);
         } else {
-            printf("❌ Failed to fill local page with merged data\n");
+            PRINT("❌ Failed to fill local page with merged data\n");
             return -1;
         }
     } else {
-        printf("Skipping local page fill. Merged data remains in buffer.\n");
+        PRINT("Skipping local page fill. Merged data remains in buffer.\n");
     }
     
     return 0;
@@ -4192,7 +4201,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
   
     sleep(1);
     fputs(menu, stdout);   /* prints whole menu at once */
-    printf("[DEBUG] isatty(stdin)=%d\n", isatty(0));
+    PRINT("[DEBUG] isatty(stdin)=%d\n", isatty(0));
     fflush(stdout);
 
     while (1) {
@@ -4200,7 +4209,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
         int choice;
         char *endptr;
 
-        printf("\n[DSM] Enter command:\n> ");
+        PRINT("\n[DSM] Enter command:\n> ");
         fflush(stdout);
 
         if (!fgets(line, sizeof(line), stdin)) {
@@ -4219,28 +4228,28 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
         // Convert to int safely
         choice = strtol(line, &endptr, 10);
         if (*endptr != '\0') {
-            printf("[WARN] Invalid input: '%s'\n", line);
+            PRINT("[WARN] Invalid input: '%s'\n", line);
             continue;
         }
 
-        printf("[DEBUG] parsed choice=%d\n", choice);
+        PRINT("[DEBUG] parsed choice=%d\n", choice);
     
         /*
         if (scanf("%d", &choice) != 1) {
-            printf("Invalid input\n");
+            PRINT("Invalid input\n");
             while (getchar() != '\n'); // flush
             continue;
         }*/
 
         if (choice == 0) {
-            printf("[DSM] Reapplying write-protection on global page...\n");
+            PRINT("[DSM] Reapplying write-protection on global page...\n");
 			enable_wp( uffd, (void *) aligned);
         } else if (choice == 1) {
-			printf("[DSM] Sending remote madvise(MADV_DONTNEED) request...\n");
+			PRINT("[DSM] Sending remote madvise(MADV_DONTNEED) request...\n");
 			if( runMADVISE( restored_pid, (void *) aligned, 4096))
 				perror("runMADVISE command loop");
 			else
-				printf("Successfully run madvise on page at %p\n", (void *) aligned);
+				PRINT("Successfully run madvise on page at %p\n", (void *) aligned);
         } else if (choice == 21){
 			// Resume the stopped process
 			send_sigcont(restored_pid);
@@ -4253,106 +4262,106 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             //Resume remote process
             dsm_msg.msg_type = MSG_WAKE_THREAD;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[SERVER] Sent MSG_WAKE_THREAD to server.\n");
+			PRINT("[SERVER] Sent MSG_WAKE_THREAD to server.\n");
 		}else if( choice == 3 ) {
 			// Resume the stopped process
 			if (compel_resume_task(restored_pid, 3, 3)) pr_err("Can't resume\n");
-			printf("[DSM Server] Sent compel resume to PID %d.\n", restored_pid);
+			PRINT("[DSM Server] Sent compel resume to PID %d.\n", restored_pid);
 		} else if( choice == 4 ) {
 			kill_and_exit(restored_pid);
 		} else if( choice == 5 ) {
 			//Infection test
-			printf("Do infection test\n");
+			PRINT("Do infection test\n");
 			infection_test(restored_pid);			
 		}else if( choice == 61 ){
 			//vmsplice test
-			printf("Do vmsplice test at %p\n", (void *)aligned);
+			PRINT("Do vmsplice test at %p\n", (void *)aligned);
 			//Prepare dsm_msg
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
 			dsm_msg.page_addr = aligned;
-			printf("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
+			PRINT("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
 			dsm_msg.msg_id = 1;
 			test_page_content(restored_pid, uffd, &dsm_msg);
 		}else if( choice == 62 ){
 			//vmsplice test
-			printf("Do vmsplice test at %p\n", (void *)aligned);
+			PRINT("Do vmsplice test at %p\n", (void *)aligned);
 			//Prepare dsm_msg
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
 			dsm_msg.page_addr = aligned;
-			printf("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
+			PRINT("Do vmsplice test at %p\n", (void *)dsm_msg.page_addr);
 			dsm_msg.msg_id = 1;
 			test_full_page_content(restored_pid, uffd, &dsm_msg, 1);
 		}else if( choice == 63 ){
             // Full page dump test (interactive)
             unsigned long input_addr;
-            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            PRINT("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
             fflush(stdout);
             if (scanf("%lx", &input_addr) != 1) {
                 fprintf(stderr, "❌ Invalid input\n");
                 kill_and_exit(restored_pid);
-            }printf("[DSM] Address entered: %lx \n",input_addr );
+            }PRINT("[DSM] Address entered: %lx \n",input_addr );
 
             // Prepare dsm_msg
             dsm_msg.msg_type = MSG_SEND_INVALIDATE;  // or anything suitable
             dsm_msg.page_addr = input_addr;
             dsm_msg.msg_id = 1;
 
-            printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
+            PRINT("[DSM] Dumping page at address: 0x%lx\n", input_addr);
 
             test_full_page_content(restored_pid, uffd, &dsm_msg, 1);
         }else if( choice == 632){
             // Full page dump test (interactive)
             unsigned long input_addr;
-            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            PRINT("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
             fflush(stdout);
             if (scanf("%lx", &input_addr) != 1) {
                 fprintf(stderr, "❌ Invalid input\n");
                 kill_and_exit(restored_pid);
-            }printf("[DSM] Address entered: %lx \n",input_addr );
+            }PRINT("[DSM] Address entered: %lx \n",input_addr );
 
             // Prepare dsm_msg
             dsm_msg.msg_type = MSG_SEND_INVALIDATE;  // or anything suitable
             dsm_msg.page_addr = input_addr;
             dsm_msg.msg_id = 1;
 
-            printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
+            PRINT("[DSM] Dumping page at address: 0x%lx\n", input_addr);
 
             test_full_page_content(restored_pid, uffd, &dsm_msg, 2);
         }else if( choice == 633 ){
             // Full page dump test (interactive)
             unsigned long input_addr;
-            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            PRINT("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
             fflush(stdout);
             if (scanf("%lx", &input_addr) != 1) {
                 fprintf(stderr, "❌ Invalid input\n");
                 kill_and_exit(restored_pid);
-            }printf("[DSM] Address entered: %lx \n",input_addr );
+            }PRINT("[DSM] Address entered: %lx \n",input_addr );
 
             // Prepare dsm_msg
             dsm_msg.msg_type = MSG_SEND_INVALIDATE;  // or anything suitable
             dsm_msg.page_addr = input_addr;
             dsm_msg.msg_id = 1;
 
-            printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
+            PRINT("[DSM] Dumping page at address: 0x%lx\n", input_addr);
 
             test_full_page_content(restored_pid, uffd, &dsm_msg, 0);
         }else if( choice == 64 ){
             // ✅ Now list all registered pages
-            printf("\n📋 Registered pages in page_list_data:\n");
+            PRINT("\n📋 Registered pages in page_list_data:\n");
             for (int i = 0; i < total_pages; ++i) {
-                printf("  [%03d] %p, owner:%ld, state(SH/MOD/INV/DIV):%d\n", i, (void *)page_list_data[i].saddr, page_list_data[i].owner_mask, page_list_data[i].state);
+                PRINT("  [%03d] %p, owner:%ld, state(SH/MOD/INV/DIV):%d\n", i, (void *)page_list_data[i].saddr, page_list_data[i].owner_mask, page_list_data[i].state);
             }
         }else if( choice == 65 ){
             // Full page dump test (interactive)
             unsigned long input_addr = 0x7f8981c8e000;
-            printf("[DSM] Address to dump: %lx\n", input_addr);
+            PRINT("[DSM] Address to dump: %lx\n", input_addr);
 
             // Prepare dsm_msg
             dsm_msg.msg_type = MSG_SEND_INVALIDATE;  // or anything suitable
             dsm_msg.page_addr = input_addr;
             dsm_msg.msg_id = 1;
 
-            printf("[DSM] Dumping page at address: 0x%lx\n", input_addr);
+            PRINT("[DSM] Dumping page at address: 0x%lx\n", input_addr);
 
             test_full_page_content(restored_pid, uffd, &dsm_msg, 0);
         }else if( choice == 66 ){
@@ -4361,9 +4370,9 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             unsigned long input_addr = 0x7f8981c8e000;
             //unsigned char page_data[4096];
             
-            printf("\n🔍 DUAL PAGE COMPARISON TEST\n");
-            printf("============================\n");
-            printf("Target address: 0x%lx\n\n", input_addr);
+            PRINT("\n🔍 DUAL PAGE COMPARISON TEST\n");
+            PRINT("============================\n");
+            PRINT("Target address: 0x%lx\n\n", input_addr);
             
             // Prepare message for both local and remote requests
             dsm_msg.msg_type = MSG_GET_PAGE_DATA;
@@ -4371,15 +4380,15 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             dsm_msg.page_size = 4096;
             dsm_msg.msg_id = 1001;
             
-            printf("Starting combined local/remote page comparison...\n");
+            PRINT("Starting combined local/remote page comparison...\n");
             
             // Call the combined function
             if (compare_local_remote_pages(restored_pid, uffd, &dsm_msg, conn->fd_handler) != 0) {
-                printf("❌ Combined page comparison failed\n");
+                PRINT("❌ Combined page comparison failed\n");
                 return;
             }
             
-            printf("✅ Combined page comparison completed\n");
+            PRINT("✅ Combined page comparison completed\n");
 
 
         }else if( choice == 67 ){
@@ -4387,9 +4396,9 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             unsigned long input_addr = 0x7f8981c8e000;
             unsigned char or_result_page[4096];
             
-            printf("\n🔍 DUAL PAGE COMPARISON + OR TEST\n");
-            printf("==================================\n");
-            printf("Target address: 0x%lx\n\n", input_addr);
+            PRINT("\n🔍 DUAL PAGE COMPARISON + OR TEST\n");
+            PRINT("==================================\n");
+            PRINT("Target address: 0x%lx\n\n", input_addr);
             
             // Prepare message for both local and remote requests
             dsm_msg.msg_type = MSG_GET_PAGE_DATA;
@@ -4397,24 +4406,24 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             dsm_msg.page_size = 4096;
             dsm_msg.msg_id = 1001;
             
-            printf("Starting combined local/remote page comparison with OR operation...\n");
+            PRINT("Starting combined local/remote page comparison with OR operation...\n");
             
             // Call the enhanced function
             if (compare_and_or_pages(restored_pid, uffd, &dsm_msg, conn->fd_handler, or_result_page, -1) != 0) {
-                printf("❌ Combined page comparison and OR failed\n");
+                PRINT("❌ Combined page comparison and OR failed\n");
                 return;
             }
             
-            printf("✅ Combined page comparison and OR completed\n");
-            printf("OR result is stored in or_result_page buffer\n");
+            PRINT("✅ Combined page comparison and OR completed\n");
+            PRINT("OR result is stored in or_result_page buffer\n");
         }else if( choice == 68 ){
             // Full page dump test (interactive)
             unsigned long input_addr = 0x7f8981c8e000;
             
-            printf("\n🔄 COMPLETE PAGE MERGE WORKFLOW TEST\n");
-            printf("====================================\n");
-            printf("Target address: 0x%lx\n", input_addr);
-            printf("Workflow: Compare → OR Merge → Fill Local\n\n");
+            PRINT("\n🔄 COMPLETE PAGE MERGE WORKFLOW TEST\n");
+            PRINT("====================================\n");
+            PRINT("Target address: 0x%lx\n", input_addr);
+            PRINT("Workflow: Compare → OR Merge → Fill Local\n\n");
             
             // Prepare message for both local and remote requests
             dsm_msg.msg_type = MSG_GET_PAGE_DATA;
@@ -4422,29 +4431,29 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             dsm_msg.page_size = 4096;
             dsm_msg.msg_id = 1001;
             
-            printf("Starting complete page merge workflow...\n");
+            PRINT("Starting complete page merge workflow...\n");
             
             // Call the complete workflow function
             if (complete_page_merge_workflow(restored_pid, uffd, &dsm_msg, conn->fd_handler) != 0) {
-                printf("❌ Complete page merge workflow failed\n");
+                PRINT("❌ Complete page merge workflow failed\n");
                 return;
             }
             
-            printf("✅ Complete page merge workflow finished successfully\n");
+            PRINT("✅ Complete page merge workflow finished successfully\n");
         }else if( choice == 69 ){
             unsigned long input_addr;
-            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            PRINT("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
             fflush(stdout);
             if (scanf("%lx", &input_addr) != 1) {
                 fprintf(stderr, "❌ Invalid input\n");
                 kill_and_exit(restored_pid);
-            }printf("[DSM] Address entered: %lx \n",input_addr );
+            }PRINT("[DSM] Address entered: %lx \n",input_addr );
             
             
-            printf("\n🔄 COMPLETE PAGE MERGE WORKFLOW TEST\n");
-            printf("====================================\n");
-            printf("Target address: 0x%lx\n", input_addr);
-            printf("Workflow: Compare → OR Merge → Fill Local\n\n");
+            PRINT("\n🔄 COMPLETE PAGE MERGE WORKFLOW TEST\n");
+            PRINT("====================================\n");
+            PRINT("Target address: 0x%lx\n", input_addr);
+            PRINT("Workflow: Compare → OR Merge → Fill Local\n\n");
             
             // Prepare message for both local and remote requests
             dsm_msg.msg_type = MSG_GET_PAGE_DATA;
@@ -4452,15 +4461,15 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             dsm_msg.page_size = 4096;
             dsm_msg.msg_id = 1001;
             
-            printf("Starting complete page merge workflow...\n");
+            PRINT("Starting complete page merge workflow...\n");
             
             // Call the complete workflow function
             if (complete_page_merge_workflow(restored_pid, uffd, &dsm_msg, conn->fd_handler) != 0) {
-                printf("❌ Complete page merge workflow failed\n");
+                PRINT("❌ Complete page merge workflow failed\n");
                 return;
             }
             
-            printf("✅ Complete page merge workflow finished successfully\n");
+            PRINT("✅ Complete page merge workflow finished successfully\n");
             // Mark page as SHARED and owned by both
             if(  update_page_info(input_addr, -1, SHARED, -2) != 0) kill_and_exit(restored_pid);
             disable_wp( uffd, (void *) input_addr); 
@@ -4482,7 +4491,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
         }else if (choice == 74) {
             // ACTUAL GET PAGE DATA WITH WRITE ON LOCAL ONE
             unsigned long input_addr;
-            printf("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
+            PRINT("[DSM] Enter address to dump (in hex, e.g. 0x555555559380): ");
             fflush(stdout);
             if (scanf("%lx", &input_addr) != 1) {
                 fprintf(stderr, "❌ Invalid input\n");
@@ -4490,7 +4499,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
                 continue;
             }
 
-            printf("[DSM] Address entered: 0x%lx\n", input_addr);
+            PRINT("[DSM] Address entered: 0x%lx\n", input_addr);
 
             dsm_msg.msg_type = MSG_GET_PAGE_DATA;
             dsm_msg.page_addr = input_addr;
@@ -4501,7 +4510,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             // 1️⃣ Get remote page content
             // =====================================
             if (send_get_page(dsm_msg, conn->fd_handler, page_data) == 0) {
-                printf("✅ Remote page received successfully.\n");
+                PRINT("✅ Remote page received successfully.\n");
 
                 // Print preview of the received page (optional)
                 //print_global_value_from_page(page_data, sizeof(page_data));
@@ -4509,15 +4518,15 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
                 // =====================================
                 // 2️⃣ Copy into local address
                 // =====================================
-                printf("\n[DSM] Writing remote page data into local memory...\n");
+                PRINT("\n[DSM] Writing remote page data into local memory...\n");
                 //disable_wp( uffd, (void *) input_addr);
                 //memcpy((void *)input_addr, page_data, PAGE_SIZE);
                 if( fill_local_page_uffdio(uffd, input_addr, page_data, restored_pid) ){
-                    printf("❌ Failed to update local page at 0x%lx\n", input_addr);
+                    PRINT("❌ Failed to update local page at 0x%lx\n", input_addr);
                     continue;
                 }
                 if( update_page_info(input_addr, -1, SHARED, -2) != 0) kill_and_exit(restored_pid); // Mark page as SHARED and owned by both, if fail, exit and kill
-                printf("✅ Successfully updated local page at 0x%lx\n", input_addr);
+                PRINT("✅ Successfully updated local page at 0x%lx\n", input_addr);
 
             }
         }else if (choice == 8) {
@@ -4529,7 +4538,7 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
             if (send_get_page(dsm_msg, conn->fd_handler, page_data) == 0) {
                 print_global_value_from_page(page_data, sizeof(page_data));
             }
-            printf("[SERVER] Sent MSG_GET_PAGE_DATA_INVALID to server.\n");
+            PRINT("[SERVER] Sent MSG_GET_PAGE_DATA_INVALID to server.\n");
 		} else if (choice == 9) {
 			// SIMULATE INVALIDATE
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
@@ -4537,50 +4546,50 @@ void command_loop(int restored_pid, int uffd, struct dsm_connection* conn) {
 			dsm_msg.page_size = 4096;
 			dsm_msg.msg_id = 1001;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[SERVER] Sent MSG_SEND_INVALIDATE to server.\n");
+			PRINT("[SERVER] Sent MSG_SEND_INVALIDATE to server.\n");
 		}else if (choice == 10) {
 			dsm_msg.msg_type = MSG_WAKE_THREAD;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[SERVER] Sent MSG_WAKE_THREAD to server.\n");
+			PRINT("[SERVER] Sent MSG_WAKE_THREAD to server.\n");
 		}else if (choice == 11) {
 			dsm_msg.msg_type = MSG_STOP_THREAD;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[SERVER] Sent MSG_STOP_THREAD to server.\n");
+			PRINT("[SERVER] Sent MSG_STOP_THREAD to server.\n");
 		}else if (choice == 12) {
             //vmsplice test
-			printf("Print mutex content test at %p\n", (void *)0x0c0);
+			PRINT("Print mutex content test at %p\n", (void *)0x0c0);
 			//Prepare dsm_msg
 			dsm_msg.msg_type = MSG_SEND_INVALIDATE;
 			dsm_msg.page_addr = aligned;
-			printf("Do vmsplice test at page %p\n", (void *)dsm_msg.page_addr);
+			PRINT("Do vmsplice test at page %p\n", (void *)dsm_msg.page_addr);
 			dsm_msg.msg_id = 1;
 			test_mutex_content(restored_pid, uffd, &dsm_msg);
         }else if (choice == 13){
-			printf("Change mutex content %p\n", (void *)0x5555555580c0);
+			PRINT("Change mutex content %p\n", (void *)0x5555555580c0);
 			runUnlockMutex(restored_pid, (void *)0x5555555580c0);
         }else if (choice == 55){
-            printf("Barrier, releasing...\n");
+            PRINT("Barrier, releasing...\n");
             pthread_mutex_lock(&barrier.lock);
             // mark that remote threads have arrived, this is useful if we come before the local threads have, 
             //so that we don't care if the signal was lost since we can check the variable
             remote_threads_barrier_arrived = 1; 
             pthread_cond_broadcast(&barrier.cond);
-			printf("Barrier released!\n");
+			PRINT("Barrier released!\n");
             pthread_mutex_unlock(&barrier.lock);
         }else if (choice == 56){
-            printf("Barrier, releasing...\n");
+            PRINT("Barrier, releasing...\n");
             pthread_mutex_lock(&barrier.lock);
             // mark that remote threads have arrived, this is useful if we come before the local threads have, 
             //so that we don't care if the signal was lost since we can check the variable
             remote_threads_barrier_arrived = 1; 
             pthread_cond_broadcast(&barrier.cond);
-			printf("Local Barrier released!\n");
+			PRINT("Local Barrier released!\n");
             dsm_msg.msg_type = MSG_BARRIER_RELEASE;
 			send(conn->fd_handler, &dsm_msg, sizeof(dsm_msg), 0);
-			printf("[SERVER] Sent MSG_BARRIER_RELEASE to client.\n");
+			PRINT("[SERVER] Sent MSG_BARRIER_RELEASE to client.\n");
             pthread_mutex_unlock(&barrier.lock);
         }else {
-            printf("[DSM] Unknown command: %d\n", choice);
+            PRINT("[DSM] Unknown command: %d\n", choice);
         }
     }
 }
@@ -4598,7 +4607,7 @@ void register_ranges_from_file(int uffd) {
     void *rdma_base;
 
     if (!f2) {
-        fprintf(stderr, "[dsm] /tmp/ranges.txt not found\n");
+        pr_perror("[dsm] /tmp/ranges.txt not found\n");
         return;
     }
 
@@ -4613,7 +4622,7 @@ void register_ranges_from_file(int uffd) {
 
         for (int i = 0; i < num_pages; i++) {
             unsigned long aux = start_address + i * page_size;
-            printf("Registering page %d at address %lx\n", i, aux);
+            PRINT("Registering page %d at address %lx\n", total_pages + i, aux);
             page_list_data[total_pages].saddr = aux;
             page_list_data[total_pages].owner_mask = (1ULL << (N_CLIENTS + 1)) - 1ULL; //all owners, starting shared
             page_list_data[total_pages].state = SHARED;
@@ -4623,7 +4632,7 @@ void register_ranges_from_file(int uffd) {
         }
 
         end_address = start_address + page_size * num_pages;
-        printf("/tmp/ranges.txt: start addr:%lx, end:%lx\n", start_address, end_address);
+        PRINT("/tmp/ranges.txt: start addr:%lx, end:%lx\n", start_address, end_address);
 
         register_region_with_uffd(uffd, (void *)start_address, page_size * num_pages);
         enable_region_wp(uffd, (void *)start_address, page_size * num_pages);

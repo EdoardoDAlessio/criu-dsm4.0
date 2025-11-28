@@ -31,7 +31,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
-#include "user.h"
+
+//#include "user.h"
 #include "page.h" //this takes the page size
 // Setup global variable address 
 extern unsigned long global_addr;
@@ -43,11 +44,43 @@ extern unsigned long global_addr;
 extern unsigned long aligned;
 int total_threads = 2; //total threads (local + remote)
 //Special PTHREAD traps DSM 
-
+struct dsm_connection conn;
 #include "dsm.h"
 #include "dsm_log.h"
 #include <stdbool.h>
 #include <time.h>
+
+
+int tids[MAX_THREADS];
+int num_remote_tids;
+#include <dirent.h>
+#include <ctype.h>
+
+int read_all_tids(int pid, int *tids, int max_tids)
+{
+    char path[256];
+	 int n = 0;
+    struct dirent *entry;
+
+	DIR *dir ;
+    snprintf(path, sizeof(path), "/proc/%d/task", pid);
+
+    dir = opendir(path);
+    if (!dir) return -1;
+
+   
+    while ((entry = readdir(dir))) {
+        if (entry->d_type == DT_DIR) {
+            if (isdigit(entry->d_name[0])) {
+                if (n < max_tids)
+                    tids[n++] = atoi(entry->d_name);
+            }
+        }
+    }
+
+    closedir(dir);
+    return n;  // number of tids
+}
 
 
 #if !RDMA_ENABLE 
@@ -172,6 +205,73 @@ int total_threads = 2; //total threads (local + remote)
 				#endif
 				continue;
 			}
+
+			else if (msg.arg.pagefault.address >= mutex_lock_start_address && msg.arg.pagefault.address < mutex_lock_end_address) {
+
+				dsm_msg.msg_type = MSG_LOCK_REQUEST;
+								
+				// Send invalidate request
+				if (send_all(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg)) != 0) {
+					perror("[CLIENT] Failed to send MSG_LOCK_REQUEST");
+					return NULL;
+				}
+				DSM_EVENT_HANDLER("[CLIENT] Sent MSG_LOCK_REQUEST to server. With address:0x%lx\n\r", msg.arg.pagefault.address);
+
+				switch ( all_read(p->fd_handler[0], &ack, 1) ) {
+					case -2:
+						fprintf(stderr, "[SERVER] Connection closed before ACK\n\r");
+						kill_and_exit(restored_pid);
+						break;
+					case -1:
+						perror("[SERVER] all_read(ACK) failed");
+						kill_and_exit(restored_pid);
+						break;
+					case 0: 
+						DSM_EVENT_HANDLER("[CLIENT] Lock granted! \n\r");
+						break;
+					default:
+						perror("Unknown value for handler all_read(ACK)\n\r");
+						kill_and_exit(restored_pid);
+						break;
+				}
+
+				/* At this point, this thread owns the lock. Resolve the fault. */
+
+				dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
+				if (dsm_msg.page_addr >= mutex_lock_end_address) {
+					dsm_msg.page_addr = mutex_lock_start_address;
+				}
+
+				enable_wp(uffd, (void *)dsm_msg.page_addr);              /* enable next lock page */
+				disable_wp(uffd, (void *)msg.arg.pagefault.address);     /* unlock current page */
+
+				continue;
+			}	
+
+		/* Local UNLOCK via page fault */
+		if (msg.arg.pagefault.address >= mutex_unlock_start_address && msg.arg.pagefault.address <  mutex_unlock_end_address) {
+
+			dsm_msg.msg_type = MSG_UNLOCK;
+							
+			// Send invalidate request
+			if (send_all(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg)) != 0) {
+				perror("[CLIENT] Failed to send MSG_UNLOCK");
+				return NULL;
+			}
+			DSM_EVENT_HANDLER("[CLIENT] Sent MSG_UNLOCK to server. With address:0x%lx\n\r", msg.arg.pagefault.address);
+
+
+			/* Move write-protect to next unlock page (if you’re rotating them) */
+			dsm_msg.page_addr = msg.arg.pagefault.address + PAGE_SIZE;
+			if (dsm_msg.page_addr >= mutex_unlock_end_address) {
+				dsm_msg.page_addr = mutex_unlock_start_address;
+			}
+
+			enable_wp(uffd, (void *)dsm_msg.page_addr);
+			disable_wp(uffd, (void *)msg.arg.pagefault.address);
+
+			continue;
+		}
 
 			//pthread_mutex_lock(&pagefaults_mutex);
 
@@ -1019,15 +1119,26 @@ void dsm_client_main_loop(int fd_command) {
 }
 #endif
 
+
+static void *dsm_thread_start(void *arg)
+{
+    int fd_cmd = *(int*)arg;
+    dsm_client_main_loop(fd_cmd);
+    return NULL;
+}
+
+
+
 /********************************* MAIN ***************************************/
 void start_dsm_client(const char *server_ip)
-{
+{	
+    pthread_t receiver_thread;
 	struct vm_area_list vmas = { .nr = 0};
-	struct dsm_connection conn;
 	pthread_t uffd_thread;
 	struct thread_param param;
 	int client_pipe[2], uffd_pipe[2]; 
 	FILE *f = fopen("/tmp/dsm_barrier_pages.txt", "r");
+	FILE *f_mutex = fopen("/tmp/dsm_mutex.txt", "r");
 	#if DEMO
 	unsigned long base_address;
 	#endif
@@ -1152,14 +1263,14 @@ void start_dsm_client(const char *server_ip)
 	qp_to_rtr_rts(z_data.qp,          &z_data.port_attr,          &remote_all.data,           z_data.psn,          sgid_idx, 1);
 
 
-	/* post RECVs (all three ready to receive) */
+	//* post RECVs (all three ready to receive) */
     post_one_recv(&z_handler);
     post_one_recv(&z_receiver);
     post_one_recv(&z_data);
 
     printf("[RDMA][CLIENT] triple handshake complete: handler=%u receiver=%u data=%u\n\r",
            z_handler.qp->qp_num, z_receiver.qp->qp_num, z_data.qp->qp_num);
-
+#if 0
 	{
 		char *buf;
 		int got = 0;
@@ -1272,7 +1383,7 @@ void start_dsm_client(const char *server_ip)
 			else            printf("[CLIENT] ❌ Handler still dirty (first=0x%02x)\n\r", p[0]);
 		}
 	}
-
+#endif
 
 
 
@@ -1458,6 +1569,8 @@ kill_and_exit(restored_pid);
 
 
 	read_proc_maps(restored_pid);
+	
+	num_remote_tids = read_all_tids(restored_pid, tids, MAX_THREADS);
 #if 0 //!EP
 	base_address = get_base_address(restored_pid);
 	register_all(uffd, restored_pid, base_address, &vmas, INVALID);
@@ -1508,6 +1621,31 @@ kill_and_exit(restored_pid);
 		enable_region_wp(uffd, (void*) barrier_start_address, page_size * num_pages);
 	}else{
 		fprintf(stderr, "[dsm] /tmp/dsm_barrier_pages.txt not found, no pthread barrier support\n\r");	
+	}
+
+	if( f_mutex ){
+		if (fscanf(f_mutex, "base=%lx page_size=%zu num_pages=%d\n", &mutex_lock_start_address, &page_size, &num_pages) != 3) {
+			PRINT( "[dsm] failed to parse mutex info file\n\r");
+		}		
+		mutex_lock_end_address = mutex_lock_start_address + page_size * num_pages;
+		PRINT("/tmp/dsm_mutex.txt: start addr:%lx, end:%lx\n\r", mutex_lock_start_address, mutex_lock_end_address);
+
+		register_region_with_uffd(uffd, (void*) mutex_lock_start_address, page_size * num_pages);
+		enable_region_wp(uffd, (void*) mutex_lock_start_address, page_size * num_pages);
+
+
+		if (fscanf(f_mutex, "base=%lx page_size=%zu num_pages=%d", &mutex_unlock_start_address, &page_size, &num_pages) != 3) {
+			PRINT( "[dsm] failed to parse mutex info file\n\r");
+		}
+		fclose(f_mutex);
+
+		mutex_unlock_end_address = mutex_unlock_start_address + page_size * num_pages;
+		PRINT("/tmp/dsm_mutex.txt: start addr:%lx, end:%lx\n\r", mutex_unlock_start_address, mutex_unlock_end_address);
+
+		register_region_with_uffd(uffd, (void*) mutex_unlock_start_address, page_size * num_pages);
+		enable_region_wp(uffd, (void*) mutex_unlock_start_address, page_size * num_pages);
+	}else{
+		PRINT( "[dsm] mutex info file not found, no pthread mutex support\n\r");	
 	}
 
 	
@@ -1565,11 +1703,44 @@ kill_and_exit(restored_pid);
 #elif COMMAND_LOOP
 	PRINT("[DSM Client] Connections established. Entering command loop\n\r");
 	command_loop(restored_pid, uffd, &conn);
-#elif 1
+#elif 0
 	PRINT("[DSM Client] Connection established. Entering main loop...\n\r");
     dsm_client_main_loop(conn.fd_command);
 	//if(!DBG) send_sigcont(restored_pid);
+#else
+	pthread_create(&receiver_thread, NULL, dsm_thread_start , &conn.fd_command);
+	pthread_detach(receiver_thread);
 #endif
+
+	{
+		
+		struct msg_info dsm_msg;
+		int ret;
+		struct pollfd pfd = { .fd = pidfd, .events = POLLIN };
+		PRINT("[DSM] Waiting for restored process %d to exit...\n\r", restored_pid);
+
+		ret = poll(&pfd, 1, -1);
+		if (ret > 0 && (pfd.revents & POLLIN))
+			PRINT("[DSM] Process %d exited.\n\r", restored_pid);
+
+		dsm_msg.msg_type = MSG_JOIN_THREAD;
+		
+		for( int i= 0; i<num_remote_tids; i++ ){
+			PRINT("send JOIN THREAD message for tid[%d]:%d\n\r", i, tids[i]);
+			dsm_msg.msg_id = tids[i];
+			if (send_all(conn.fd_handler, &dsm_msg, sizeof(dsm_msg)) != 0) {
+				perror("[CLIENT] Failed to send JOIN THREAD message SERVER");
+			}
+		}
+
+	#if RDMA_ENABLE
+		printf("RDMA MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
+	#else
+		printf("TCP MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
+	#endif
+		close(pidfd);
+	}
+
 
 	PRINT("Killing and exiting\n\r");
 	kill_and_exit(restored_pid);
