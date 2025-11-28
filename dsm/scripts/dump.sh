@@ -8,10 +8,13 @@ fi
 app=$1
 client=$2
 threads=$3
-
+rm -f /tmp/haltcode
+rm -f /tmp/ranges.txt
+rm -f /tmp/dsm_barrier_pages.txt
+rm -f /tmp/dsm_mutex.txt
 # Ensure the directory exists
 mkdir -p ~/${app}/images
-cp ~/criu/dsm/${app} ~/${app}
+cp ~/criu/dsm/test/${app} ~/${app}
 cd ~/${app}
 # Run the application with the specified number of threads
 sudo ./${app} "$threads" &
@@ -21,5 +24,4 @@ sleep 3
 sudo ~/criu/criu/criu dump -t "$(pidof $app)" --images-dir ~/${app}/images --shell-job -v 
 
 # Copy the entire app directory to the client machine after cleaning old imgages
-ssh ${client} "rm -rf ~/${app}"
-scp -r ~/${app} ${client}:~/
+scp -r ~/${app} "$client":

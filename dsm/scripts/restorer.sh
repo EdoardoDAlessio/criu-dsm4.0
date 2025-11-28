@@ -21,7 +21,7 @@ if [ "$3" == "--verbose" ]; then
   #Readelf for 
   echo "🚀 Saving readelf..."
 fi
-
+sudo pkill -9 -f "criu"
 
 cd ~/${app}
 readelf -s ./$app | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > /tmp/readelf.txt
@@ -32,9 +32,12 @@ sudo rm -r images
 cp -r backup images
 
 cd ~/${app}/images || { echo "Image directory not found"; exit 1; }
-cp ranges.txt /tmp/ranges.txt
-cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt
-
+sudo rm -f /tmp/ranges.txt
+sudo rm -f /tmp/dsm_barrier_pages.txt
+sudo rm -f /tmp/dsm_mutex.txt
+cp ranges.txt /tmp/ranges.txt > /dev/null 2>&1 || true
+cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt > /dev/null 2>&1 || true
+cp dsm_mutex.txt  /tmp/dsm_mutex.txt > /dev/null 2>&1 || true
 # Apply thread filtering
 if [ "$3" == "--verbose" ]; then
   python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" 
@@ -62,5 +65,5 @@ if [ -n "$defunct_pid" ]; then
 fi
 
 
-sudo ~/criu/criu/criu restore --shell-job --dsm_client 128.110.217.45 $verbose_flag
+sudo ~/criu/criu/criu restore --shell-job --dsm_client 128.110.219.21 $verbose_flag
 rm -f /tmp/.restore_flag 

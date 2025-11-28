@@ -1,11 +1,12 @@
+
 #!/bin/bash
 
 # CRIU DSM Server Toggle Script
 # Toggles ENABLE_SERVER between 0 and 1 in dsm.h and recompiles CRIU
 # Usage: ./criu_toggle_server.sh [0|1|toggle] [--clean]
 
-DSM_HEADER="/users/EdoDale/criu/criu/include/dsm.h"
-CRIU_DIR="/users/EdoDale/criu"
+DSM_HEADER="$HOME/criu/criu/include/dsm.h"
+CRIU_DIR="$HOME/criu"
 
 # Parse arguments
 CLEAN_BUILD=false
