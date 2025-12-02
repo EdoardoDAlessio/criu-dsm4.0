@@ -1,0 +1,36 @@
+########## PATHS ##########
+
+# Location of the source benchmark
+APP_SOURCE_DIR="$HOME/phoenix/phoenix-2.0/tests/string_match"
+
+# Executable (must exist inside APP_SOURCE_DIR)
+APP_EXEC="string_match-dsm"
+
+########## RUN PARAMS ##########
+
+
+# Arguments passed to the binary
+APP_ARGS="/users/EdoDale/phoenix/phoenix-2.0/tests/input/string_match_datafiles/key_file_500MB.txt 10"
+
+# Additional input files required for correct execution (optional)
+APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
+
+# Warm up time before CRIU dump
+APP_WARMUP=5
+
+########## CLIENT MACHINES ##########
+CLIENTS=("dsm_client")
+
+# Number of threads for DSM (main thread count)
+APP_THREADS=64
+
+########## RESTORE / SPLIT CONFIGS ##########
+CONFIGS=(
+    "base            0-63    -       0   tcp"
+    "split16_16_tcp  0-31    32-63   1   tcp"
+    "split16_16_rdma 0-31    32-63   1   rdma"
+)
+
+########## SCRIPT PATHS ##########
+SCRIPTS="$HOME/criu/dsm/scripts"
+THREAD_FILTER="$SCRIPTS/thread_filter_ranged.py"

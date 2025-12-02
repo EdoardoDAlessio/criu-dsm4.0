@@ -1,46 +1,49 @@
 #!/bin/bash
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  echo "Usage: $0 <app name> <thread range e.g. 1-6> [--verbose]"
+if [ "$#" -lt 3 ] || [ "$#" -gt 5 ]; then
+  echo "Usage: $0 <app name> <thread range e.g. 1-6> <n_clients> [--verbose] [--rdma]"
   exit 1
 fi
 
 app=$1
 range=$2
-verbose_flag=""
+clients=$3
 first=$(echo "$range" | cut -d'-' -f1)
 second=$(echo "$range" | cut -d'-' -f2)
 gap=$((second - first + 1))
 
-if [ "$3" == "--verbose" ]; then
-  verbose_flag="-v"
-  echo "🚀 Saving readelf..."
-fi
+verbose_flag=""
+rdma_flag=""
 
-sudo kill -9 $(pidof criu) 2>/dev/null || true
-sudo kill -9 $(pidof "$app") 2>/dev/null || true
+for arg in "$4" "$5"; do
+  case "$arg" in
+    --verbose) verbose_flag="-v" ;;
+    --rdma)    rdma_flag="--dsm-rdma-enable" ;;
+  esac
+done
+
+
+
+#sudo pkill -9 -f "criu" > /dev/null 2>&1
+#sudo pkill -9 -f "${app}" > /dev/null 2>&1
 
 # Change to app folder and dump readelf
 cd ~/"${app}" || { echo "App directory not found"; exit 1; }
-readelf -s "./$app" | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > /tmp/readelf.txt
+
+
 sudo rm -f /tmp/ranges.txt
 sudo rm -f /tmp/dsm_barrier_pages.txt
 sudo rm -f /tmp/dsm_mutex.txt
-
 sudo rm -rf images
+
 cp -r backup images
 
 # Go to images directory
 cd ~/"${app}/images" || { echo "Image directory not found"; exit 1; }
-cp ranges.txt /tmp/ranges.txt
-cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt
-cp dsm_mutex.txt /tmp/dsm_mutex.txt
-# Apply thread filtering (range passed directly)
-if [ "$3" == "--verbose" ]; then
-  python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range"
-else
-  python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" > /dev/null 2>&1
-fi
+cp ranges.txt /tmp/ranges.txt > /dev/null 2>&1 || true
+cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt > /dev/null 2>&1 || true
+cp dsm_mutex.txt /tmp/dsm_mutex.txt > /dev/null 2>&1 || true
+
 
 # Remove previous PID file
 sudo rm -f /tmp/criu-restored.pid
@@ -65,6 +68,14 @@ touch /tmp/haltcode
 
 #script -q -c "sudo ~/criu/criu/criu restore --shell-job --dsm_server $verbose_flag" /dev/null
 
-sudo ~/criu/criu/criu restore --shell-job --dsm_server $verbose_flag
+#sudo ~/criu/criu/criu restore --shell-job --dsm_server $clients $rdma_flag $verbose_flag
 
+#sudo ~/criu/criu/criu restore --shell-job --dsm_server "$clients" $rdma_flag $verbose_flag
 
+cmd=(sudo ~/criu/criu/criu restore --shell-job --dsm_server "$clients")
+
+[ -n "$rdma_flag" ] && cmd+=("$rdma_flag")
+[ -n "$verbose_flag" ] && cmd+=("$verbose_flag")
+
+echo "Running: ${cmd[@]}"
+"${cmd[@]}"

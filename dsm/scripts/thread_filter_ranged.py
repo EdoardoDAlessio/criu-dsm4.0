@@ -27,7 +27,10 @@ with open("pstree.img", "rb") as f:
 
 threads_list = pstree_object['entries'][0]['threads']
 n_threads = len(threads_list)
-
+# Exit if full-range restore
+if RANGE_START == 0 and RANGE_END >= n_threads - 1:
+    print(f"[INFO] Full restore requested ({n_threads} threads). Skipping filtering.")
+    sys.exit(0)
 # Clamp range
 if RANGE_START < 0:
     RANGE_START = 0

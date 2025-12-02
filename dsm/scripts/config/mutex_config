@@ -1,0 +1,35 @@
+########## PATHS ##########
+
+# Location of the source benchmark
+APP_SOURCE_DIR="$HOME/phoenix/phoenix-2.0/tests/histogram"
+
+# Executable (must exist inside APP_SOURCE_DIR)
+APP_EXEC="histogram-dsm"
+
+########## RUN PARAMS ##########
+
+# Arguments passed to the binary
+APP_ARGS="/dev/shm/random.bmp 1"
+
+# Additional input files required for correct execution (optional)
+APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
+
+# Warm up time before CRIU dump
+APP_WARMUP=5
+
+########## CLIENT MACHINES ##########
+CLIENTS=("dsm_client")
+
+# Number of threads for DSM (main thread count)
+APP_THREADS=8
+
+########## RESTORE / SPLIT CONFIGS ##########
+CONFIGS=(
+    "base            0-7    -       0   tcp"
+    "split16_16_tcp  0-3    4-7   1   tcp"
+    "split16_16_rdma 0-3    4-7   1   rdma"
+)
+
+########## SCRIPT PATHS ##########
+SCRIPTS="$HOME/criu/dsm/scripts"
+THREAD_FILTER="$SCRIPTS/thread_filter_ranged.py"
