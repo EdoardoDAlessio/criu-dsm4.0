@@ -1,26 +1,28 @@
 #!/bin/bash
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  echo "Usage: $0 <app name> <thread range e.g. 1-6> [--verbose]"
+if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
+  echo "Usage: $0 <app name> <thread range e.g. 1-6> [--verbose] [--rdma]"
   exit 1
 fi
 
 app=$1
 range=$2
-verbose_flag=""
 first=$(echo "$range" | cut -d'-' -f1)
 second=$(echo "$range" | cut -d'-' -f2)
 gap=$((second - first + 1))
 echo "First:  $first"
 echo "Second: $second"
 echo "Gap:    $gap"
+verbose_flag=""
+rdma_flag=""
 
-if [ "$3" == "--verbose" ]; then
-  verbose_flag="-v"
+for arg in "$3" "$4"; do
+  case "$arg" in
+    --verbose) verbose_flag="-v" ;;
+    --rdma)    rdma_flag="--dsm-rdma-enable" ;;
+  esac
+done
 
-  #Readelf for 
-  echo "🚀 Saving readelf..."
-fi
 sudo pkill -9 -f "criu"
 
 cd ~/${app}
@@ -39,11 +41,12 @@ cp ranges.txt /tmp/ranges.txt > /dev/null 2>&1 || true
 cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt > /dev/null 2>&1 || true
 cp dsm_mutex.txt  /tmp/dsm_mutex.txt > /dev/null 2>&1 || true
 # Apply thread filtering
-if [ "$3" == "--verbose" ]; then
+if [ "$verbose_flag" == "-v" ]; then
   python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" 
 else
   python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" > /dev/null 2>&1
 fi
+
 
 # Remove previous PID file
 sudo rm -f /tmp/criu-restored.pid
@@ -65,5 +68,5 @@ if [ -n "$defunct_pid" ]; then
 fi
 
 
-sudo ~/criu/criu/criu restore --shell-job --dsm_client 128.110.219.21 $verbose_flag
+sudo ~/criu/criu/criu restore --shell-job --dsm_client 128.110.219.21 $verbose_flag $rdma_flag
 rm -f /tmp/.restore_flag 

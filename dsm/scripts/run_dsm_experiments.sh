@@ -10,8 +10,8 @@ if [ $# -ne 1 ]; then
 fi
 
 APP="$1"
-CONFIG_DIR="$SCRIPTS/config"
-CONFIG_FILE="${APP}_config"
+CONFIG_DIR="$(dirname "$0")/config"
+CONFIG_FILE="$CONFIG_DIR/${APP}_config"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "❌ Missing config file: $CONFIG_FILE"
@@ -20,6 +20,50 @@ fi
 
 # Load ALL app-specific information
 source "$CONFIG_FILE"
+
+
+##############################
+# PARSE CONFIG LINE (NEW FORMAT)
+##############################
+
+# Tokenize the first config line
+read -ra TOK <<< "${CONFIGS[0]}"
+
+# Format:
+#   NAME  N_CLIENTS  MAIN_RANGE  CLIENT_RANGES...  MODE
+#
+# Example:
+#   split4_2_2_tcp  2 0-3 4-5 6-7 tcp
+
+CONF_NAME="${TOK[0]}"
+N_CLIENTS="${TOK[1]}"
+
+MODE="${TOK[-1]}"   # last token
+
+MAIN_RANGE="${TOK[2]}"
+
+# Extract client ranges dynamically
+C_RANGE=()
+for ((i=0; i<N_CLIENTS; i++)); do
+    C_RANGE+=("${TOK[$((3 + i))]}")
+done
+
+FLAGCLIENT="$MODE"
+
+
+echo "======================================"
+echo " Loaded config: $CONFIG_FILE"
+echo "======================================"
+
+echo "CONF_NAME   = $CONF_NAME"
+echo "N_CLIENTS   = $N_CLIENTS"
+echo "MAIN_RANGE  = $MAIN_RANGE"
+echo "C_RANGE     = ${C_RANGE[*]}"
+echo "MODE        = $MODE"
+echo "FLAGCLIENT  = $FLAGCLIENT"
+
+echo "======================================"
+sleep 1
 
 # Threads come from config
 THREADS="$APP_THREADS"
@@ -111,18 +155,45 @@ sudo rm -f /tmp/ranges.txt /tmp/dsm_barrier_pages.txt /tmp/dsm_mutex.txt
 PIDS=()
 
 for cfg in "${CONFIGS[@]}"; do
-    read -r LABEL S_RANGE C_RANGE N_CLIENTS PROTO <<< "$cfg"
+    ##########################################
+    ### PARSE CONFIG LINE (NEW FORMAT)
+    ##########################################
 
-    echo ""
-    echo "=========== $LABEL ==============="
+    # Tokenize line
+    read -ra TOK <<< "$cfg"
 
-    #FLAGCLIENT="--verbose"
+    # Format:
+    #   NAME  N_CLIENTS  MAIN_RANGE  C0 C1 ...  MODE
+    #
+    # Example:
+    #   split4_2_2_tcp  2 0-3 4-5 6-7 tcp
+
+    CONF_NAME="${TOK[0]}"
+    N_CLIENTS="${TOK[1]}"
+    MAIN_RANGE="${TOK[2]}"
+    MODE="${TOK[-1]}"   # last token
+
+    # Extract client ranges
+    C_RANGE=()
+    for ((i=0; i<N_CLIENTS; i++)); do
+        C_RANGE+=("${TOK[$((3 + i))]}")
+    done
+
+ 
     #FLAGSERVER="--verbose"
     FLAGSERVER=""
     FLAGCLIENT=""
+    FLAGCLIENT="--verbose"
     [[ "$PROTO" == "rdma" ]] && FLAGSERVER="$FLAGSERVER --dsm-rdma-enable"
     [[ "$PROTO" == "rdma" ]] && FLAGCLIENT="$FLAGCLIENT --rdma"
 
+    echo ""
+    echo "=========== $CONF_NAME ==============="
+    echo "N_CLIENTS   = $N_CLIENTS"
+    echo "MAIN_RANGE  = $MAIN_RANGE"
+    echo "C_RANGE     = ${C_RANGE[*]}"
+    echo "MODE        = $MODE"
+    echo ""
     ##########################################
     ### FILTER IMAGES
     ##########################################
@@ -133,7 +204,7 @@ for cfg in "${CONFIGS[@]}"; do
     cp -r ~/"$APP"/backup/ ~/"$APP"/images/
 
     cd ~/"$APP"/images
-    python3 "$THREAD_FILTER" "$S_RANGE"
+    python3 "$THREAD_FILTER" "$MAIN_RANGE"
 
     t3b=$(date +%s.%N)
     filter_time=$(echo "$t3b - $t3a" | bc -l)
@@ -149,8 +220,8 @@ for cfg in "${CONFIGS[@]}"; do
             /tmp/criu-restored.pid /tmp/dsm_exec_time_sec \
             /tmp/restored_threads.txt /tmp/authorized_barrier_thread.txt
 
-    first=$(echo "$S_RANGE" | cut -d'-' -f1)
-    second=$(echo "$S_RANGE" | cut -d'-' -f2)
+    first=$(echo "$MAIN_RANGE" | cut -d'-' -f1)
+    second=$(echo "$MAIN_RANGE" | cut -d'-' -f2)
     gap=$((second - first + 1))
 
     echo "$gap"   | sudo tee /tmp/restored_threads.txt >/dev/null
@@ -167,7 +238,7 @@ for cfg in "${CONFIGS[@]}"; do
     touch /tmp/haltcode
     RESTORE_CMD="sudo ~/criu/criu/criu restore --shell-job --dsm_server $N_CLIENTS"
     [[ "$PROTO" == "rdma" ]] && RESTORE_CMD+=" --dsm-rdma-enable"
-    #RESTORE_CMD+=" -v"
+    RESTORE_CMD+=" -v"
 
     script -q -c "$RESTORE_CMD" /dev/null &
     RESTORE_PID=$!
@@ -176,18 +247,22 @@ for cfg in "${CONFIGS[@]}"; do
     ### 3) LAUNCH CLIENT SIDE IF NEEDED
     ##############################################
     PIDS=()
-    if [[ "$N_CLIENTS" -ge 1 ]]; then
-        C1="${CLIENTS[0]}"
-        echo "[CLIENT] Starting restore on $C1..."
+    
+    if (( N_CLIENTS > 0 )); then
+        for (( cid=0; cid<N_CLIENTS; cid++ )); do
+            CLIENT_HOST="${CLIENTS[$cid]}"
+            echo "[CLIENT-$cid] Starting restore on $CLIENT_HOST..."
 
-       ssh -tt "$C1" "
-    cd ~/criu/dsm/scripts || exit 1
-    source ~/venv-criu/bin/activate || true
-    ./restorer.sh $APP $C_RANGE $FLAGCLIENT
-" &
+            ssh -tt "$CLIENT_HOST" "
+                cd ~/criu/dsm/scripts || exit 1
+                source ~/venv-criu/bin/activate || true
+                ./restorer.sh $APP ${C_RANGE[$cid]} $FLAGCLIENT
+            " &
 
-        PIDS+=($!)
+            PIDS+=($!)
+        done
     fi
+
 
     wait $RESTORE_PID
     t5=$(date +%s.%N)
