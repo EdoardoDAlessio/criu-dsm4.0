@@ -42,8 +42,7 @@ static inline uint64_t to64(uint64_t v){
 }
 
 static void die(const char *msg){ perror(msg); exit(EXIT_FAILURE); }
-static void xassert(bool cond, const char *msg){ if(!cond){ fprintf(stderr, "FATAL: %s
-", msg); exit(EXIT_FAILURE);} }
+static void xassert(bool cond, const char *msg){ if(!cond){ fprintf(stderr, "FATAL: %s", msg); exit(EXIT_FAILURE);} }
 
 // ---------- TCP bootstrap ----------
 static int tcp_listen(const char *ip, const char *port){
@@ -51,8 +50,7 @@ static int tcp_listen(const char *ip, const char *port){
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_PASSIVE;
     struct addrinfo *res = NULL, *it = NULL; int sfd=-1; int yes=1;
     int rc = getaddrinfo(ip, port, &hints, &res);
-    if(rc){ fprintf(stderr, "getaddrinfo: %s
-", gai_strerror(rc)); exit(1); }
+    if(rc){ fprintf(stderr, "getaddrinfo: %s", gai_strerror(rc)); exit(1); }
     for(it=res; it; it=it->ai_next){
         sfd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if(sfd<0) continue;
@@ -70,8 +68,7 @@ static int tcp_connect(const char *ip, const char *port){
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     struct addrinfo *res = NULL, *it = NULL; int sfd=-1;
     int rc = getaddrinfo(ip, port, &hints, &res);
-    if(rc){ fprintf(stderr, "getaddrinfo: %s
-", gai_strerror(rc)); exit(1); }
+    if(rc){ fprintf(stderr, "getaddrinfo: %s", gai_strerror(rc)); exit(1); }
     for(it=res; it; it=it->ai_next){
         sfd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if(sfd<0) continue;
@@ -150,8 +147,7 @@ static void pick_device_and_port(struct RDMA *r){
     }
     if (!r->sgid.raw[0] && !r->sgid.raw[1]) { ibv_query_gid(r->ctx, r->port_num, 0, &r->sgid); r->gid_index = 0; }
 
-    fprintf(stderr, "[RDMA] device=%s port=%u link=%s active_mtu=%d LID=0x%04x GID-idx=%u
-",
+    fprintf(stderr, "[RDMA] device=%s port=%u link=%s active_mtu=%d LID=0x%04x GID-idx=%u",
             ibv_get_device_name(list[0]), r->port_num, r->link_layer_ether?"ETH":"IB",
             r->port_attr.active_mtu, r->lid, r->gid_index);
 
@@ -279,33 +275,26 @@ static void do_handshake(int sock, struct RDMA *r, int is_server){
         memcpy(r->mr1_buf, PING, 5);
         post_rdma_write(r, r->remote.mr0_addr, r->remote.mr0_rkey, r->mr1_buf, 5);
         wait_one_completion(r);
-        fprintf(stderr, "[RDMA] Server wrote PING → remote MR0
-");
+        fprintf(stderr, "[RDMA] Server wrote PING → remote MR0");
         volatile char *ctrl = (volatile char*)r->mr0_buf;
-        fprintf(stderr, "[RDMA] Server waiting for PONG in local MR0...
-");
+        fprintf(stderr, "[RDMA] Server waiting for PONG in local MR0...");
         while (strncmp((const char*)ctrl, PONG, 4) != 0) { sched_yield(); }
-        fprintf(stderr, "[RDMA] Server received PONG in MR0. Handshake OK.
-");
+        fprintf(stderr, "[RDMA] Server received PONG in MR0. Handshake OK.");
     } else {
         volatile char *ctrl = (volatile char*)r->mr0_buf;
-        fprintf(stderr, "[RDMA] Client waiting for PING in local MR0...
-");
+        fprintf(stderr, "[RDMA] Client waiting for PING in local MR0...");
         while (strncmp((const char*)ctrl, PING, 4) != 0) { sched_yield(); }
-        fprintf(stderr, "[RDMA] Client got PING. Writing PONG back...
-");
+        fprintf(stderr, "[RDMA] Client got PING. Writing PONG back...");
         memcpy(r->mr1_buf, PONG, 5);
         post_rdma_write(r, r->remote.mr0_addr, r->remote.mr0_rkey, r->mr1_buf, 5);
         wait_one_completion(r);
-        fprintf(stderr, "[RDMA] Client wrote PONG → remote MR0. Handshake OK.
-");
+        fprintf(stderr, "[RDMA] Client wrote PONG → remote MR0. Handshake OK.");
     }
 }
 
 int main(int argc, char **argv){
     if(argc != 4){
-        fprintf(stderr, "Usage: %s <role 0=server 1=client> <ip> <port>
-", argv[0]);
+        fprintf(stderr, "Usage: %s <role 0=server 1=client> <ip> <port>", argv[0]);
         return 1;
     }
     srand((unsigned)time(NULL));
@@ -321,15 +310,12 @@ int main(int argc, char **argv){
         sock = accept(lfd, (struct sockaddr *)&peer, &pl);
         if (sock < 0) die("accept");
         close(lfd);
-        fprintf(stderr, "[CTRL] Accepted TCP from %s:%u
-", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
+        fprintf(stderr, "[CTRL] Accepted TCP from %s:%u", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
     } else if (role == 1) {
         sock = tcp_connect(ip, port);
-        fprintf(stderr, "[CTRL] Connected to %s:%s
-", ip, port);
+        fprintf(stderr, "[CTRL] Connected to %s:%s", ip, port);
     } else {
-        fprintf(stderr, "role must be 0 or 1
-");
+        fprintf(stderr, "role must be 0 or 1");
         return 1;
     }
 
@@ -347,8 +333,7 @@ int main(int argc, char **argv){
     memset(r.mr1_buf, 0, r.mr1_len);
     do_handshake(sock, &r, role == 0);
 
-    fprintf(stderr, "[CTRL] TCP control link open on fd=%d. Press ENTER to exit.
-", sock);
+    fprintf(stderr, "[CTRL] TCP control link open on fd=%d. Press ENTER to exit.", sock);
     getchar();
 
     close(sock);

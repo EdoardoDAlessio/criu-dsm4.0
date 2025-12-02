@@ -47,6 +47,7 @@ extern int restored_pid;
 extern int local_threads;
 extern int pidfd;
 extern int fault_counter;
+extern int rdma_on;
 /****************** Enums ******************/
 
 enum msg_type {
@@ -66,7 +67,12 @@ enum msg_type {
     MSG_UNLOCK,
     MSG_JOIN_THREAD,
     MSG_GRANT_LOCK,
+    MSG_TYPE_MAX,
 };
+
+extern unsigned long long dsm_incoming[MSG_TYPE_MAX];   // messages received
+extern unsigned long long dsm_outgoing[MSG_TYPE_MAX];   // messages sent
+extern unsigned long long dsm_forwarded[MSG_TYPE_MAX];  // messages forwarded (special case)
 
 
 typedef enum {
@@ -94,7 +100,7 @@ struct thread_param {
     int uffd;
     int server_pipe;      // read end for handler
     int uffd_pipe;        // write end for handler
-    int fd_handler[N_CLIENTS];
+    int *fd_handler;
 };
 
 typedef struct {
@@ -168,6 +174,11 @@ extern unsigned long active_fault_addr;
 extern int active_fault_tid;
 extern struct vm_area_list* my_vm_area_list;
 extern unsigned long start_address, end_address;
+
+extern long start_time; 
+extern long end_time;
+
+long time_now_us(void);
 /****************** Function Declarations ******************/
 void mark_fault_start(unsigned long addr, const char *who, pid_t tid);
 void mark_fault_end(unsigned long addr, const char *who, pid_t tid);
@@ -306,7 +317,8 @@ typedef struct {
     rdma_wire_all remote_all;  // what client sends back
 }rdma_endpoint;
 
-extern rdma_endpoint endpoints[N_CLIENTS];
+extern rdma_endpoint *endpoints;
+
 
 /* ---------------- Global rdma decl ---------------- */
 extern rdma_context z_handler, z_receiver, z_data;

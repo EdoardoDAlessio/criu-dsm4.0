@@ -76,6 +76,13 @@ page_list page_list_data[MAX_PAGE_COUNT];
 int total_pages = 0;
 int uffd, restored_pid, local_threads, pidfd;
 int fault_counter = 0;
+
+unsigned long long dsm_incoming[MSG_TYPE_MAX];   // messages received
+unsigned long long dsm_outgoing[MSG_TYPE_MAX];   // messages sent
+unsigned long long dsm_forwarded[MSG_TYPE_MAX];  // messages forwarded (special case)
+
+
+int rdma_on = 0;
 /*
 unsigned long global_addr = 0x5555555580c0;
 unsigned long aligned = 0x5555555580c0 & ~(PAGE_SIZE - 1);
@@ -88,6 +95,17 @@ void barrier_init(void) {
     pthread_cond_init(&barrier.cond, NULL);
 }
 
+
+#include <stdio.h>
+#include <time.h>
+long start_time; 
+long end_time;
+
+long time_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000;
+}
 
 #if RDMA_ENABLE
 
@@ -104,7 +122,7 @@ rdma_context z_handler, z_receiver, z_data;
 rdma_context z_handler_data, z_receiver_data;
 rdma_wire_all local_all;
 rdma_wire_all remote_all;
-rdma_endpoint endpoints[N_CLIENTS];
+rdma_endpoint *endpoints = NULL;
 
 int readn_all_exact(int fd, void *buf, size_t n)
 {

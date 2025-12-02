@@ -419,6 +419,11 @@ void init_opts(void)
 	INIT_LIST_HEAD(&opts.new_cgroup_roots);
 	INIT_LIST_HEAD(&opts.irmap_scan_paths);
 
+	opts.is_dsm_server = false;
+	opts.dsm_server_ip = NULL;
+	opts.dsm_n_clients = 0;
+	opts.dsm_rdma_enable = 0;
+
 	opts.cpu_cap = CPU_CAP_DEFAULT;
 	opts.manage_cgroups = CG_MODE_DEFAULT;
 	opts.ps_socket = -1;
@@ -619,9 +624,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 
 	static const char short_opts[] = "dSsRt:hD:o:v::x::Vr:jJ:lW:L:M:";
 	static struct option long_opts[] = {
-		{ "dsm_server", no_argument, 0, 2001 },
+		{ "dsm_server", required_argument, 0, 2001 },
     	{ "dsm_client", required_argument, 0, 2002 },
-
+		{ "dsm-rdma-enable", no_argument, 0, 2003 },
 		{ "tree", required_argument, 0, 't' },
 		{ "leave-stopped", no_argument, 0, 's' },
 		{ "leave-running", no_argument, 0, 'R' },
@@ -1056,12 +1061,21 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			return 2;
 
 		case 2001:
+			// --dsm-server <n_clients>
 			opts.is_dsm_server = true;
+			opts.dsm_n_clients = atoi(optarg);
+			if (opts.dsm_n_clients < 0) {
+				pr_err("Invalid value for --dsm-server: %s\n", optarg);
+				return 1;
+			}
 			break;
 		case 2002:
 			SET_CHAR_OPTS(dsm_server_ip, optarg);
 			break;
-
+		case 2003:
+			// --dsm-rdma-enable
+			opts.dsm_rdma_enable = 1;
+			break;
 		default:
 			return 2;
 		}
@@ -1144,6 +1158,12 @@ int check_options(void)
 		pr_err("Error: namespace flags conflict\n");
 		return 1;
 	}
+
+	if (opts.is_dsm_server && opts.dsm_server_ip) {
+		pr_err("Cannot use --dsm-server and --dsm-client together.\n");
+		return 1;
+	}
+
 
 	return 0;
 }

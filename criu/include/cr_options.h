@@ -127,6 +127,8 @@ enum criu_mode {
 struct cr_options {
 	bool is_dsm_server;
 	char* dsm_server_ip;
+	int dsm_n_clients;
+	int dsm_rdma_enable;
 	int final_state;
 	int check_extra_features;
 	int check_experimental_features;

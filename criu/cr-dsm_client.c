@@ -83,7 +83,7 @@ int read_all_tids(int pid, int *tids, int max_tids)
 }
 
 
-#if !RDMA_ENABLE 
+
 	static void *handler(void *arg) {
 		struct thread_param *p = arg;
 		struct uffd_msg msg;
@@ -93,9 +93,7 @@ int read_all_tids(int pid, int *tids, int max_tids)
 		};
 		unsigned long addr;
 		unsigned char ack = 0;
-		#if ENABLE_SERVER
 		unsigned char page_data[PAGE_SIZE] = {0}; 
-		#endif
 		struct uffdio_copy copy;
 		int index;
 		struct uffdio_range r;
@@ -110,13 +108,13 @@ int read_all_tids(int pid, int *tids, int max_tids)
 		//dsm_msg.msg_type = MSG_WAKE_THREAD;
 		//send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0);
 		//printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n\r");
-	#if !DBG //&& 0
-		sleep(10);
-		DSM_EVENT_HANDLER("[handler] Sending SIGCONT to restored process %d\n\r", restored_pid);
-		send_sigcont(restored_pid);		/*dsm_msg.msg_type = MSG_WAKE_THREAD;
-		send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0);
-		printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n\r");*/
-	#endif
+		if( !DBG){ //&& 0
+			//sleep(10);
+			DSM_EVENT_HANDLER("[handler] Sending SIGCONT to restored process %d\n\r", restored_pid);
+			send_sigcont(restored_pid);		/*dsm_msg.msg_type = MSG_WAKE_THREAD;
+			send(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg), 0);
+			printf("[CLIENT] Sent MSG_WAKE_THREAD to server.\n\r");*/
+		}
 		while (1) {
 			int pollres = poll(pollfd, 1, -1);
 			if (pollres == -1) {
@@ -139,7 +137,6 @@ int read_all_tids(int pid, int *tids, int max_tids)
 			if( msg.arg.pagefault.address >= barrier_start_address && msg.arg.pagefault.address < barrier_end_address){
 				
 				pthread_mutex_lock(&barrier.lock);
-				#if 1
 				DSM_EVENT_HANDLER("[barrier] Local barrier hit: tid=%d page=%p", msg.arg.pagefault.feat.ptid, (void*)msg.arg.pagefault.address);
 				local_barrier_addr = msg.arg.pagefault.address;
 				//all local threads arrived, send the message to remote 
@@ -172,37 +169,6 @@ int read_all_tids(int pid, int *tids, int max_tids)
 				enable_wp(uffd, (void*) dsm_msg.page_addr ); //enable next
 				disable_wp(uffd, (void*) msg.arg.pagefault.address); //disable current
 				pthread_mutex_unlock(&barrier.lock);
-				#else
-				e = barrier.epoch;
-				barrier.local_barrier_addr = addr;
-				pthread_mutex_unlock(&barrier.lock);
-
-				// Rep-only notify? If yes, gate this with is_rep()
-				dsm_msg.msg_type = MSG_BARRIER_HIT;
-				dsm_msg.msg_id   = 1001;
-				dsm_msg.page_addr = addr;
-				if (send_all(p->fd_handler[0], &dsm_msg, sizeof(dsm_msg)) != 0) {
-					perror("[CLIENT] send MSG_BARRIER_HIT");
-					kill_and_exit(restored_pid);
-				}
-
-				// Now wait for release of *this* epoch
-				pthread_mutex_lock(&barrier.lock);
-				while (barrier.released_epoch != e) {
-					pthread_cond_wait(&barrier.cond, &barrier.lock);
-				}
-
-				// advance epoch for next barrier locally (rep or all—pick one policy; usually rep)
-				barrier.epoch++;
-				// (released_epoch will be set by server receiver on next round)
-
-				next = addr + PAGE_SIZE;
-				if (next >= barrier_end_address) next = barrier_start_address;
-				pthread_mutex_unlock(&barrier.lock);
-
-				enable_wp(uffd, (void*)next);
-				disable_wp(uffd, (void*)addr);
-				#endif
 				continue;
 			}
 
@@ -352,7 +318,7 @@ int read_all_tids(int pid, int *tids, int max_tids)
 					page_list_data[index].state = SHARED;
 				}
 
-	#if ENABLE_SERVER
+	
 
 				dsm_msg.page_addr = addr;
 				dsm_msg.page_size = PAGE_SIZE;
@@ -370,10 +336,7 @@ int read_all_tids(int pid, int *tids, int max_tids)
 					continue;
 				}
 				copy.src  = (unsigned long)page_data;
-	#else
-				copy.src  = (unsigned long)zero_page;
-				DSM_EVENT_HANDLER("[handler] Creating zero page for MISSING PAGE FAULT on READ on an ALREADY SHARED PAGE (debug mode)\n\r");
-	#endif
+	
 				copy.dst = addr;
 				copy.len = PAGE_SIZE;     
 
@@ -439,8 +402,8 @@ int read_all_tids(int pid, int *tids, int max_tids)
 
 		return NULL;
 	}
-#else 
-static void *handler(void *arg) {
+#if RDMA_ENABLE 
+static void *handler_RDMA(void *arg) {
     struct thread_param *p = arg;
     struct uffd_msg msg;
 	struct msg_info dsm_msg;
@@ -448,10 +411,6 @@ static void *handler(void *arg) {
         { .fd = p->uffd, .events = POLLIN }
     };
 	unsigned long addr;
-	//unsigned char ack = 0;
-	#if ENABLE_SERVER && !RDMA_ENABLE
-	unsigned char page_data[PAGE_SIZE] = {0}; 
-	#endif
 	struct uffdio_copy copy;
 	int index;
 	struct uffdio_range r;
@@ -459,13 +418,6 @@ static void *handler(void *arg) {
 	struct ibv_wc wc;
 	rdma_cmd_msg cmd; /* temporary on stack, but we will copy it into MR */
 	uint64_t my_handler_addr;
-	
-    //union ibv_gid sgid;
-    //uint8_t sgid_idx;
-    //unsigned char rawbuf[sizeof(rdma_wire_all)];
-    //size_t i;
-    //rdma_cmd_msg cmd; /* temporary on stack, but we will copy it into MR */
-    //uint64_t my_data_addr;
 
     DSM_EVENT_HANDLER("[handler] started, uffd = %d\n\r", p->uffd);
 
@@ -474,51 +426,52 @@ static void *handler(void *arg) {
     }
 	
 	
-#if !DBG 
-	sleep(5);
-	DSM_EVENT_HANDLER("[handler] Sending SIGCONT to restored process %d\n\r", restored_pid);
-	send_sigcont(restored_pid);
+ 	if(!DBG){ 
+		//sleep(5);
+		DSM_EVENT_HANDLER("[handler] Sending SIGCONT to restored process %d\n\r", restored_pid);
+		send_sigcont(restored_pid);
+		#if 0
+		/* 2) Build command asking server to write into OUR handler */
+		my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
+		cmd.target_addr   = htobe64(my_handler_addr);
+		cmd.faulting_addr  = htobe64((uint64_t)0xDEADBEEF);
+		cmd.id           = htonl(MSG_WAKE_THREAD);
 
-	/* 2) Build command asking server to write into OUR handler */
-	my_handler_addr   = (uint64_t)(uintptr_t)z_handler.base_addr;
-	cmd.target_addr   = htobe64(my_handler_addr);
-	cmd.faulting_addr  = htobe64((uint64_t)0xDEADBEEF);
-	cmd.id           = htonl(MSG_WAKE_THREAD);
+		DSM_EVENT_HANDLER("[CLIENT] Sending rdma barrier hit: target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
+			(unsigned long long)be64toh(cmd.target_addr),
+			(unsigned long long)be64toh(cmd.faulting_addr),
+			(unsigned)ntohl(cmd.id),
+			(unsigned)ntohl(cmd.index));
 
-	DSM_EVENT_HANDLER("[CLIENT] Sending rdma barrier hit: target_addr=%#llx faulting_addr=%#llx id=%u, index:%u\n\r",
-		(unsigned long long)be64toh(cmd.target_addr),
-		(unsigned long long)be64toh(cmd.faulting_addr),
-		(unsigned)ntohl(cmd.id),
-		(unsigned)ntohl(cmd.index));
+		/* 3) Copy CMD into TX buffer (handler_data MR) */
+		memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
 
-	/* 3) Copy CMD into TX buffer (handler_data MR) */
-	memcpy(z_handler_data.base_addr, &cmd, sizeof(cmd));
+		//Prepare for response 
+		post_one_recv(&z_handler);
 
-	//Prepare for response 
-	post_one_recv(&z_handler);
+		/* 4) WRITE_WITH_IMM to server.receiver using that registered buffer */
+		DSM_EVENT_HANDLER("[CLIENT] Sending CMD to server.receiver (imm=0xCAFE)\n\r");
+		rdma_write_core(&z_handler_data,
+						be64toh(remote_all.receiver.vaddr),
+						ntohl(remote_all.receiver.rkey),
+						z_handler_data.base_addr, sizeof(cmd), 0xCAFE);
 
-	/* 4) WRITE_WITH_IMM to server.receiver using that registered buffer */
-	DSM_EVENT_HANDLER("[CLIENT] Sending CMD to server.receiver (imm=0xCAFE)\n\r");
-	rdma_write_core(&z_handler_data,
-					be64toh(remote_all.receiver.vaddr),
-					ntohl(remote_all.receiver.rkey),
-					z_handler_data.base_addr, sizeof(cmd), 0xCAFE);
-
-	/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
-	for (;;) {
-		if (ibv_poll_cq(z_handler.cq, 1, &wc) > 0) {
-			if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-				if (wc.wc_flags & IBV_WC_WITH_IMM)
-					DSM_EVENT_HANDLER("[CLIENT] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
-				break;
+		/* Wait for server's WRITE_WITH_IMM CQE on our z_data CQ */
+		for (;;) {
+			if (ibv_poll_cq(z_handler.cq, 1, &wc) > 0) {
+				if (wc.opcode == IBV_WC_RECV || wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+					if (wc.wc_flags & IBV_WC_WITH_IMM)
+						DSM_EVENT_HANDLER("[CLIENT] Got RDMA WRITE_WITH_IMM imm=0x%x\n\r", ntohl(wc.imm_data));
+					break;
+				}
 			}
 		}
+
+
+		//dsm_msg.msg_type = MSG_WAKE_THREAD;
+		DSM_EVENT_HANDLER("[CLIENT] Sent MSG_WAKE_THREAD to server.\n\r");
+	#endif
 	}
-
-
-	//dsm_msg.msg_type = MSG_WAKE_THREAD;
-	DSM_EVENT_HANDLER("[CLIENT] Sent MSG_WAKE_THREAD to server.\n\r");
-#endif
 
 
     while (1) {
@@ -685,7 +638,6 @@ static void *handler(void *arg) {
 				page_list_data[index].state = SHARED;
 			}
 
-		#if ENABLE_SERVER
 			dsm_msg.msg_id = index;
 			
 			/* 2) Build command asking server to write into OUR handler */
@@ -730,10 +682,7 @@ static void *handler(void *arg) {
 				}
 			}
 			copy.src  = (unsigned long)z_handler.base_addr;
-#else
-			copy.src  = (unsigned long)zero_page;
-			DSM_EVENT_HANDLER("[handler] Creating zero page for MISSING PAGE FAULT on READ on an ALREADY SHARED PAGE (debug mode)\n\r");
-#endif
+
 			copy.dst = addr;
 			copy.len = PAGE_SIZE;     
 
@@ -820,7 +769,7 @@ size_t page_size = 0;
 int num_pages = 0;
 
 #if RDMA_ENABLE 
-void dsm_client_main_loop(int fd_command) {
+void dsm_client_main_loop_RDMA(int fd_command) {
     struct msg_info msg;
     //ssize_t n;
 	//unsigned char ack;
@@ -867,10 +816,6 @@ void dsm_client_main_loop(int fd_command) {
         switch (msg.msg_type) {
 			case MSG_BARRIER_HIT:
                 DSM_DEBUG_CLIENT("[DSM Client] Remote barrier hit.\n\r");
-
-			#if 1
-				
-
 				DSM_EVENT_CLIENT("[SERVER] Sending ACK_CMD to client.handler (imm=0xB1)\n\r");
 				rdma_write_core(&z_receiver_data,
 								be64toh(remote_all.handler.vaddr),
@@ -888,7 +833,6 @@ void dsm_client_main_loop(int fd_command) {
 				pthread_cond_broadcast(&barrier.cond);
 				DSM_EVENT_CLIENT("[DSM Client] Remote hit barrier, releasing...\n\r");
 				pthread_mutex_unlock(&barrier.lock);
-			#endif
 				break;
 			case MSG_BARRIER_RELEASE:
 				DSM_DEBUG_CLIENT("[DSM Client] Remote barrier released.\n\r");
@@ -1000,7 +944,7 @@ void dsm_client_main_loop(int fd_command) {
 		PRINT("\n\r");
     }
 }
-#else
+#endif
 void dsm_client_main_loop(int fd_command) {
     struct msg_info msg;
     ssize_t n;
@@ -1024,7 +968,6 @@ void dsm_client_main_loop(int fd_command) {
         switch (msg.msg_type) {
 			case MSG_BARRIER_HIT:
                 DSM_DEBUG_CLIENT("[DSM Client] Remote barrier hit.\n\r");
-				#if 1
 				pthread_mutex_lock(&barrier.lock);
 				// mark that remote threads have arrived, this is useful if we come before the local threads have, 
 				//so that we don't care if the signal was lost since we can check the variable
@@ -1038,14 +981,6 @@ void dsm_client_main_loop(int fd_command) {
 				pthread_cond_broadcast(&barrier.cond);
 				DSM_EVENT_CLIENT("[DSM Client] Remote hit barrier, releasing...\n\r");
 				pthread_mutex_unlock(&barrier.lock);
-				#else
-				pthread_mutex_lock(&barrier.lock);
-				// Signal that barrier #2 for current epoch is released
-				barrier.released_epoch = barrier.epoch;
-				pthread_cond_broadcast(&barrier.cond);
-				pthread_mutex_unlock(&barrier.lock);
-				break;
-				#endif
 				break;
 			case MSG_BARRIER_RELEASE:
 				DSM_DEBUG_CLIENT("[DSM Client] Remote barrier released.\n\r");
@@ -1117,20 +1052,24 @@ void dsm_client_main_loop(int fd_command) {
 		PRINT("\n\r");
     }
 }
-#endif
+
 
 
 static void *dsm_thread_start(void *arg)
 {
     int fd_cmd = *(int*)arg;
-    dsm_client_main_loop(fd_cmd);
+    #if RDMA_ENABLE
+	if( rdma_on )   dsm_client_main_loop_RDMA(fd_cmd);
+	else
+	#endif
+    	dsm_client_main_loop(fd_cmd);
     return NULL;
 }
 
 
 
 /********************************* MAIN ***************************************/
-void start_dsm_client(const char *server_ip)
+void start_dsm_client(const char *server_ip, int rdma_enable)
 {	
     pthread_t receiver_thread;
 	struct vm_area_list vmas = { .nr = 0};
@@ -1152,11 +1091,6 @@ void start_dsm_client(const char *server_ip)
 	FILE *f2 = fopen("/tmp/ranges.txt", "r");
 	char line[256]; 
 	
-#if RDMA_ENABLE && 0
-	struct ibv_port_attr port_attr = {};
-	union ibv_gid gid;	
-	ssize_t n;
-#endif
 
 
 	(void) line;
@@ -1169,9 +1103,15 @@ void start_dsm_client(const char *server_ip)
 	init_zero_page();
 	barrier_init();
 	pidfd = init_pidfd(restored_pid);
+	rdma_on = rdma_enable;
 
 	//pthread_create(&barrier_tid, NULL, barrier_resolver_thread, NULL);
 #endif 
+
+	if( rdma_on && !RDMA_ENABLE ) {
+		PRINT("[DSM SERVER] Warning: RDMA support mismatch. Compiled with RDMA_ENABLE=%d, started with rdma_on=%d\n", RDMA_ENABLE, rdma_on);
+		kill_and_exit(restored_pid);
+	}
 
 	vm_area_list_init(&vmas); // CRIU macro
 
@@ -1192,11 +1132,12 @@ void start_dsm_client(const char *server_ip)
 	}
 	PRINT("[DSM] First Connectivity OK ✅\n\r");
 
+	
 
 
 
 #if RDMA_ENABLE
-{
+if(rdma_on){
 	
     union ibv_gid sgid;
     uint8_t sgid_idx;
@@ -1658,10 +1599,14 @@ kill_and_exit(restored_pid);
 	param.uffd = uffd;               // from stealUFFD()
 	//param.server_pipe = server_pipe[0];    // read end for handler
 	//param.uffd_pipe = uffd_pipe[1];  // write end for handler
+	param.fd_handler = malloc(sizeof(int));
 	param.fd_handler[0] = conn.fd_handler;
 	//Spawn handler thread
-	pthread_create(&uffd_thread, NULL, handler, &param);
-
+	#if RDMA_ENABLE
+	if(rdma_on) pthread_create(&uffd_thread, NULL, handler_RDMA, &param);
+	else
+#endif	
+		pthread_create(&uffd_thread, NULL, handler, &param);
 
 	/*
 	PRINT("[DSM] Checking connectivity with server...\n\r");
@@ -1698,7 +1643,11 @@ kill_and_exit(restored_pid);
 	pthread_attr_destroy(&attr);
 
 	PRINT("[DSM Client] After creating thread. Entering main loop...\n\r");
-    dsm_client_main_loop(conn.fd_command);
+	#if RDMA_ENABLE
+	if( rdma_on )   dsm_client_main_loop_RDMA(conn.fd_command);
+	else
+	#endif
+    	dsm_client_main_loop(conn.fd_command);
 
 #elif COMMAND_LOOP
 	PRINT("[DSM Client] Connections established. Entering command loop\n\r");
@@ -1733,11 +1682,11 @@ kill_and_exit(restored_pid);
 			}
 		}
 
-	#if RDMA_ENABLE
-		printf("RDMA MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
-	#else
-		printf("TCP MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
-	#endif
+		if (rdma_on)
+			printf("RDMA MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
+		else
+			printf("TCP MODE, NUM_CLIENTS:%d, NUM_FAULTS:%d\n\r", N_CLIENTS, fault_counter);
+
 		close(pidfd);
 	}
 

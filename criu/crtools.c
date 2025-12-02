@@ -48,39 +48,8 @@
 #include "sysctl.h"
 
 /*DSM STUFF*/
-void start_dsm_server(void);
-void start_dsm_client(const char *server_ip);
-void flush_early_log_to_stderr(void) __attribute__((destructor));
-
-void flush_early_log_to_stderr(void)
-{
-	flush_early_log_buffer(STDERR_FILENO);
-}
-/*
-#include <dlfcn.h>
-
-static void start_dsm_dynamic(void)
-{
-    void *lib = dlopen("/usr/local/lib/libdsm.so", RTLD_NOW | RTLD_LOCAL);
-	void (*server)(void) = dlsym(lib, "start_dsm_server");
-	void (*client)(const char *) = dlsym(lib, "start_dsm_client");
-
-	if (!lib) {
-        pr_err("Failed to load libdsm.so: %s\n", dlerror());
-        return;
-    }
-
-    if (!server || !client) {
-        pr_err("DSM symbols not found: %s\n", dlerror());
-        return;
-    }
-
-    if (opts.is_dsm_server)
-        server();
-    else if (opts.dsm_server_ip)
-        client(opts.dsm_server_ip);
-}
-*/
+void start_dsm_server(int n_clients, int rdma_enable);
+void start_dsm_client(const char *server_ip, int rdma_enable);
 
 static int image_dir_mode(char *argv[], int optind)
 {
@@ -347,17 +316,14 @@ int main(int argc, char *argv[], char *envp[])
 			ret = 1;
 		}
 
-#if 1
+
 		if (opts.is_dsm_server) {
-			pr_info("CRIU DSM server mode enabled\n");
-			start_dsm_server();  
+			pr_info("CRIU DSM server mode enabled, clients:%d, RDMA_ENABLE:%d\n", opts.dsm_n_clients, opts.dsm_rdma_enable);
+			start_dsm_server(opts.dsm_n_clients, opts.dsm_rdma_enable);
 		} else if (opts.dsm_server_ip) {
-			pr_info("Connecting to DSM server at %s\n", opts.dsm_server_ip);
-			start_dsm_client(opts.dsm_server_ip);  
+			pr_info("Connecting to DSM server at %s, RDMA_ENABLE:%d\n", opts.dsm_server_ip, opts.dsm_rdma_enable);
+			start_dsm_client(opts.dsm_server_ip, opts.dsm_rdma_enable);  
 		}
-#else
-		if (opts.is_dsm_server || opts.dsm_server_ip) start_dsm_dynamic();
-#endif
 
 		return ret != 0;
 	}
