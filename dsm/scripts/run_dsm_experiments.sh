@@ -73,12 +73,28 @@ THREADS="$APP_THREADS"
 # CSV output depends on app
 CSV="$SCRIPTS/results/dsm_results_${APP}_${N_CORES}_cores${SUFFIX:+_$SUFFIX}.csv"
 
+MAX_PHYSICAL=16
 CPU_LIST="0"
-for ((i=1; i< N_CORES; i++)); do
+
+#
+# 1) Physical cores first → even CPU IDs (0,2,4,...)
+#
+for ((i=1; i<N_CORES && i<MAX_PHYSICAL; i++)); do
     CPU_LIST+=",$((i*2))"
 done
 
+#
+# 2) SMT siblings if more cores requested → odd IDs (1,3,5,...)
+#
+if (( N_CORES > MAX_PHYSICAL )); then
+    extra=$((N_CORES - MAX_PHYSICAL))
+    for ((j=0; j<extra; j++)); do
+        CPU_LIST+=",$((j*2+1))"
+    done
+fi
+
 echo "[INFO] Using CPU list: $CPU_LIST"
+
 
 
 ##############################################

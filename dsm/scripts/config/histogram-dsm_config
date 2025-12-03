@@ -1,7 +1,7 @@
 ########## PATHS ##########
 
 # Location of the source benchmark
-APP_SOURCE_DIR="$HOME/phoenix/phoenix-2.0/tests/histogram"
+APP_SOURCE_DIR="$HOME/criu/dsm/phoenix/histogram"
 
 # Executable (must exist inside APP_SOURCE_DIR)
 APP_EXEC="histogram-dsm"
@@ -9,7 +9,7 @@ APP_EXEC="histogram-dsm"
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="/dev/shm/random.bmp 1"
+APP_ARGS="/dev/shm/big63gb.bmp 1"
 
 # Additional input files required for correct execution (optional)
 APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files

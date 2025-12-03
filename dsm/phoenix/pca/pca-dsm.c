@@ -494,28 +494,34 @@ int main(int argc, char **argv){
         }
         dsm_wrapper(&arg[0]);
 
+      
+
         if (dsm_active){
             Global->finishtime = now_us();
             printf("[APP] Total runtime: %.3f s\n", (Global->finishtime - Global->starttime)/1e6);
+            f = fopen("/tmp/dsm_exec_time_sec", "w");
+            if (f) { printf("[APP] Printing into file:/tmp/dsm_exec_time_sec\n"); fprintf(f, "%.6f\n", (Global->finishtime - Global->starttime) / 1e6); fclose(f); }
+            else printf("Error open file /tmp/dsm_exec_time_sec\n");
         }
         if(log_enable) dump_points(cov, num_rows, num_rows);
         /* Print covariance (optional; comment out for large sizes) */
         dump_points_check(cov, num_rows, num_rows);
+        /*
         printf("\n[WORKLOAD PER THREAD]\n");
-    for (int i = 0; i < total_threads; i++) {
-        thread_arg_t *a = &arg[i];
+        for (int i = 0; i < total_threads; i++) {
+            thread_arg_t *a = &arg[i];
 
-        int R = num_rows;
-        int s = a->start;
-        int e = a->end;
-        int N = e - s;
+            int R = num_rows;
+            int s = a->start;
+            int e = a->end;
+            int N = e - s;
 
-        long long W = (long long)N * (2LL * R - (s + e - 1)) / 2LL;
+            long long W = (long long)N * (2LL * R - (s + e - 1)) / 2LL;
 
-        printf("Thread %d: rows [%d..%d) → %lld covariance pairs\n",
-            a->tid, s, e, W);
-    }
-
+            printf("Thread %d: rows [%d..%d) → %lld covariance pairs\n",
+                a->tid, s, e, W);
+        }
+*/
     
 
         for (int i=0;i<num_rows;i++){ free(cov[i]); free(matrix[i]); }

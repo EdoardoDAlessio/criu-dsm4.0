@@ -3,13 +3,14 @@
 # Location of the source benchmark
 APP_SOURCE_DIR="$HOME/phoenix/phoenix-2.0/tests/pca"
 
+#APP_SOURCE_DIR="$HOME/criu/dsm/phoenix/pca"
 # Executable (must exist inside APP_SOURCE_DIR)
 APP_EXEC="pca-dsm"
 
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="-r 11000 -c 11000 -s 1000 -p 64"
+APP_ARGS="-r 10000 -c 10000 -s 1000 -p 64"
 
 # Additional input files required for correct execution (optional)
 APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
@@ -18,16 +19,24 @@ APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client")
+CLIENTS=("dsm_client" "dsm_client2")
 
 # Number of threads for DSM (main thread count)
 APP_THREADS=64
 
 ########## RESTORE / SPLIT CONFIGS ##########
 CONFIGS=(
-    "base            0-63    -       0   tcp"
-    "split16_16_tcp  0-31    32-63   1   tcp"
-    "split16_16_rdma 0-31    32-63   1   rdma"
+    "base            0 0-63    -          tcp"
+    "split16_16_tcp  1 0-31    32-63      tcp"
+    "split16_16_rdma 1 0-31    32-63      rdma"
+    "split16_48_tcp  1 0-15    16-63      tcp"
+    "split16_48_rdma  1 0-15    16-63      rdma"
+    "split48_16_tcp  1 0-47    48-63      tcp"
+    "split48_16_tcp  1 0-47    48-63      rdma"
+    "split32_16_16_tcp  2 0-31  32-47 48-63      tcp"
+    "split32_16_16_rdma 2 0-31  32-47 48-63      rdma"
+    "split22_21_21_tcp  2 0-21  22-42 43-63      tcp"
+    "split22_21_21_rdma  2 0-21  22-42 43-63      rdma"
 )
 
 ########## SCRIPT PATHS ##########
