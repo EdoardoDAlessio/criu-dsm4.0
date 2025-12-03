@@ -1,0 +1,13 @@
+config,init,dump_s,scp_s,filter_s,restore_s,exec_s
+base,.035095923,.087579316,1.270625096,.092200640,1.658287289,6.546200
+split4_4_tcp,.035095923,.087579316,1.270625096,.097264008,1.336702455,4.601469
+split4_4_rdma,.035095923,.087579316,1.270625096,.096988413,1.598205359,4.748433
+split4_2_2_tcp,.035095923,.087579316,1.270625096,.097243770,1.840370046,4.837939
+split4_2_2_rdma,.035095923,.087579316,1.270625096,.097081406,1.536327728,4.793460
+==========================
+
+[APP] main 0 wrote to barrier page 0x74020371d000 (index=1)
+[APP] Total runtime: 6.560 seconds
+[APP] ✅ Histogram verification successful — all values match.
+[APP] Printing into file:/tmp/dsm_exec_time_sec
+taskset -c 0,2,4,6,8,10 ./histogram-dsm /dev/shm/random.bmp 1  32.12s user 4.59s system 448% cpu 8.183 total

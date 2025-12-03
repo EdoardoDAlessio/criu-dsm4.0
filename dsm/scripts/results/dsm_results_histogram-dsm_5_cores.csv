@@ -1,0 +1,15 @@
+config,init,dump_s,scp_s,filter_s,restore_s,exec_s
+base,.033204820,.106745045,1.815828390,.093266469,1.700522085,7.254587
+split4_4_tcp,.033204820,.106745045,1.815828390,.099087341,1.388864131,4.769302
+split4_4_rdma,.033204820,.106745045,1.815828390,.097494817,1.377154360,4.571054
+split4_2_2_tcp,.033204820,.106745045,1.815828390,.097631672,1.585783114,4.620359
+split4_2_2_rdma,.033204820,.106745045,1.815828390,.098716899,1.607595602,4.587185
+
+
+[APP] main 0 wrote to barrier page 0x728dd98a4000 (index=1)
+[APP] Total runtime: 7.705 seconds
+[APP] ✅ Histogram verification successful — all values match.
+[APP] Printing into file:/tmp/dsm_exec_time_sec
+taskset -c 0,2,4,6,8 ./histogram-dsm /dev/shm/random.bmp 1  32.16s user 4.47s system 393% cpu 9.306 total
+╭─EdoDale@node-0 ~/phoenix/phoenix-2.0/tests/histogram ‹master●› 
+╰─$ 

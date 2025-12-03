@@ -1,0 +1,11 @@
+config,init,dump_s,scp_s,filter_s,restore_s,exec_s
+base,.039477852,.107629792,1.808597400,.092942257,1.707043690,11.704677
+split4_4_tcp,.039477852,.107629792,1.808597400,.097039963,1.392754909,6.599261
+split4_4_rdma,.039477852,.107629792,1.808597400,.097602555,1.377544291,6.675846
+split4_2_2_tcp,.039477852,.107629792,1.808597400,.098422108,1.597458691,6.622842
+split4_2_2_rdma,.039477852,.107629792,1.808597400,.098147814,1.523856227,6.536251
+
+APP] Total runtime: 12.160 seconds
+[APP] ✅ Histogram verification successful — all values match.
+[APP] Printing into file:/tmp/dsm_exec_time_sec
+taskset -c 0,2,4 ./histogram-dsm /dev/shm/random.bmp 1  33.00s user 4.41s system 271% cpu 13.777 total

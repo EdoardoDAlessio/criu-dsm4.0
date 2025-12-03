@@ -75,7 +75,7 @@ CSV="$SCRIPTS/results/dsm_results_${APP}_${N_CORES}_cores${SUFFIX:+_$SUFFIX}.csv
 
 CPU_LIST="0"
 for ((i=1; i< N_CORES; i++)); do
-    CPU_LIST+=",$((i*2))"
+    CPU_LIST+=",${i*2}"
 done
 
 echo "[INFO] Using CPU list: $CPU_LIST"
@@ -222,7 +222,7 @@ for cfg in "${CONFIGS[@]}"; do
     ##########################################
     ### RESTORE
     ##########################################
-    
+    t4=$(date +%s.%N)
 
     echo "[SERVER] Inline restore..."
 
@@ -246,11 +246,10 @@ for cfg in "${CONFIGS[@]}"; do
 
     touch /tmp/.restore_flag
     touch /tmp/haltcode
-    
     RESTORE_CMD="sudo ~/criu/criu/criu restore --shell-job --dsm_server $N_CLIENTS"
     [[ "$PROTO" == "rdma" ]] && RESTORE_CMD+=" --dsm-rdma-enable"
     #RESTORE_CMD+=" -v"
-    t4=$(date +%s.%N)
+
     script -q -c "$RESTORE_CMD" /dev/null &
     RESTORE_PID=$!
 
