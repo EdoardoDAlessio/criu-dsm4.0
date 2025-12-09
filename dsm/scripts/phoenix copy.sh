@@ -27,7 +27,8 @@ mkdir -p "$dump_dir"
 
 #cp -r ~/phoenix/phoenix-2.0/tests/histogram/${app} ~/${app}
 #cp -r ~/phoenix/phoenix-2.0/tests/string_match/${app} ~/${app}
-cp -r ~/phoenix/phoenix-2.0/tests/kmeans/${app} ~/${app}
+#cp -r ~/phoenix/phoenix-2.0/tests/kmeans/${app} ~/${app}
+cp -r  ~/criu/dsm/test/${app} ~/${app}
 cd ~/${app}
 
 
@@ -85,18 +86,18 @@ scp -r ~/${app} "$client":~/
 echo "✅ Transfer complete $client"
 
 
-#client=dsm_client2
-# 🚚 Copy to client
-#echo "🚚 Transferring app and images to $client..."
-#ssh "$client" "rm -rf ~/${app}"
-#scp -r ~/${app} "$client":~/
-#echo "✅ Transfer complete $client"
+client=dsm_client2
+ 🚚 Copy to client
+echo "🚚 Transferring app and images to $client..."
+ssh "$client" "sudo rm -rf ~/${app}"
+scp -r ~/${app} "$client":~/
+echo "✅ Transfer complete $client"
 
-client=dsm_client-3
+client=dsm_client3
 # 🚚 Copy to client
 #echo "🚚 Transferring app and images to $client..."
-#ssh "$client" "rm -rf ~/${app}"
-#scp -r ~/${app} "$client":~/
+ssh "$client" "sudo rm -rf ~/${app}"
+scp -r ~/${app} "$client":~/
 #scp /tmp/mmapalloc_log "$client":/tmp || true
 #scp /tmp/dsm_barrier_pages.txt "$client":/tmp || true
 #scp /tmp/ranges.txt "$client":/tmp || true

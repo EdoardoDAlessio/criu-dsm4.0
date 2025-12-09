@@ -21,16 +21,15 @@ APP_EXTRA_FILES=(
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client")
+CLIENTS=("dsm_client" "dsm_client2" "dsm_client3")
 
 # Number of threads for DSM (main thread count)
 APP_THREADS=64
 
 ########## RESTORE / SPLIT CONFIGS ##########
 CONFIGS=(
-    "base            0-63    -       0   tcp"
-    "split16_16_tcp  0-31    32-63   1   tcp"
-    "split16_16_rdma 0-31    32-63   1   rdma"
+    "split22_21_21_rdma  2 0-21  22-42 43-63      rdma"
+    "split34_10_10_10_rdma  3 0-15 16-31 32-47 48-63   rdma"
 )
 
 ########## SCRIPT PATHS ##########

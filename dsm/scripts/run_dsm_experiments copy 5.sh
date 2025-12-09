@@ -1,36 +1,5 @@
 #!/usr/bin/env bash
 set -e
-##############################################
-### SIGNAL HANDLER — MAKE CTRL+C WORK
-##############################################
-cleanup() {
-    echo ""
-    echo "=== Ctrl+C received → Cleaning up ==="
-
-    # Kill all local background jobs started inside THIS script
-    jobs -p | xargs -r kill -9 2>/dev/null || true
-
-    # Kill CRIU processes
-    sudo pkill -9 -f "criu"      2>/dev/null || true
-
-    # Kill your app (dump target)
-    pkill -9 -f "$APP_EXEC"      2>/dev/null || true
-
-    # Kill restore processes
-    sudo pkill -9 -f "criu restore" 2>/dev/null || true
-
-    # Kill script subprocesses
-    pkill -9 -f "restorer.sh"    2>/dev/null || true
-    pkill -9 -f "thread_filter"  2>/dev/null || true
-
-    # Kill remote SSH clients launched by this script
-    pkill -9 ssh                 2>/dev/null || true
-
-    echo "=== Cleanup complete, exiting ==="
-    exit 1
-}
-
-trap cleanup INT
 
 ##############################################
 ### 0) ARGUMENT PARSING
@@ -141,105 +110,6 @@ sudo pkill -9 -f "criu" || true
 
 
 ##############################################
-### (0) RUN VANILLA LOCAL EXECUTION
-##############################################
-echo "=== Running VANILLA (no DSM) ==="
-
-cd "$APP_SOURCE_DIR"
-
-sudo rm -f /tmp/dsm_exec_time_sec
-touch /tmp/haltcode
-
-echo "$THREADS" | sudo tee /tmp/restored_threads.txt >/dev/null
-t_van_start=$(date +%s.%N)
-
-#DSM=$THREADS ./${APP_EXEC} ${APP_ARGS}
-t_van_end=$(date +%s.%N)
-
-# internal exec time (from benchmark)
-exec_internal=$(cat /tmp/dsm_exec_time_sec 2>/dev/null || echo "0")
-
-# total wall-clock time
-exec_total=$(echo "$t_van_end - $t_van_start" | bc -l)
-
-echo "VANILLA internal exec = $exec_internal"
-echo "VANILLA total time    = $exec_total"
-
-# write CSV line:
-# columns: config,init,dump_s,scp_s,filter_s,restore_s,exec_s
-echo "vanilla,0,0,0,0,$exec_total,$exec_internal" >> "$CSV"
-
-echo "=== Vanilla done ==="
-echo ""
-sleep 1
-
-
-
-##############################################
-### 1) DUMP PHASE (INLINE)
-##############################################
-echo "=== Dump (inline) ==="
-t_init=$(date +%s.%N)
-
-# --- CLEAN temp ---
-sudo rm -f /tmp/ranges.txt /tmp/dsm_barrier_pages.txt /tmp/dsm_mutex.txt
-rm -rf ~/"${APP}"
-mkdir -p ~/"${APP}/images"
-
-# --- COPY APPLICATION FROM CONFIG ---
-cp "${APP_SOURCE_DIR}/${APP_EXEC}" ~/"${APP}/"
-
-# Copy extra data if defined
-if [[ ${#APP_EXTRA_FILES[@]} -gt 0 ]]; then
-    for f in "${APP_EXTRA_FILES[@]}"; do
-        cp "${APP_SOURCE_DIR}/${f}" ~/"${APP}/" 2>/dev/null || true
-    done
-fi
-
-cd ~/"${APP}"
-
-# --- RUN APPLICATION ---
-echo "🚀 Launching $APP with DSM=$THREADS"
-sudo rm -f /tmp/criu-restored.pid /tmp/haltcode
-
-DSM=$THREADS ./${APP_EXEC} ${APP_ARGS} &
-app_pid=$!
-echo "APP PID = $app_pid"
-sleep "$APP_WARMUP"
-t0=$(date +%s.%N)
-# --- CRIU DUMP ---
-echo "📦 Dumping with CRIU..."
-sudo ~/criu/criu/criu dump -t "$app_pid" --images-dir ~/"${APP}/images" \
-     --shell-job -v || true
-
-# --- COPY METADATA ---
-cp /tmp/ranges.txt ~/"${APP}/images/" 2>/dev/null || true
-cp /tmp/dsm_barrier_pages.txt ~/"${APP}/images/" 2>/dev/null || true
-cp /tmp/dsm_mutex.txt ~/"${APP}/images/" 2>/dev/null || true
-
-# --- BACKUP ---
-cp -r ~/"${APP}/images" ~/"${APP}/backup"
-#exit
-t1=$(date +%s.%N)
-dump_time=$(echo "$t1 - $t0" | bc -l)
-init_time=$(echo "$t0 - $t_init - $APP_WARMUP" | bc -l)
-##############################################
-### 2) SCP PHASE
-##############################################
-echo "=== SCP ==="
-t2=$(date +%s.%N)
-
-for client in "${CLIENTS[@]}"; do
-    echo "[SCP] → $client"
-    ssh -o StrictHostKeyChecking=no "$client" "sudo rm -rf ~/${APP}"
-    scp -r ~/"${APP}" "$client":~/
-done
-
-t3=$(date +%s.%N)
-scp_time=$(echo "$t3 - $t2" | bc -l)
-
-
-##############################################
 ### 3) RESTORE CONFIGS LOOP
 ##############################################
 echo "=== Running configs ==="
@@ -277,8 +147,8 @@ for cfg in "${CONFIGS[@]}"; do
     FLAGSERVER=""
     FLAGCLIENT=""
     #FLAGCLIENT="--verbose"
-    [[ "$MODE" == "rdma" ]] && FLAGSERVER="$FLAGSERVER --dsm-rdma-enable"
-    [[ "$MODE" == "rdma" ]] && FLAGCLIENT="$FLAGCLIENT --rdma"
+    [[ "$PROTO" == "rdma" ]] && FLAGSERVER="$FLAGSERVER --dsm-rdma-enable"
+    [[ "$PROTO" == "rdma" ]] && FLAGCLIENT="$FLAGCLIENT --rdma"
 
     echo ""
     echo "=========== $CONF_NAME ==============="
@@ -331,13 +201,11 @@ for cfg in "${CONFIGS[@]}"; do
     touch /tmp/haltcode
     
     RESTORE_CMD="sudo ~/criu/criu/criu restore --shell-job --dsm_server $N_CLIENTS"
-    [[ "$MODE" == "rdma" ]] && RESTORE_CMD+=" --dsm-rdma-enable"
-    echo "Restore command: $RESTORE_CMD"
+    [[ "$PROTO" == "rdma" ]] && RESTORE_CMD+=" --dsm-rdma-enable"
     #RESTORE_CMD+=" -v"
     t4=$(date +%s.%N)
     script -q -c "$RESTORE_CMD" /dev/null &
     RESTORE_PID=$!
-    #exit
 
     ##############################################
     ### 3) LAUNCH CLIENT SIDE IF NEEDED
@@ -347,8 +215,8 @@ for cfg in "${CONFIGS[@]}"; do
     if (( N_CLIENTS > 0 )); then
         for (( cid=0; cid<N_CLIENTS; cid++ )); do
             CLIENT_HOST="${CLIENTS[$cid]}"
-            echo "[CLIENT-$cid] Starting restore on $CLIENT_HOST..., $FLAGCLIENT"
-        
+            echo "[CLIENT-$cid] Starting restore on $CLIENT_HOST..."
+
             ssh -tt "$CLIENT_HOST" "
                 cd ~/criu/dsm/scripts || exit 1
                 source ~/venv-criu/bin/activate || true

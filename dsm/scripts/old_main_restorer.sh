@@ -57,7 +57,7 @@ sudo rm -f /tmp/criu-restored.pid
 
 # Setting program arguments
 echo $gap > /tmp/restored_threads.txt
-echo $first > /tmp/authorized_barrier_thread.txt
+echo $first | sudo tee /tmp/authorized_barrier_thread.txt
 unset DSM
 export DSM=0
 # Trigger CRIU restore

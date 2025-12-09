@@ -9,7 +9,7 @@ APP_EXEC="word_count-dsm"
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="$HOME/phoenix/phoenix-2.0/tests/input/word_count_datafiles/word_1600MB.txt 8"
+APP_ARGS="$HOME/phoenix/phoenix-2.0/tests/input/word_count_datafiles/word_1600MB.txt 1"
 
 # Additional input files required for correct execution (optional)
 APP_EXTRA_FILES=()   # word_count-dsm doesn't need extra files
@@ -18,16 +18,22 @@ APP_EXTRA_FILES=()   # word_count-dsm doesn't need extra files
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client")
+CLIENTS=("dsm_client" "dsm_client2" "dsm_client3")
 
 # Number of threads for DSM (main thread count)
-APP_THREADS=32
+APP_THREADS=8
 
 ########## RESTORE / SPLIT CONFIGS ##########
 CONFIGS=(
-    "base            0-31    -       0   tcp"
-    "split16_16_tcp  0-15    16-31   1   tcp"
-    "split16_16_rdma 0-15    16-31   1   rdma"
+    "base      0   0-7        tcp"
+    "4_4_t            1   0-3   4-7          tcp"
+    "4_4_r         1    0-3   4-7             rdma"
+    "4_2_2_t        2   0-3   4-5   6-7           tcp"
+    "4_2_2_r        2   0-3   4-5   6-7         rdma"
+    "5_1_1_1_t     3   0-4   5-5   6-6   7-7          tcp"
+    "5_1_1_1_r     3   0-4   5-5   6-6   7-7          rdma"
+    "2_2_2_2_t      3   0-1   2-3  4-5   6-7          tcp"
+    "2_2_2_2_r     3   0-1   2-3  4-5   6-7           rdma"
 )
 
 ########## SCRIPT PATHS ##########

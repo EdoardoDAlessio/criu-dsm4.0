@@ -1,0 +1,72 @@
+hca_id:	irdma0
+	transport:			InfiniBand (0)
+	fw_ver:				1.74
+	node_guid:			42a6:b7ff:fec2:e3e0
+	sys_image_guid:			42a6:b7ff:fec2:e3e0
+	vendor_id:			0x8086
+	vendor_part_id:			5522
+	hw_ver:				0x2
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_DOWN (1)
+			max_mtu:		4096 (5)
+			active_mtu:		1024 (3)
+			sm_lid:			0
+			port_lid:		1
+			port_lmc:		0x00
+			link_layer:		Ethernet
+
+hca_id:	irdma1
+	transport:			InfiniBand (0)
+	fw_ver:				1.74
+	node_guid:			42a6:b7ff:fec2:e3e1
+	sys_image_guid:			42a6:b7ff:fec2:e3e1
+	vendor_id:			0x8086
+	vendor_part_id:			5522
+	hw_ver:				0x2
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_DOWN (1)
+			max_mtu:		4096 (5)
+			active_mtu:		1024 (3)
+			sm_lid:			0
+			port_lid:		1
+			port_lmc:		0x00
+			link_layer:		Ethernet
+
+hca_id:	irdma2
+	transport:			InfiniBand (0)
+	fw_ver:				1.74
+	node_guid:			323e:a7ff:fe1d:21dc
+	sys_image_guid:			323e:a7ff:fe1d:21dc
+	vendor_id:			0x8086
+	vendor_part_id:			5531
+	hw_ver:				0x2
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_ACTIVE (4)
+			max_mtu:		4096 (5)
+			active_mtu:		1024 (3)
+			sm_lid:			0
+			port_lid:		1
+			port_lmc:		0x00
+			link_layer:		Ethernet
+
+hca_id:	irdma3
+	transport:			InfiniBand (0)
+	fw_ver:				1.74
+	node_guid:			323e:a7ff:fe1d:21dd
+	sys_image_guid:			323e:a7ff:fe1d:21dd
+	vendor_id:			0x8086
+	vendor_part_id:			5531
+	hw_ver:				0x2
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_DOWN (1)
+			max_mtu:		4096 (5)
+			active_mtu:		1024 (3)
+			sm_lid:			0
+			port_lid:		1
+			port_lmc:		0x00
+			link_layer:		Ethernet
+

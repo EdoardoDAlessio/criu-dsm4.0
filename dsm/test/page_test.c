@@ -13,8 +13,13 @@
 #define PAGE_SIZE 4096
 #endif
 
+
+// Per-thread mode array: 0 = read-only, 1 = write
+int *thread_mode = NULL;
+
+int done = 0;
 // -----------------------------------------------------------------------------
-// GLOBAL MEMORY + DSM BARRIER (identical to histogram-dsm.c)
+// GLOBAL MEMORY + DSM BARRIER
 // -----------------------------------------------------------------------------
 typedef struct {
     pthread_mutex_t mutex;
@@ -25,51 +30,39 @@ typedef struct {
 
 typedef struct GlobalMemory {
     start_barrier_t start;
-    unsigned long starttime;
-    unsigned long finishtime;
 } GlobalMemory;
 
 GlobalMemory *Global;
 
-// For splash_barrier
 static inline unsigned long now_us(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (unsigned long)tv.tv_sec * 1000000UL + (unsigned long)tv.tv_usec;
+    return (unsigned long)tv.tv_sec * 1000000UL + tv.tv_usec;
 }
 
-#if 1
-void splash_barrier(GlobalMemory *Global, int P, int tid) {
-    unsigned long Error, Cycle;
-    long Cancel, Temp;
+void splash_barrier(GlobalMemory *G, int P, int tid) {
+    pthread_mutex_lock(&(G->start).mutex);
 
-    Error = pthread_mutex_lock(&(Global->start).mutex);
-    if (Error != 0) {
-        fprintf(stderr, "Barrier mutex lock failed\n");
-        exit(1);
-    }
-
-    Cycle = (Global->start).cycle;
-    if (++(Global->start).counter != P) {
+    unsigned long Cycle = G->start.cycle;
+    if (++G->start.counter != P) {
+        long Cancel, Temp;
         pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &Cancel);
-        while (Cycle == (Global->start).cycle)
-            pthread_cond_wait(&(Global->start).cv, &(Global->start).mutex);
+        while (Cycle == G->start.cycle)
+            pthread_cond_wait(&(G->start).cv, &(G->start).mutex);
         pthread_setcancelstate(Cancel, &Temp);
     } else {
-        (Global->start).cycle ^= 1;
-        (Global->start).counter = 0;
-        pthread_cond_broadcast(&(Global->start).cv);
+        G->start.cycle ^= 1;
+        G->start.counter = 0;
+        pthread_cond_broadcast(&(G->start).cv);
     }
 
-    pthread_mutex_unlock(&(Global->start).mutex);
+    pthread_mutex_unlock(&(G->start).mutex);
 }
-#endif
 
 // -----------------------------------------------------------------------------
-// DSM barrier pages (8 pages exactly like histogram)
+// DSM barrier pages
 // -----------------------------------------------------------------------------
 #define NUM_BARRIER_PAGES 8
-
 static void *barrier_region = NULL;
 static size_t page_size = 0;
 static int current_barrier_index = 0;
@@ -79,38 +72,41 @@ void dsm_init_barrier_pages(void) {
     if (page_size == 0) page_size = PAGE_SIZE;
 
     size_t length = NUM_BARRIER_PAGES * page_size;
-
     barrier_region = mmap(NULL, length,
                           PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
                           -1, 0);
     if (barrier_region == MAP_FAILED) {
-        fprintf(stderr, "mmap failed: %s\n", strerror(errno));
+        perror("mmap barrier_region");
         exit(1);
     }
 
-    for (int i = 0; i < NUM_BARRIER_PAGES; i++) {
-        volatile char *p = (volatile char*)barrier_region + i * page_size;
-        p[0] = 0;
-    }
+    for (int i = 0; i < NUM_BARRIER_PAGES; i++)
+        ((volatile char*)barrier_region)[i * page_size] = 0;
 
+    // WRITE /tmp/dsm_barrier_pages.txt --------------- RESTORED
     FILE *f = fopen("/tmp/dsm_barrier_pages.txt", "w");
     if (f) {
-        fprintf(f,"base=%p page_size=%zu num_pages=%d\n",
+        fprintf(f, "base=%p page_size=%zu num_pages=%d\n",
                 barrier_region, page_size, NUM_BARRIER_PAGES);
         fclose(f);
     }
 
-    fprintf(stderr," DSM barrier region at %p (%d pages)\n",
+    fprintf(stderr, "[DSM] barrier region at %p (%d pages)\n",
             barrier_region, NUM_BARRIER_PAGES);
 }
 
 // -----------------------------------------------------------------------------
-// Local region used for trigger tests (the <num_pages> pages)
+// LOCAL REGION & GLOBAL VARIABLES
 // -----------------------------------------------------------------------------
 static void *region = NULL;
 int num_threads = 0;
 int num_pages   = 0;
+int num_repeats = 0;
+int total_rounds = 0;
+
+// per-thread timing matrix
+unsigned long **times_us;
 
 // -----------------------------------------------------------------------------
 // THREAD ARGS
@@ -120,74 +116,129 @@ typedef struct {
     int nthreads;
 } thread_arg_t;
 
-void check_halt_file(int tid){
-    printf("Thread %d: Waiting for haltcode file /tmp/haltcode to continue...\n", tid);
+void check_halt_file(int tid) {
+    printf("Thread %d waiting for /tmp/haltcode...\n", tid);
     fflush(stdout);
-    while(access("/tmp/haltcode", F_OK) != 0) {
-        //spin wait for haltcode file
+    while (access("/tmp/haltcode", F_OK) != 0) {
+        usleep(10000);
     }
-    printf("Thread %d: Haltcode file detected, continuing execution\n", tid);
+    printf("Thread %d continues\n", tid);
     fflush(stdout);
-    return;
 }
 
+// -----------------------------------------------------------------------------
+// THREAD MAIN — DSM logic untouched, only wrapped with timing
+// -----------------------------------------------------------------------------
 void *thread_main(void *arg) {
     thread_arg_t *ta = (thread_arg_t*)arg;
     int tid   = ta->tid;
     int total = ta->nthreads;
 
-    printf("[T%d] started\n", tid);
-    fflush(stdout);
-
-    
-    splash_barrier(Global, total, tid);
     check_halt_file(tid);
 
-    // Every thread participates in ALL rounds: 0 .. total-1
-    // In round i, only thread i actually does the writes.
-    for (int i = 0; i < total; i++) {
-        int idx0, idx1;
-        volatile unsigned char *q0, *q1;
+    int round_id = 0;
 
-        // Touch first DSM barrier page
-        idx0 = current_barrier_index;
-        q0   = (volatile unsigned char *)barrier_region + (size_t)idx0 * page_size;
-        q0[0] = (unsigned char)(q0[0] ^ 1); // write to trigger WP fault
+    for (int rep = 0; rep < num_repeats; rep++) {
+        for (int owner = 0; owner < total; owner++) {
 
-        fprintf(stderr, " tid %d wrote to DSM barrier page %p (index=%d)\n",
-                tid, (void*)q0, idx0);
+            unsigned long t0 = now_us();   // time start
 
-        current_barrier_index = (current_barrier_index + 1) % NUM_BARRIER_PAGES;
+            // FIRST DSM barrier touch — DO NOT MODIFY
+            int idx0 = current_barrier_index;
+            volatile unsigned char *q0 =
+                (volatile unsigned char*)barrier_region + idx0 * page_size;
+            q0[0] ^= 1;
 
+            //fprintf(stderr, " tid %d wrote to DSM barrier page %p (index=%d)\n",                    tid, (void*)q0, idx0);
 
-        fflush(stdout);
-        if (i == tid) {
-            
-        // Now touch ALL pages of the test region
-        printf("[T%d] My turn (round %d) → writing %d pages in region\n",
-            tid, i, num_pages);
-            for (int p = 0; p < num_pages; p++) {
-                volatile char *page = (volatile char*)region + (size_t)p * PAGE_SIZE;
-                page[0] ^= 1;  // trigger write fault on test region
+            current_barrier_index =
+                (current_barrier_index + 1) % NUM_BARRIER_PAGES;
+
+            // OWNER performs ALL page writes — UNTOUCHED DSM BEHAVIOR
+            if (tid == owner) {
+                if( tid == 0 || tid == 2 ){//write page fault
+                    printf("[T%d] rep %d owner-turn (%d) → writing %d pages\n",
+                        tid, rep, owner, num_pages);
+
+                    for (int p = 0; p < num_pages; p++) {
+                        volatile char *page =
+                            (volatile char*)region + p * PAGE_SIZE;
+                        page[0] ^= 1;
+                    }
+                }else{ //thread 1 and 2 write 
+                    printf("[T%d] rep %d owner-turn (%d) → reading %d pages\n",
+                        tid, rep, owner, num_pages);
+
+                    for (int p = 0; p < num_pages; p++) {
+                        volatile char *page = (volatile char*)region + p * PAGE_SIZE;
+                        volatile char tmp = page[0];
+                    }
+                }
+               
             }
+
+            // SECOND DSM barrier touch — DO NOT MODIFY
+            int idx1 = current_barrier_index;
+            volatile unsigned char *q1 =   (volatile unsigned char*)barrier_region + idx1 * page_size;
+            q1[0] ^= 1;
+
+            //fprintf(stderr," tid %d wrote to DSM barrier page %p (index=%d)\n",     tid, (void*)q1, idx1);
+
+            current_barrier_index = (current_barrier_index + 1) % NUM_BARRIER_PAGES;
+
+            unsigned long t1 = now_us();   // time end
+
+            times_us[tid][round_id] = t1 - t0;   // STORE TIMING
+
+            round_id++;
         }
-
-        // Touch second DSM barrier page
-        idx1 = current_barrier_index;
-        q1   = (volatile unsigned char *)barrier_region + (size_t)idx1 * page_size;
-        q1[0] = (unsigned char)(q1[0] ^ 1);
-
-        fprintf(stderr, " tid %d wrote to DSM barrier page %p (index=%d)\n",
-                tid, (void*)q1, idx1);
-
-        current_barrier_index = (current_barrier_index + 1) % NUM_BARRIER_PAGES;
-
-    
-
     }
 
+    pthread_mutex_lock(&Global->start.mutex);
+
+    FILE *ft = fopen("/tmp/page_test_times.csv", "w");
+    fprintf(ft, "thread,round,time_us,avg0,avg1,avg2\n");
+
+    // For each thread compute averages of groups r%3 == 0,1,2
+    for (int t = 0; t < num_threads; t++) {
+
+        unsigned long sums[3] = {0,0,0};
+        int counts[3] = {0,0,0};
+
+        for (int r = 0; r < total_rounds; r++) {
+            unsigned long v = times_us[t][r];
+
+            // write raw values
+            fprintf(ft, "%d,%d,%lu", t, r, v);
+
+            // accumulate into groups (0,1,2)
+            int bucket = r % 3;
+            sums[bucket] += v;
+            counts[bucket] += 1;
+
+            // write placeholder for averages
+            fprintf(ft, ",,,\n");
+        }
+
+        // compute averages
+        double avg0 = (counts[0] ? (double)sums[0] / counts[0] : 0.0);
+        double avg1 = (counts[1] ? (double)sums[1] / counts[1] : 0.0);
+        double avg2 = (counts[2] ? (double)sums[2] / counts[2] : 0.0);
+
+        // append summary line for this thread
+        fprintf(ft,
+            "thread %d averages,, ,%.2f,%.2f,%.2f\n",
+            t, avg0, avg1, avg2);
+    }
+
+    fflush(ft);
+    fclose(ft);
+
+    printf("Saved timings to /tmp/page_test_times.csv\n");
+    pthread_mutex_unlock(&Global->start.mutex);
+
+
     printf("[T%d] done\n", tid);
-    fflush(stdout);
     return NULL;
 }
 
@@ -195,146 +246,74 @@ void *thread_main(void *arg) {
 // MAIN
 // -----------------------------------------------------------------------------
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        printf("Usage: %s <num_threads> <num_pages>\n", argv[0]);
+
+    if (argc != 4) {
+        printf("Usage: %s <num_threads> <num_pages> <num_repeats>\n",
+               argv[0]);
         return 1;
     }
 
     num_threads = atoi(argv[1]);
     num_pages   = atoi(argv[2]);
+    num_repeats = atoi(argv[3]);
+    total_rounds = num_threads * num_repeats;
 
-    printf(" DSM test: %d threads, %d pages\n",
-           num_threads, num_pages);
-
-    // ----------------------------------------------------
-    // Init Global
-    // ----------------------------------------------------
+    // Init global barrier memory
     Global = malloc(sizeof(GlobalMemory));
     memset(Global, 0, sizeof(GlobalMemory));
     pthread_mutex_init(&(Global->start).mutex, NULL);
     pthread_cond_init(&(Global->start).cv, NULL);
 
-    // ----------------------------------------------------
-    // Init DSM barrier pages (8 pages)
-    // ----------------------------------------------------
+    // DSM barrier initialization
     dsm_init_barrier_pages();
 
-    // ----------------------------------------------------
-    // Map region for testing and print /tmp/ranges.txt
-    // ----------------------------------------------------
+    // Allocate local test region
     size_t length = (size_t)num_pages * PAGE_SIZE;
     region = mmap(NULL, length,
                   PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
                   -1, 0);
     if (region == MAP_FAILED) {
-        perror("mmap region");
+        perror("region mmap");
         exit(1);
     }
 
+    // WRITE /tmp/ranges.txt ---- RESTORED
     FILE *fr = fopen("/tmp/ranges.txt","w");
     if (fr) {
-        fprintf(fr, "base=%p page_size=%d num_pages=%d\n",
+        fprintf(fr,
+                "base=%p page_size=%d num_pages=%d\n",
                 region, PAGE_SIZE, num_pages);
         fclose(fr);
     }
 
-    for (int p = 0; p < num_pages; p++) {
-        volatile char *page = (volatile char*)region + p * PAGE_SIZE;
-        page[0] = 0;
+    memset(region, 0, length);
+
+    // Allocate timing matrix
+    times_us = malloc(sizeof(unsigned long*) * num_threads);
+    for (int t = 0; t < num_threads; t++) {
+        times_us[t] = malloc(sizeof(unsigned long) * total_rounds);
+        memset(times_us[t], 0, sizeof(unsigned long) * total_rounds);
     }
 
-    printf("[MAIN] region mapped at %p (%zu bytes)\n",
-           region, length);
-
-    // ----------------------------------------------------
-    // Launch worker threads: 0..num_threads-2
-    // ----------------------------------------------------
-    pthread_t tids[num_threads];
+    // Launch threads
+    pthread_t thr[num_threads];
     thread_arg_t args[num_threads];
+    //int order[3] = {0,2,1}; //th0 modifies then main reads, th1 reads 
+    int order[3] = {0,1,2}; //th0 modifies then th1 reads lasly main reads
 
-    int tid;
-    for (tid = 0; tid < num_threads - 1; tid++) {
-        args[tid].tid      = tid;
-        args[tid].nthreads = num_threads;
-        pthread_create(&tids[tid], NULL, thread_main, &args[tid]);
+    for (int t = 0; t < num_threads - 1; t++) {
+        args[t].tid = order[t];
+        args[t].nthreads = num_threads;
+        pthread_create(&thr[t], NULL, thread_main, &args[t]);
     }
+    int t = num_threads - 1;
+    args[t].tid = order[t];
+    args[t].nthreads = num_threads;
+    thread_main(&args[t]);
 
-    // Main thread is the last logical TID
-    int my_tid = num_threads - 1;
 
-    printf("[T%d] startedd\n", my_tid);
-    fflush(stdout);
-
-    static unsigned long *iteration_times = NULL;
-
-    // Allocate iteration_times for ALL iterations
-    iteration_times = malloc(sizeof(unsigned long) * num_threads);
-    if (!iteration_times) {
-        perror("malloc iteration_times");
-        exit(1);
-    }
-    memset(iteration_times, 0, sizeof(unsigned long) * num_threads);
-
-    
-    splash_barrier(Global, num_threads, my_tid);
-    check_halt_file(my_tid);
-    // Every thread participates in ALL rounds: 0 .. num_threads-1
-    // In round i, only thread i actually does the writes.
-    for (int i = 0; i < num_threads; i++) {
-        unsigned long t0 = now_us();
-        int idx0, idx1;
-        volatile unsigned char *q0, *q1;
-
-        // Touch first DSM barrier page
-        idx0 = current_barrier_index;
-        q0   = (volatile unsigned char *)barrier_region + (size_t)idx0 * page_size;
-        q0[0] = (unsigned char)(q0[0] ^ 1); // write to trigger WP fault
-
-        fprintf(stderr, " tid %d wrote to DSM barrier page %p (index=%d)\n",
-                my_tid, (void*)q0, idx0);
-
-        current_barrier_index = (current_barrier_index + 1) % NUM_BARRIER_PAGES;
-        if (i == my_tid) {
-            
-            // Now touch ALL pages of the test region
-            printf("[T%d] My turn (round %d) → writing %d pages in region\n",
-                my_tid, i, num_pages);
-            for (int p = 0; p < num_pages; p++) {
-                volatile char *page = (volatile char*)region + (size_t)p * PAGE_SIZE;
-                page[0] ^= 1;  // trigger write fault on test region
-            }
-        }
-        // Touch second DSM barrier page
-        idx1 = current_barrier_index;
-        q1   = (volatile unsigned char *)barrier_region + (size_t)idx1 * page_size;
-        q1[0] = (unsigned char)(q1[0] ^ 1);
-
-        fprintf(stderr, " tid %d wrote to DSM barrier page %p (index=%d)\n",
-                my_tid, (void*)q1, idx1);
-
-        current_barrier_index = (current_barrier_index + 1) % NUM_BARRIER_PAGES;
-
-        fflush(stdout);
-        unsigned long t1 = now_us();   // <--- END TIME (local)
-        iteration_times[i] = t1 - t0;  // STORE
-    }
-
-    // ----------------------------------------------------
-    // Write iteration times to file
-    // ----------------------------------------------------
-    FILE *ft = fopen("/tmp/iteration_times.txt", "w");
-    if (!ft) {
-        perror("fopen /tmp/iteration_times.txt");
-    } else {
-        fprintf(ft, "iteration,time_us\n");
-        for (int i = 0; i < num_threads; i++) {
-            fprintf(ft, "%d,%lu\n", i, iteration_times[i]);
-        }
-        fclose(ft);
-        printf(" iteration times written to cat /tmp/iteration_times.txt \n");
-    }
-  
-    printf(" ALL DONE.\n");
+    sleep(5);
+    printf("ALL DONE.\n");
     return 0;
 }

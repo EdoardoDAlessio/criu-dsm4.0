@@ -9,7 +9,11 @@ APP_EXEC="kmeans-dsm"
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="-p 1000 -d 500 -c 300 -s 500"
+#APP_ARGS="-p 1000 -d 500 -c 300 -s 500"
+#APP_ARGS="-p 100000 -d 500 -c 1000 -s 1000"
+
+APP_ARGS="-p 1000 -d 500 -c 1000 -s 1000"
+
 
 # Additional input files required for correct execution (optional)
 APP_EXTRA_FILES=()   # kmeans-dsm doesn't need extra files
@@ -18,16 +22,14 @@ APP_EXTRA_FILES=()   # kmeans-dsm doesn't need extra files
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client")
+CLIENTS=("dsm_client" "dsm_client2" "dsm_client3") 
 
 # Number of threads for DSM (main thread count)
 APP_THREADS=32
 
 ########## RESTORE / SPLIT CONFIGS ##########
 CONFIGS=(
-    "base            0-31    -       0   tcp"
-    "split16_16_tcp  0-15    16-31   1   tcp"
-    "split16_16_rdma 0-15    16-31   1   rdma"
+    "17_5_5_5_t 3 0-16 17-21 22-26 27-31 tcp"
 )
 
 ########## SCRIPT PATHS ##########
