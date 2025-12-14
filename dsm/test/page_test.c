@@ -31,7 +31,6 @@ typedef struct {
 typedef struct GlobalMemory {
     start_barrier_t start;
 } GlobalMemory;
-
 GlobalMemory *Global;
 
 static inline unsigned long now_us(void) {
@@ -156,7 +155,7 @@ void *thread_main(void *arg) {
 
             // OWNER performs ALL page writes — UNTOUCHED DSM BEHAVIOR
             if (tid == owner) {
-                if( tid == 0 || tid == 2 ){//write page fault
+                if( tid == 0 || tid ){//write page fault
                     printf("[T%d] rep %d owner-turn (%d) → writing %d pages\n",
                         tid, rep, owner, num_pages);
 
@@ -299,8 +298,8 @@ int main(int argc, char **argv) {
     // Launch threads
     pthread_t thr[num_threads];
     thread_arg_t args[num_threads];
-    //int order[3] = {0,2,1}; //th0 modifies then main reads, th1 reads 
-    int order[3] = {0,1,2}; //th0 modifies then th1 reads lasly main reads
+    int order[3] = {0,2,1}; //th0 modifies then main reads, th1 reads 
+    //int order[3] = {0,1,2}; //th0 modifies then th1 reads lasly main reads
 
     for (int t = 0; t < num_threads - 1; t++) {
         args[t].tid = order[t];

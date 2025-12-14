@@ -9,7 +9,7 @@ APP_EXEC="linear_regression-dsm"
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="/dev/shm/key_file_40000MB.txt"
+APP_ARGS="/dev/shm/key_file_24000MB.txt"
 
 # Additional input files required for correct execution (optional)
 APP_EXTRA_FILES=()   # word_count-dsm doesn't need extra files
@@ -25,7 +25,7 @@ APP_THREADS=8
 
 ########## RESTORE / SPLIT CONFIGS ##########
 CONFIGS=(
-    "base      0   0-7        tcp"
+    "4      0   0-7        tcp"
     "4_4_t            1   0-3   4-7          tcp"
     "4_4_r         1    0-3   4-7             rdma"
     "4_2_2_t        2   0-3   4-5   6-7           tcp"

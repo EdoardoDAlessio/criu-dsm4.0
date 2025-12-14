@@ -102,7 +102,7 @@ sleep 1
 THREADS="$APP_THREADS"
 
 # CSV output depends on app
-CSV="$SCRIPTS/results/dsm_results_${APP}_${N_CORES}_cores${SUFFIX:+_$SUFFIX}.csv"
+CSV="$SCRIPTS/results/${APP}/dsm_results_${APP}_${N_CORES}_cores${SUFFIX:+_$SUFFIX}.csv"
 
 MAX_PHYSICAL=28
 CPU_LIST="0"
@@ -134,7 +134,7 @@ echo "[INFO] Using CPU list: $CPU_LIST"
 run_cmd() { echo ">>> CMD: $*"; eval "$*"; }
 
 # CSV header
-echo "config,init,dump_s,scp_s,filter_s,restore_s,exec_s" > "$CSV"
+echo "cores,config,transport,dump,scp_s,filter,restore,exec" > "$CSV"
 
 echo "=== Clean previous runs ==="
 sudo pkill -9 -f "criu" || true
@@ -167,7 +167,7 @@ echo "VANILLA total time    = $exec_total"
 
 # write CSV line:
 # columns: config,init,dump_s,scp_s,filter_s,restore_s,exec_s
-echo "vanilla,0,0,0,0,$exec_total,$exec_internal" >> "$CSV"
+echo "$N_CORES,vanilla,0,0,0,0,$exec_total,$exec_internal" >> "$CSV"
 
 echo "=== Vanilla done ==="
 echo ""
@@ -372,7 +372,10 @@ for cfg in "${CONFIGS[@]}"; do
     echo "RESTORE OVERHEAD = $restore_overhead"
     echo "EXEC TIME        = $exec_time"
 
-    run_cmd "sudo sh -c 'echo \"$CONF_NAME,$init_time,$dump_time,$scp_time,$filter_time,$restore_overhead,$exec_time\" >> \"$CSV\"'"
+    run_cmd "sudo sh -c 'echo \"$N_CORES,$CONF_NAME,$MODE,$dump_time,$scp_time,$filter_time,$restore_overhead,$exec_time\" >> \"$CSV\"'"
+
+    cp /tmp/page_test_times.csv "/tmp/page_test_times_${MODE}.csv"
+#echo "cores,config,transport,dump,scp_s,filter,restore,execute" > "$CSV"
 
     echo ">>> Finished $CONF_NAME"
 done

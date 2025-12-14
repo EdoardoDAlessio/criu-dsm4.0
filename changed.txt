@@ -1,0 +1,105 @@
+10 151 compel/arch/aarch64/src/lib/infect.c
+1 1 compel/arch/arm/src/lib/infect.c
+1 1 compel/arch/loongarch64/src/lib/infect.c
+9 22 compel/arch/mips/src/lib/handle-elf.c
+1 1 compel/arch/mips/src/lib/infect.c
+1 1 compel/arch/ppc64/src/lib/infect.c
+0 78 compel/arch/riscv64/src/lib/cpu.c
+0 1 compel/arch/riscv64/src/lib/handle-elf-host.c
+0 32 compel/arch/riscv64/src/lib/handle-elf.c
+0 224 compel/arch/riscv64/src/lib/infect.c
+1 1 compel/arch/s390/src/lib/infect.c
+4 4 compel/arch/x86/src/lib/infect.c
+1 1 compel/src/lib/infect-util.c
+118 20 compel/src/lib/infect.c
+0 3 compel/src/main.c
+0 3 compel/test/infect/spy.c
+112 1 compel/test/stack/spy.c
+5 254 criu/arch/aarch64/crtools.c
+0 157 criu/arch/aarch64/gcs.c
+1 1 criu/arch/arm/crtools.c
+1 1 criu/arch/loongarch64/crtools.c
+1 1 criu/arch/mips/crtools.c
+0 6 criu/arch/ppc64/cpu.c
+1 1 criu/arch/ppc64/crtools.c
+0 40 criu/arch/riscv64/cpu.c
+0 171 criu/arch/riscv64/crtools.c
+0 14 criu/arch/riscv64/restorer.c
+0 8 criu/arch/riscv64/sigframe.c
+0 159 criu/arch/riscv64/vdso-pie.c
+0 6 criu/arch/s390/cpu.c
+39 53 criu/arch/s390/crtools.c
+0 6 criu/arch/x86/cpu.c
+1 1 criu/arch/x86/crtools.c
+1 1 criu/cgroup.c
+31 2 criu/config.c
+0 35 criu/cr-check.c
+1 2 criu/cr-dedup.c
+25 46 criu/cr-dump.c
+27 69 criu/cr-restore.c
+159 215 criu/cr-service.c
+99 96 criu/crtools.c
+2 2 criu/fault-injection.c
+1 1 criu/fdstore.c
+3 7 criu/files-ext.c
+1 1 criu/files-reg.c
+2 13 criu/files.c
+0 1 criu/image-desc.c
+1 160 criu/image.c
+1 145 criu/kerndat.c
+12 23 criu/log.c
+2 4 criu/lsm.c
+35 147 criu/mem.c
+12 31 criu/mount-v2.c
+1 12 criu/mount.c
+15 10 criu/namespaces.c
+15 215 criu/net.c
+1 19 criu/netfilter.c
+5 5 criu/page-pipe.c
+22 31 criu/page-xfer.c
+0 3 criu/pagemap-cache.c
+12 24 criu/pagemap.c
+1 4 criu/parasite-syscall.c
+1 1 criu/pidfd-store.c
+0 305 criu/pidfd.c
+1 18 criu/pie/parasite-vdso.c
+277 15 criu/pie/parasite.c
+52 147 criu/pie/restorer.c
+59 249 criu/pie/util-vdso.c
+0 14 criu/plugin.c
+10 101 criu/proc_parse.c
+0 1 criu/protobuf-desc.c
+6 13 criu/pstree.c
+52 109 criu/seize.c
+1 1 criu/servicefd.c
+10 17 criu/shmem.c
+3 13 criu/sk-inet.c
+1 1 criu/sk-netlink.c
+1 1 criu/sk-packet.c
+1 1 criu/sk-unix.c
+9 41 criu/sockets.c
+1 3 criu/timer.c
+1 1 criu/tty.c
+13 14 criu/uffd.c
+1 3 criu/unittest/mock.c
+10 8 criu/util.c
+7 27 criu/vdso.c
+2 21 lib/c/criu.c
+
+
+
+
+
+╭─EdoDale@node-0 ~/criu ‹main●›
+╰─$ git diff --numstat upstream/criu-dev..main \
+    | awk '$2==0 && $3 ~ /^criu\/.*\.c$/ {print $1, $3}'
+
+1 criu/arch/x86/shstk.c
+1697 criu/cr-dsm_client.c
+2340 criu/cr-dsm_server.c
+4661 criu/dsm.c
+25 criu/dsm_log.c
+╭─EdoDale@node-0 ~/criu ‹main●›
+╰─$
+
+CRIT IMAGE PYTHON SCRIPT 102 LOC

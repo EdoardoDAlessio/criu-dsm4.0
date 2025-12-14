@@ -9,7 +9,7 @@ APP_EXEC="page_test"
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="3 1 100"
+APP_ARGS="3 512 100"
 # Additional input files required for correct execution (optional)
 APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
 
@@ -21,12 +21,11 @@ CLIENTS=("dsm_client" "dsm_client2" )
 
 # Number of threads for DSM (main thread count)
 APP_THREADS=3
-
-########## RESTORE / SPLIT CONFIGS ##########
 CONFIGS=(
     #"base   0     0-1   tcp"
     #"2node 2 0-0 1-1 tcp"
     "split1_1_tcp   2   0-0  1-1  2-2    tcp"
+    #"split1_1_rdma   2   0-0  1-1  2-2    rdma"
     #"split4_4_rdma  2   0-0  1-1  2-2      rdma"
     #"split4_2_2_tcp 2 0-0 1-1 2-2 tcp"
     #"split4_2_2_rdma  2  0-3     4-5     6-7     rdma"

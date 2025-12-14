@@ -1,0 +1,3 @@
+config,init,dump_s,scp_s,filter_s,restore_s,exec_s
+vanilla,0,0,0,0,.001771489,0
+split32_32_tcp,.593381521,4.919649862,26.417079853,2.545973416,12.588176301,50.682600

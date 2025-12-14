@@ -1,0 +1,9 @@
+╭─EdoDale@node-0 ~sys/shm
+╰─$ la
+total 61G
+-rw-r--r-- 1 EdoDale popcornlinux-PG0  25G Dec  9 14:49 key_file_24000MB.txt
+-rw-r--r-- 1 EdoDale popcornlinux-PG0  195 Dec  9 14:49 key_file_24000MB.txt_check
+-rw-r--r-- 1 EdoDale popcornlinux-PG0  33G Dec  9 14:53 key_file_32000MB.txt
+-rw-r--r-- 1 EdoDale popcornlinux-PG0 4.1G Dec  9 14:42 key_file_4000MB.txt
+╭─EdoDale@node-0 ~sys/shm
+╰─$

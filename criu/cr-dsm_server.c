@@ -993,11 +993,72 @@ void dsm_command_main_loop_RDMA(command_thread_args *a){
         DSM_DEBUG_SERVER("[DSM Server] Received message: type=%d, addr=0x%lx, id=%ld\n\r",
                msg.msg_type, msg.page_addr, msg.msg_id);
 		
-		if( msg.msg_type != MSG_BARRIER_HIT ) {
+		if( msg.msg_type != MSG_BARRIER_HIT &&  msg.msg_type != MSG_LOCK_REQUEST && msg.msg_type != MSG_UNLOCK && msg.msg_type != MSG_JOIN_THREAD ) {
 			fault_start(msg.page_addr, "SERVER", client_id);
 			print_owner_mask( page_list_data[msg.msg_id].owner_mask );
-		}	
+		}
         switch (msg.msg_type) {
+
+			case MSG_LOCK_REQUEST: 
+				unsigned long my_ticket;
+
+				pthread_mutex_lock(&mutex_l);
+
+				my_ticket = ticket_next++;
+				DSM_EVENT_SERVER("[mutex] remote LOCK from client=%d, ticket=%lu (serving=%lu)\n",
+								client_id,
+								(unsigned long)my_ticket,
+								(unsigned long)ticket_serving);
+
+				while (my_ticket != ticket_serving) {
+					pthread_cond_wait(&mutex_cond, &mutex_l);
+				}
+
+				/* Now this client is granted the lock */
+				pthread_mutex_unlock(&mutex_l);
+				DSM_EVENT_SERVER("[SERVER] Sending ACK_CMD to client.handler on GRANT LOCK (imm=0xB1)\n\r");
+				rdma_write_core(&endpoints[client_id].receiver_data,
+								be64toh(endpoints[client_id].remote_all.handler.vaddr),
+								ntohl(endpoints[client_id].remote_all.handler.rkey),
+								endpoints[client_id].receiver_data.base_addr, 0, 0xB1);
+
+				continue;
+				break;
+
+			case MSG_UNLOCK: 
+				pthread_mutex_lock(&mutex_l);
+
+				ticket_serving++;
+				DSM_EVENT_SERVER("[mutex] remote UNLOCK from client=%d, now serving=%lu\n",
+								client_id,
+								(unsigned long)ticket_serving);
+
+				pthread_cond_broadcast(&mutex_cond);
+
+				pthread_mutex_unlock(&mutex_l);
+				continue;
+				break;
+			case MSG_JOIN_THREAD:
+				DSM_EVENT_SERVER("Server received JOIN_THREAD from client:%d, tid:%d\n\r", client_id, msg.msg_id);
+				{
+					char path[256];
+					int fd ;
+					snprintf(path, sizeof(path), "/tmp/thread_%ld_dead", msg.msg_id);
+
+					fd = open(path, O_CREAT | O_WRONLY, 0666);
+					if (fd < 0) {
+						perror("open dead thread file");
+					} else {
+						close(fd);
+					}
+
+				}
+
+				continue;
+				break;
+
+
+
 			case MSG_BARRIER_HIT:
 				if( num_clients ){
 					pthread_mutex_lock(&barrier.lock);

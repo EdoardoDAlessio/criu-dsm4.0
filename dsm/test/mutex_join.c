@@ -220,7 +220,7 @@ void *worker(void *arg) {
     
     while(1){
 
-         // Local mutex acquisition
+        // Local mutex acquisition
         pthread_mutex_lock(&lock);
 
         // Global mutex acquisition: write to current barrier page

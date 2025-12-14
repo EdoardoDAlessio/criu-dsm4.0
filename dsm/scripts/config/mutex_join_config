@@ -17,7 +17,7 @@ APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client" "dsm_client2")
+CLIENTS=("dsm_client" "dsm_client2" "dsm_client3")
 
 # Number of threads for DSM (main thread count)
 APP_THREADS=6
@@ -25,10 +25,7 @@ APP_THREADS=6
 ########## RESTORE / SPLIT CONFIGS ##########
 CONFIGS=(
     #"base   0     0-1   tcp"
-    #"split1_1_tcp   2   0-0  1-1  2-2    rdma"
-    "split4_4_rdma  1   0-4 5-6   rdma"
-    "split4_4_tcp  1   0-4 5-6   tcp"
-    #"split4_2_2_tcp 2 0-2 3-4 5-6 tcp"
+    "3nodes 3 0-2 3-3 4-4 5-5 tcp"
     #"split4_2_2_rdma  2  0-3     4-5     6-7     rdma"
 )
 

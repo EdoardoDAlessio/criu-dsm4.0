@@ -1,0 +1,4 @@
+cores,config,transport,dump,scp_s,filter,restore,exec
+32,vanilla,0,0,0,0,.001282231,0
+32,split4_4_tcp,tcp,.067169930,1.912522238,.096786712,170.506892324,0.0
+32,split1_1_tcp,tcp,.067169930,1.912522238,.095898844,240.943964058,0.0
