@@ -18,6 +18,7 @@
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 #define BACKLOG 1
 
+#define KPROBE_MADVISE 0
 #define RDMA_ENABLE 1
 #define DBG 0
 #define COMMAND_LOOP 0

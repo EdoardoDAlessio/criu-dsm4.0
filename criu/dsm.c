@@ -30,7 +30,7 @@ struct vm_area_list* my_vm_area_list;
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
-//#include "user.h"
+#include "user.h"
 #include "page.h" //this takes the page size
 #define ACK_WRITE_PROTECT_EXPIRED 0x11
 // Setup global variable address 
@@ -400,256 +400,6 @@ void rdma_write_core(rdma_context *ctx,
     ibv_post_send(ctx->qp, &wr, &bad);
     poll_one_cqe(ctx, &wc);
 }
-#elif 0
-
-#include "dsm.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <arpa/inet.h>
-#include <time.h>
-
-#define RDMA_PORT 1
-
-#define DIE_IF(cond, msg) \
-    do { if (cond) { perror(msg); exit(EXIT_FAILURE); } } while (0)
-
-int rdma_context_init(rdma_context *c)
-{
-    struct ibv_device **devs;
-    int n;
-    struct ibv_qp_init_attr qia;
-    struct ibv_qp_attr a;
-    int ret;
-
-    memset(c, 0, sizeof(*c));
-
-    devs = ibv_get_device_list(&n);
-    DIE_IF(!devs || !n, "no RDMA devices");
-
-    c->ctx = ibv_open_device(devs[0]);
-    DIE_IF(!c->ctx, "ibv_open_device");
-    ibv_free_device_list(devs);
-
-    DIE_IF(ibv_query_port(c->ctx, RDMA_PORT, &c->port_attr), "ibv_query_port");
-    DIE_IF(ibv_query_gid(c->ctx, RDMA_PORT, 0, &c->gid), "ibv_query_gid");
-
-    c->pd = ibv_alloc_pd(c->ctx);
-    DIE_IF(!c->pd, "ibv_alloc_pd");
-
-    c->cq = ibv_create_cq(c->ctx, 16, NULL, NULL, 0);
-    DIE_IF(!c->cq, "ibv_create_cq");
-
-    DIE_IF(posix_memalign(&c->base_addr, 4096, 4096) != 0, "memalign");
-    c->length = 4096;
-    c->mr = ibv_reg_mr(c->pd, c->base_addr, c->length,
-                       IBV_ACCESS_LOCAL_WRITE |
-                       IBV_ACCESS_REMOTE_WRITE |
-                       IBV_ACCESS_REMOTE_READ);
-    DIE_IF(!c->mr, "ibv_reg_mr");
-    c->rkey = c->mr->rkey;
-    c->lkey = c->mr->lkey;
-
-    memset(&qia, 0, sizeof(qia));
-    qia.send_cq = c->cq;
-    qia.recv_cq = c->cq;
-    qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr = 16;
-    qia.cap.max_recv_wr = 16;
-    qia.cap.max_send_sge = 1;
-    qia.cap.max_recv_sge = 1;
-    qia.cap.max_inline_data = 128;
-
-    c->qp = ibv_create_qp(c->pd, &qia);
-    DIE_IF(!c->qp, "ibv_create_qp");
-
-    memset(&a, 0, sizeof(a));
-    a.qp_state = IBV_QPS_INIT;
-    a.port_num = RDMA_PORT;
-    a.pkey_index = 0;
-    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
-                        IBV_ACCESS_REMOTE_WRITE |
-                        IBV_ACCESS_REMOTE_READ;
-    ret = ibv_modify_qp(c->qp, &a,
-                        IBV_QP_STATE |
-                        IBV_QP_PKEY_INDEX |
-                        IBV_QP_PORT |
-                        IBV_QP_ACCESS_FLAGS);
-    DIE_IF(ret, "INIT");
-
-    srand((unsigned)time(NULL));
-    c->psn = rand() & 0xffffff;
-    c->max_inline = qia.cap.max_inline_data;
-
-    return 0;
-}
-
-void rdma_cleanup(rdma_context *c)
-{
-    if (!c) return;
-    if (c->qp) ibv_destroy_qp(c->qp);
-    if (c->cq) ibv_destroy_cq(c->cq);
-    if (c->mr) ibv_dereg_mr(c->mr);
-    if (c->pd) ibv_dealloc_pd(c->pd);
-    if (c->ctx) ibv_close_device(c->ctx);
-    free(c->base_addr);
-}
-int pick_valid_sgid_index(struct ibv_context *ctx, uint8_t port,
-                                 uint8_t *out_idx, union ibv_gid *out_gid)
-{
-    int idx;
-    union ibv_gid g;
-
-    for (idx = 0; idx < 16; idx++) {
-        if (ibv_query_gid(ctx, port, idx, &g) != 0)
-            continue;
-
-        /* skip all-zero gid */
-        if (((uint64_t*)g.raw)[0] == 0 && ((uint64_t*)g.raw)[1] == 0)
-            continue;
-
-        *out_idx = (uint8_t)idx;
-        if (out_gid) *out_gid = g;
-        PRINT("[RDMA] pick_valid_sgid_index: using gid_index=%d "
-               "gid=%02x:%02x:%02x:%02x:%02x:%02x:... (port=%u)\n",
-               idx,
-               g.raw[0], g.raw[1], g.raw[2], g.raw[3], g.raw[4], g.raw[5],
-               (unsigned)port);
-        return 0;
-    }
-    fprintf(stderr, "[RDMA] No valid GID found on port %u\n", (unsigned)port);
-    return -1;
-}
-
-/* dsm.c */
-void qp_to_rtr_rts(struct ibv_qp *qp,
-                   const struct ibv_port_attr *pa,
-                   const rdma_wire_info *peer,
-                   uint32_t local_psn,
-                   uint8_t sgid_idx,
-                   uint8_t port)
-{
-    struct ibv_qp_attr a;
-    int flags;
-
-    memset(&a, 0, sizeof(a));
-    /* --- RTR --- */
-    a.qp_state           = IBV_QPS_RTR;
-    a.path_mtu           = pa->active_mtu;
-    a.dest_qp_num        = ntohl(peer->qp_num);
-    a.rq_psn             = ntohl(peer->psn);        /* expect peer’s SQ PSN */
-    a.max_dest_rd_atomic = 1;
-    a.min_rnr_timer      = 12;
-    a.ah_attr.port_num   = port;
-
-    if (pa->link_layer == IBV_LINK_LAYER_INFINIBAND) {
-        a.ah_attr.is_global = 0;
-        a.ah_attr.dlid      = ntohs(peer->lid);
-    } else {
-        a.ah_attr.is_global        = 1;
-        a.ah_attr.grh.hop_limit    = 1;
-        a.ah_attr.grh.sgid_index   = sgid_idx;
-        memcpy(&a.ah_attr.grh.dgid, peer->gid, 16);
-    }
-
-    flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-            IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-
-    if (ibv_modify_qp(qp, &a, flags)) { perror("RTR"); exit(1); }
-
-    /* --- RTS --- */
-    memset(&a, 0, sizeof(a));
-    a.qp_state      = IBV_QPS_RTS;
-    a.timeout       = 14;
-    a.retry_cnt     = 7;
-    a.rnr_retry     = 7;
-    a.sq_psn        = local_psn & 0xFFFFFF;   /* MUST match what you sent in local.psn */
-    a.max_rd_atomic = 1;
-
-    flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
-
-    if (ibv_modify_qp(qp, &a, flags)) { perror("RTS"); exit(1); }
-}
-
-
-
-void post_one_recv(rdma_context *ctx)
-{
-    struct ibv_sge s;
-    struct ibv_recv_wr wr;
-    struct ibv_recv_wr *bad;
-
-    memset(&s, 0, sizeof(s));
-    s.addr = (uintptr_t)ctx->base_addr;
-    s.length = 4;
-    s.lkey = ctx->lkey;
-
-    memset(&wr, 0, sizeof(wr));
-    wr.sg_list = &s;
-    wr.num_sge = 1;
-
-    bad = NULL;
-    ibv_post_recv(ctx->qp, &wr, &bad);
-}
-
-void poll_one_cqe(rdma_context *ctx, struct ibv_wc *wc)
-{
-    int n;
-    for (;;) {
-        n = ibv_poll_cq(ctx->cq, 1, wc);
-        if (n == 1) break;
-    }
-}
-
-void rdma_write_core(rdma_context *ctx,
-                     uint64_t remote_addr, uint32_t remote_rkey,
-                     const void *src, size_t len, uint32_t imm)
-{
-    struct ibv_send_wr wr;
-    struct ibv_send_wr *bad;
-    struct ibv_sge s;
-    struct ibv_wc wc;
-
-    memset(&wr, 0, sizeof(wr));
-    memset(&s, 0, sizeof(s));
-
-    s.addr = (uintptr_t)src;
-    s.length = (uint32_t)len;
-    s.lkey = ctx->lkey;
-
-    wr.sg_list = &s;
-    wr.num_sge = 1;
-    wr.opcode = imm ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.rdma.remote_addr = remote_addr;
-    wr.wr.rdma.rkey = remote_rkey;
-    if (imm) wr.imm_data = htonl(imm);
-
-    bad = NULL;
-    ibv_post_send(ctx->qp, &wr, &bad);
-    poll_one_cqe(ctx, &wc);
-}
-
-int readn_all_exact(int fd, void *buf, size_t n) {
-    char *p = (char*)buf; size_t left = n; ssize_t r;
-    while (left) { r = recv(fd, p, left, 0);
-        if (r < 0) { if (errno == EINTR) continue; return -1; }
-        if (r == 0) return -1; 
-        p += r; left -= (size_t)r; }
-    return 0;
-}
-int writen_all_exact(int fd, const void *buf, size_t n) {
-    const char *p = (const char*)buf; size_t left = n; ssize_t w;
-    while (left) { w = send(fd, p, left, 0);
-        if (w < 0) { if (errno == EINTR) continue; return -1; }
-        if (w == 0) return -1; 
-        p += w; left -= (size_t)w; }
-    return 0;
-}
-
 #endif
 
 /*********************************** VMA RECONSTRUCTION ********************* */
@@ -2378,7 +2128,6 @@ fail:
 	return -1;
 }
 
-#if 1
 
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -2405,7 +2154,10 @@ int init_pidfd(int restored_pid) {
     return pidfd;
 }
 
-
+#if KPROBE_MADVISE
+/*pidfd is needed in this case, but to cut syscall, I only call SYS_pidfd_open once, and then store the value and call: run_proc_MADVISE.
+    - So run_proc_MADVISE needs pidfd
+    - runMADVISE doesn't need pidfd*/
 int run_proc_MADVISE(int pidfd, int restored_pid, void *addr, size_t len) {
     struct iovec iov;
     long ret;
@@ -2413,7 +2165,6 @@ int run_proc_MADVISE(int pidfd, int restored_pid, void *addr, size_t len) {
     PRINT("[DSM] Sending remote process_madvise(MADV_DONTNEED) with pidfd %d request to pid %d at %p (len=%zu)...\n",
           pidfd, restored_pid, addr, len);
 
-    
     // Prepare iovec for the target memory region
     iov.iov_base = addr;
     iov.iov_len = len;
@@ -2464,6 +2215,58 @@ int runMADVISE(int restored_pid, void *addr, size_t len) {
 
 
 #else
+/*pidfd is not needed in this case, but in order to keep the same function signature. Therefore, run_proc_MADVISE = runMADVISE*/
+int run_proc_MADVISE(int pidfd, int restored_pid, void *addr, size_t len) {
+	int state;
+	struct parasite_ctl *ctl;
+	struct infect_ctx *ictx;
+	struct madvise_args *args;
+	(void) state;
+	(void) args;
+
+	PRINT("[DSM] Sending remote madvise(MADV_DONTNEED) request...\n");
+
+	state = compel_stop_task(restored_pid);
+	if (!(ctl = compel_prepare(restored_pid))){
+		pr_err("❌ Compel prepare failed\n");
+		return -1;
+	} 
+
+	parasite_setup_c_header(ctl);
+	ictx = compel_infect_ctx(ctl);
+	ictx->log_fd = STDERR_FILENO;
+
+	if (compel_infect(ctl, 1, sizeof(long)) < 0) {
+		xfree(ctl);
+		return -1;
+	}
+
+	//Prepare the addr to pass
+    args = compel_parasite_args(ctl, struct madvise_args);
+	args->addr = (long)addr;
+    args->length = len;  
+
+	if (compel_rpc_call(PARASITE_CMD_RUN_MADVISE, ctl) < 0) {
+		pr_err("❌ RPC call to run MADVISE failed\n");
+		goto fail;
+	}
+	if (compel_rpc_sync(PARASITE_CMD_RUN_MADVISE, ctl) < 0) {
+		pr_err("❌ Failed to sync back from MADVISE\n");
+		goto fail;
+	}
+	if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
+	if (compel_cure(ctl)) pr_err("Can't cure\n");
+	if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
+	
+	return 0;
+fail:
+	state = compel_stop_daemon(ctl);
+	state = compel_cure(ctl);
+	state = compel_resume_task(restored_pid, state, state);
+	return -1;
+}
+
+
 int runMADVISE(int restored_pid, void *addr, size_t len){
 	int state;
 	struct parasite_ctl *ctl;
@@ -2514,6 +2317,8 @@ fail:
 	return -1;
 }
 #endif
+
+
 void print_mutex(const unsigned char *page_data, size_t offset) {
     const pthread_mutex_t *mutex = (const pthread_mutex_t *)(page_data + offset);
     int lock = *((int *)mutex);               // __lock
@@ -3111,11 +2916,6 @@ int send_get_page(struct msg_info dsm_msg, int fd_handler, void *page_out) {
     return 0;
 }
 
-
-
-#if 1
-
-
 int wait_readable(int fd, int timeout_ms) {
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
     int r = poll(&pfd, 1, timeout_ms);
@@ -3158,12 +2958,7 @@ int send_all(int fd, const void *buf, size_t len) {
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#endif
 
-#if RDMA_ENABLE && 0
-
-
-#elif 1
 int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg) {
     unsigned char page_content[PAGE_SIZE];
     struct iovec local_iov, remote_iov;
@@ -3228,222 +3023,6 @@ int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info
     return 0;
 }
 
-
-
-#elif 1
-int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg) {
-    int state;
-    int p[2];
-    unsigned char page_content[PAGE_SIZE];
-    struct parasite_ctl *ctl;
-    struct infect_ctx *ictx;
-    long *args;
-
-    PRINT("[DSM] Sending get page to rpc daemon (DUMP_SINGLE) request...\n");
-
-    state = compel_stop_task(restored_pid);
-    if (!(ctl = compel_prepare(restored_pid))) {
-        PRINT("❌ compel_prepare failed\n");
-        return -1;
-    }
-
-    parasite_setup_c_header(ctl);
-    ictx = compel_infect_ctx(ctl);
-    ictx->log_fd = STDERR_FILENO;
-
-    if (compel_infect(ctl, 1, sizeof(long)) < 0) {
-        PRINT("❌ compel_infect failed\n");
-        xfree(ctl);
-        return -1;
-    }
-
-    args = compel_parasite_args(ctl, long);
-    *args = dsm_msg->page_addr;
-
-    if (pipe(p) < 0) {
-        perror("pipe");
-        return -1;
-    }
-
-    if (compel_rpc_call(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        PRINT("❌ RPC DUMP_SINGLE call failed\n");
-        goto fail_close;
-    }
-
-    if (compel_util_send_fd(ctl, p[1]) != 0) {
-        PRINT("❌ Failed to send pipe fd\n");
-        goto fail_close;
-    }
-
-    if (compel_rpc_sync(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        PRINT("❌ RPC DUMP_SINGLE sync failed\n");
-        goto fail_close;
-    }
-
-    close(p[1]); // close write end on parent
-
-    PRINT("[DSM] Waiting for parasite page data on fd=%d\n", p[0]);
-
-    if (wait_readable(p[0], 5000) < 0) {
-        PRINT("❌ Timeout waiting for parasite page data\n");
-        goto fail_close;
-    }
-
-    if (all_read(p[0], page_content, PAGE_SIZE) < 0) {
-        perror("all_read parasite pipe");
-        goto fail_close;
-    }
-
-    PRINT("✅ Received 4096 bytes from parasite, sending to client (fd=%d)\n", sk);
-
-    if (send_all(sk, page_content, PAGE_SIZE) < 0) {
-        perror("send_all(page_content)");
-        goto fail_close;
-    }
-
-    PRINT("✅ Page_transfer_complete to client (addr=%p)\n", (void*)dsm_msg->page_addr);
-
-    // Optional: perform invalidation or re-enable WP
-    if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
-        PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
-        if (compel_rpc_call_sync(PARASITE_CMD_RUN_MADVISE_SINGLE_PAGE, ctl) < 0)
-            PRINT("❌ MADV_DONTNEED failed\n");
-        else
-            PRINT("Madvise to invalidate page %p\n", (void *)dsm_msg->page_addr);
-        update_page_info(dsm_msg->page_addr, 1, INVALID, -2);
-    } else {
-        PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n");
-        if (enable_wp(uffd, (void *)dsm_msg->page_addr))
-            PRINT("⚠️ enable_wp failed\n");
-        update_page_info(dsm_msg->page_addr, 1, SHARED, -2);
-    }
-
-    if (compel_stop_daemon(ctl))
-        PRINT("⚠️ Can't stop daemon\n");
-    if (compel_cure(ctl))
-        PRINT("⚠️ Can't cure\n");
-    if (compel_resume_task(restored_pid, state, state))
-        PRINT("⚠️ Can't resume task\n");
-
-    close(p[0]);
-    return 0;
-
-fail_close:
-    close(p[0]);
-    close(p[1]);
-    return -1;
-}
-
-#elif 0
-int handle_page_data_request(int restored_pid, int uffd, int sk, struct msg_info *dsm_msg) {
-    int state, value, p[2];
-    long *args;
-    unsigned char page_content[4096];
-    size_t offset;
-    struct parasite_ctl *ctl;
-    struct infect_ctx *ictx;
-
-    
-    (void) value;
-    (void) offset;
-
-
-    PRINT("[DSM] Sending get page to rpc daemon (DUMP_SINGLE) request...\n");
-
-    state = compel_stop_task(restored_pid);
-    if (!(ctl = compel_prepare(restored_pid))) {
-        pr_err("❌ Compel prepare failed\n");
-        return -1;
-    }
-
-    parasite_setup_c_header(ctl);
-    ictx = compel_infect_ctx(ctl);
-    ictx->log_fd = STDERR_FILENO;
-
-    if (compel_infect(ctl, 1, sizeof(long)) < 0) {
-        xfree(ctl);
-        return -1;
-    }
-
-    args = compel_parasite_args(ctl, long);
-    *args = dsm_msg->page_addr;
-
-    if (pipe(p) < 0) {
-        perror("pipe");
-        return -1;
-    }
-
-    if (compel_rpc_call(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        fprintf(stderr, "RPC DUMP_SINGLE call failed\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (compel_util_send_fd(ctl, p[1]) != 0) {
-        fprintf(stderr, "Failed to send pipe fd\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (compel_rpc_sync(PARASITE_CMD_DUMP_SINGLE, ctl) < 0) {
-        fprintf(stderr, "RPC DUMP_SINGLE sync failed\n");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    if (read(p[0], page_content, 4096) != 4096) {
-        perror("read from parasite pipe");
-        close(p[0]);
-        close(p[1]);
-        return -1;
-    }
-
-    // Send page to requesting client
-    send(sk, page_content, 4096, 0);
-    PRINT("✅ Page_transfer_complete to client\n");
-
-    #if 0
-    // Show value at global_addr for debugging
-    offset = global_addr - aligned;
-    if (offset >= 4096 - sizeof(int)) {
-        fprintf(stderr, "Offset out of bounds\n");
-    } else {
-        memcpy(&value, &page_content[offset], sizeof(int));
-        //PRINT("[DSM] Value at GLOBAL_ADDR (0x%lx): %d (0x%x)\n", global_addr, value, value);
-    }
-    #endif
-
-    // Handle invalidation or write protection
-
-    if (dsm_msg->msg_type == MSG_GET_PAGE_DATA_INVALID) {
-        PRINT("Message is GET_PAGE_INVALIDATE → Drop the page to INVALIDATE\n");
-        if (compel_rpc_call_sync(PARASITE_CMD_RUN_MADVISE_SINGLE_PAGE, ctl) < 0) {
-            fprintf(stderr, "❌ MADV_DONTNEED failed\n");
-        }else PRINT("Madvise to invalidate page %p\n", (void *)dsm_msg->page_addr);
-        if( update_page_info(dsm_msg->page_addr, 1, INVALID, -2) != 0) kill_and_exit(restored_pid);
-    } else {
-        PRINT("Message is GET_PAGE_DATA → Enable WP to SHARED\n");
-        enable_wp( uffd, (void *)dsm_msg->page_addr);
-        if( update_page_info(dsm_msg->page_addr, 1, SHARED, -2) == -2){
-            PRINT("mah\n");
-            kill_and_exit(restored_pid);
-        }
-    }
-
-    
-    if (compel_stop_daemon(ctl)) pr_err("Can't stop daemon\n");
-    if (compel_cure(ctl)) pr_err("Can't cure\n");
-    if (compel_resume_task(restored_pid, state, state)) pr_err("Can't resume\n");
-
-    close(p[0]);
-    close(p[1]);
-
-    return 0;
-}
-#endif
 /******************************** END INFECTION FUNCTIONS *******************************/
 
 /******************************** CONTROLLER HELPER FUNCTIONS *******************************/

@@ -36,7 +36,7 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
 //#undef uffdio_range
-//#include "user.h"
+#include "user.h"
 
 //#include "parsemap.h"
 
@@ -71,6 +71,8 @@ int num_clients = 0;
 unsigned long *active_addr;
 pthread_cond_t *fault_cond;
 pthread_mutex_t *handler_locks;
+
+unsigned long my_ticket;
 
 void print_owner_mask(uint64_t mask)
 {
@@ -186,67 +188,6 @@ int get_local_thread_count(int restored_pid) {
 #include <pthread.h>
 #include <stdbool.h>
 #include <time.h>
-#if 0
-
-typedef struct barrier_state {
-    int total_threads;       // total participants (local + remote)
-    int arrived;             // number of threads that have hit the barrier
-    void **pending_addrs;    // array of faulting pages to resolve later
-    int pending_count;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;     // signal resolver when all arrived
-} barrier_state_t;
-
-barrier_state_t barrier = {0};
-
-void barrier_init(void) {
-    barrier.total_threads = total_threads;
-    barrier.arrived = 0;
-    barrier.pending_addrs = malloc(total_threads * sizeof(void *));
-    barrier.pending_count = 0;
-    pthread_mutex_init(&barrier.lock, NULL);
-    pthread_cond_init(&barrier.cond, NULL);
-}
-
-
-void *barrier_resolver_thread(void *arg) {
-		
-	//struct timespec ts;
-	//ts.tv_sec = 0;
-	//ts.tv_nsec = 500000000;  // 0.5 seconds
-    while (true) {
-        pthread_mutex_lock(&barrier.lock);
-
-        while (barrier.arrived < barrier.total_threads) {
-            pthread_cond_wait(&barrier.cond, &barrier.lock);
-        }
-
-        // ✅ At this point, all threads are waiting at the barrier
-        PRINT("[resolver] All threads arrived. Resolving %d faults.\n\r",
-              barrier.pending_count);
-
-			  
-        for (int i = 0; i < barrier.pending_count; i++) {
-			disable_wp(uffd, barrier.pending_addrs[i]);
-			PRINT("[resolver] Resolved fault at %p\n\r", barrier.pending_addrs[i]);
-        }
-		//nanosleep(&ts, NULL);//sleep 0.5s to let threads continue and hit the barrier again
-		for (int i = 0; i < barrier.pending_count; i++) {
-			enable_wp(uffd, barrier.pending_addrs[i]);
-			PRINT("[resolver] Resolved fault at %p\n\r", barrier.pending_addrs[i]);
-        }
-		
-        // Reset for next barrier round
-        barrier.arrived = 0;
-        barrier.pending_count = 0;
-
-        pthread_mutex_unlock(&barrier.lock);
-    }
-    return NULL;
-}
-#endif
-
-//pthread_barrier_t local_barrier;
 pthread_mutex_t local_barrier = PTHREAD_MUTEX_INITIALIZER;
 int local_barrier_count = 0;
 
@@ -715,7 +656,6 @@ static void *handler(void *arg) {
 
 		/* Local LOCK via page fault */
 		else if (msg.arg.pagefault.address >= mutex_lock_start_address && msg.arg.pagefault.address < mutex_lock_end_address) {
-			unsigned long my_ticket;
 			pthread_mutex_lock(&mutex_l);
 
 			my_ticket = ticket_next++;
@@ -1000,7 +940,6 @@ void dsm_command_main_loop_RDMA(command_thread_args *a){
         switch (msg.msg_type) {
 
 			case MSG_LOCK_REQUEST: 
-				unsigned long my_ticket;
 
 				pthread_mutex_lock(&mutex_l);
 
@@ -1474,7 +1413,6 @@ void dsm_command_main_loop_RDMA(command_thread_args *a){
 			switch (msg.msg_type) {
 
 				case MSG_LOCK_REQUEST: 
-					unsigned long my_ticket;
 
 					pthread_mutex_lock(&mutex_l);
 

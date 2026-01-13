@@ -32,7 +32,7 @@
 #include <fcntl.h>
 #include <linux/userfaultfd.h>	
 
-//#include "user.h"
+#include "user.h"
 #include "page.h" //this takes the page size
 // Setup global variable address 
 extern unsigned long global_addr;
@@ -559,9 +559,6 @@ static void *handler_RDMA(void *arg) {
 			pthread_mutex_unlock(&barrier.lock);
 			continue;
 		}
-
-		//pthread_mutex_lock(&pagefaults_mutex);
-
 		//Getting index in page list data
 		index = -1;
 		for (int i=0; i < total_pages; i++) {
