@@ -5,6 +5,7 @@ if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
   exit 1
 fi
 
+PYTHON_PATH="/users/EdoDale/venv-criu/bin/python3"
 app=$1
 range=$2
 first=$(echo "$range" | cut -d'-' -f1)
@@ -25,7 +26,7 @@ done
 
 sudo pkill -9 -f "criu"
 
-cd ~/${app}
+cd /users/EdoDale/${app}
 readelf -s ./$app | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > /tmp/readelf.txt
 
 
@@ -33,7 +34,7 @@ readelf -s ./$app | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > 
 sudo rm -r images
 cp -r backup images
 
-cd ~/${app}/images || { echo "Image directory not found"; exit 1; }
+cd /users/EdoDale/${app}/images || { echo "Image directory not found"; exit 1; }
 sudo rm -f /tmp/ranges.txt
 sudo rm -f /tmp/dsm_barrier_pages.txt
 sudo rm -f /tmp/dsm_mutex.txt
@@ -42,9 +43,9 @@ cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt > /dev/null 2>&1 || true
 cp dsm_mutex.txt  /tmp/dsm_mutex.txt > /dev/null 2>&1 || true
 # Apply thread filtering
 if [ "$verbose_flag" == "-v" ]; then
-  python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" 
+  "$PYTHON_PATH" /users/EdoDale/criu/dsm/scripts/thread_filter_ranged.py "$range" 
 else
-  python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" > /dev/null 2>&1
+  "$PYTHON_PATH" /users/EdoDale/criu/dsm/scripts/thread_filter_ranged.py "$range" > /dev/null 2>&1
 fi
 
 
@@ -68,5 +69,8 @@ if [ -n "$defunct_pid" ]; then
 fi
 
 
-sudo ~/criu/criu/criu restore --shell-job --dsm_client 128.110.219.21 $verbose_flag $rdma_flag
+#sudo /users/EdoDale/criu/criu/criu restore --shell-job --dsm_client 10.10.1.1 $verbose_flag $rdma_flag
+
+sudo script -q -c "/users/EdoDale/criu/criu/criu restore --shell-job --dsm_client 10.10.1.1 $verbose_flag $rdma_flag" /dev/null
+
 rm -f /tmp/.restore_flag 

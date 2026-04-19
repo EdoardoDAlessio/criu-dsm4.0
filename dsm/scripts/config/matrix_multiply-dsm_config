@@ -21,15 +21,17 @@ APP_EXTRA_FILES=(
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client" "dsm_client2" "dsm_client3")
-
+CLIENTS=("node1" "node2" "node3")
 # Number of threads for DSM (main thread count)
 APP_THREADS=64
 
 ########## RESTORE / SPLIT CONFIGS ##########
 
+CONFIGS=(    
+    "16+16+16+16  3 0-15 16-31 32-47 48-63   rdma"
+        ) 
     
-CONFIGS=(
+CONFIGSS=(
     "22+21+21  2 0-21  22-42 43-63      tcp"
     "22+21+21 2 0-21  22-42 43-63      rdma"
     "16+16+16+16  3 0-15 16-31 32-47 48-63   tcp"
@@ -48,3 +50,4 @@ CONFIGS=(
 ########## SCRIPT PATHS ##########
 SCRIPTS="$HOME/criu/dsm/scripts"
 THREAD_FILTER="$SCRIPTS/thread_filter_ranged.py"
+PYTHON_PATH="$HOME/venv-criu/bin/python3"

@@ -10,7 +10,7 @@ APP_EXEC="pca-dsm"
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="-r 10000 -c 10000 -s 1000 -p 64"
+APP_ARGS="-r 10000 -c 10000 -s 1000 -p 128"
 
 # Additional input files required for correct execution (optional)
 APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
@@ -19,14 +19,19 @@ APP_EXTRA_FILES=()   # histogram-dsm doesn't need extra files
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client" "dsm_client2" "dsm_client3" )
+CLIENTS=("node1" "node2" "node3" )
 
 # Number of threads for DSM (main thread count)
-APP_THREADS=64
+APP_THREADS=128
 
 ########## RESTORE / SPLIT CONFIGS ##########
 #CONFIGS=()
 
+
+
+CONFIGS=(
+    "64  0 0-63  local"
+)
 
 CONFIGS=(
     "64  0 0-63  local"
@@ -47,8 +52,14 @@ CONFIGS=(
     "12+15+36  2  0-11 12-26 27-63  rdma"
     "9+10+21+34  3  0-8 9-18 19-31 32-63  rdma"
 )
-
+CONFIGS=(
+    "128  0 0-127 local"
+    "64+64 1 0-63  64-127    tcp"
+    "42+43+43 2 0-41 42-84 85-127   tcp"
+    "32+32+32+32 3 0-31 32-63 64-95 96-127   tcp"
+)
 
 ########## SCRIPT PATHS ##########
 SCRIPTS="$HOME/criu/dsm/scripts"
 THREAD_FILTER="$SCRIPTS/thread_filter_ranged.py"
+PYTHON_PATH="$HOME/venv-criu/bin/python3"
