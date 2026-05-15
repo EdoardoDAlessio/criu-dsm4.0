@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
 set -e
+
+
+##############################################
+### PHASE FLAGS — set to 1 to run, 0 to skip
+##############################################
+SKIP_ALL=0
+DO_VANILLA=1
+DO_DUMP=1
+DO_SCP=1
+DO_RESTORE_SERVER=1
+DO_RESTORE_CLIENTS=1
+SERVER_VERBOSE=0
+CLIENT_VERBOSE=0
+CLIENT_OUTPUT_FILE=1
+
+if [[ "$SKIP_ALL" -eq 1 ]]; then
+    DO_VANILLA=0
+    DO_DUMP=0
+    DO_SCP=0
+    DO_RESTORE_SERVER=0
+    DO_RESTORE_CLIENTS=0
+fi
 ##############################################
 ### SIGNAL HANDLER — MAKE CTRL+C WORK
 ##############################################
@@ -31,6 +53,10 @@ cleanup() {
 }
 
 trap cleanup INT
+
+
+
+
 
 ##############################################
 ### 0) ARGUMENT PARSING
@@ -87,14 +113,22 @@ FLAGCLIENT="$MODE"
 echo "======================================"
 echo " Loaded config: $CONFIG_FILE"
 echo "======================================"
-
 echo "CONF_NAME   = $CONF_NAME"
 echo "N_CLIENTS   = $N_CLIENTS"
 echo "MAIN_RANGE  = $MAIN_RANGE"
 echo "C_RANGE     = ${C_RANGE[*]}"
 echo "MODE        = $MODE"
 echo "FLAGCLIENT  = $FLAGCLIENT"
-
+echo ""
+echo "--- Phases ---"
+echo "DO_VANILLA        = $DO_VANILLA"
+echo "DO_DUMP           = $DO_DUMP"
+echo "DO_SCP            = $DO_SCP"
+echo "DO_RESTORE_SERVER = $DO_RESTORE_SERVER"
+echo "SERVER_VERBOSE    = $SERVER_VERBOSE"
+echo "DO_RESTORE_CLIENTS= $DO_RESTORE_CLIENTS"
+echo "CLIENT_VERBOSE    = $CLIENT_VERBOSE"
+echo "CLIENT_OUTPUT_FILE    = $CLIENT_OUTPUT_FILE"
 echo "======================================"
 sleep 1
 
@@ -134,6 +168,7 @@ echo "[INFO] Using CPU list: $CPU_LIST"
 run_cmd() { echo ">>> CMD: $*"; eval "$*"; }
 
 # CSV header
+touch "$CSV"
 echo "cores,config,transport,dump,scp_s,filter,restore,exec" > "$CSV"
 
 echo "=== Clean previous runs ==="
@@ -178,25 +213,26 @@ sleep 1
 ##############################################
 ### 1) DUMP PHASE (INLINE)
 ##############################################
+if [[ "$DO_DUMP" -eq 1 ]]; then
 echo "=== Dump (inline) ==="
 t_init=$(date +%s.%N)
 
 # --- CLEAN temp ---
 sudo rm -f /tmp/ranges.txt /tmp/dsm_barrier_pages.txt /tmp/dsm_mutex.txt
-rm -rf ~/"${APP}"
-mkdir -p ~/"${APP}/images"
+rm -rf $DIRECTORY/"${APP}"
+mkdir -p $DIRECTORY/"${APP}/images"
 
 # --- COPY APPLICATION FROM CONFIG ---
-cp "${APP_SOURCE_DIR}/${APP_EXEC}" ~/"${APP}/"
+cp "${APP_SOURCE_DIR}/${APP_EXEC}" $DIRECTORY/"${APP}/"
 
 # Copy extra data if defined
 if [[ ${#APP_EXTRA_FILES[@]} -gt 0 ]]; then
     for f in "${APP_EXTRA_FILES[@]}"; do
-        cp "${APP_SOURCE_DIR}/${f}" ~/"${APP}/" 2>/dev/null || true
+        cp "${APP_SOURCE_DIR}/${f}" $DIRECTORY/"${APP}/" 2>/dev/null || true
     done
 fi
 
-cd ~/"${APP}"
+cd $DIRECTORY/"${APP}"
 
 # --- RUN APPLICATION ---
 echo "🚀 Launching $APP with DSM=$THREADS"
@@ -209,35 +245,38 @@ sleep "$APP_WARMUP"
 t0=$(date +%s.%N)
 # --- CRIU DUMP ---
 echo "📦 Dumping with CRIU..."
-sudo ~/criu/criu/criu dump -t "$app_pid" --images-dir ~/"${APP}/images" \
+sudo $DIRECTORY/criu/criu/criu dump -t "$app_pid" --images-dir $DIRECTORY/"${APP}/images" \
      --shell-job -v || true
 
 # --- COPY METADATA ---
-cp /tmp/ranges.txt ~/"${APP}/images/" 2>/dev/null || true
-cp /tmp/dsm_barrier_pages.txt ~/"${APP}/images/" 2>/dev/null || true
-cp /tmp/dsm_mutex.txt ~/"${APP}/images/" 2>/dev/null || true
+cp /tmp/ranges.txt $DIRECTORY/"${APP}/images/" 2>/dev/null || true
+cp /tmp/dsm_barrier_pages.txt $DIRECTORY/"${APP}/images/" 2>/dev/null || true
+cp /tmp/dsm_mutex.txt $DIRECTORY/"${APP}/images/" 2>/dev/null || true
 
 # --- BACKUP ---
-cp -r ~/"${APP}/images" ~/"${APP}/backup"
+cp -r $DIRECTORY/"${APP}/images" $DIRECTORY/"${APP}/backup"
 #exit
 t1=$(date +%s.%N)
 dump_time=$(echo "$t1 - $t0" | bc -l)
 init_time=$(echo "$t0 - $t_init - $APP_WARMUP" | bc -l)
+
+fi
 ##############################################
 ### 2) SCP PHASE
 ##############################################
-echo "=== SCP ==="
-t2=$(date +%s.%N)
+if [[ "$DO_SCP" -eq 1 ]]; then
+    echo "=== SCP ==="
+    t2=$(date +%s.%N)
 
-for client in "${CLIENTS[@]}"; do
-    echo "[SCP] → $client"
-    ssh -o StrictHostKeyChecking=no "$client" "sudo rm -rf ~/${APP}"
-    scp -r ~/"${APP}" "$client":~/
-done
+    for client in "${CLIENTS[@]}"; do
+        echo "[SCP] → $client"
+        ssh -o StrictHostKeyChecking=no "$client" "sudo rm -rf $DIRECTORY/${APP}"
+        scp -r $DIRECTORY/"${APP}" "$client":$DIRECTORY/
+    done
 
-t3=$(date +%s.%N)
-scp_time=$(echo "$t3 - $t2" | bc -l)
-
+    t3=$(date +%s.%N)
+    scp_time=$(echo "$t3 - $t2" | bc -l)
+fi
 
 ##############################################
 ### 3) RESTORE CONFIGS LOOP
@@ -272,11 +311,8 @@ for cfg in "${CONFIGS[@]}"; do
         C_RANGE+=("${TOK[$((3 + i))]}")
     done
 
- 
-    #FLAGSERVER="--verbose"
     FLAGSERVER=""
     FLAGCLIENT=""
-    #FLAGCLIENT="--verbose"
     [[ "$MODE" == "rdma" ]] && FLAGSERVER="$FLAGSERVER --dsm-rdma-enable"
     [[ "$MODE" == "rdma" ]] && FLAGCLIENT="$FLAGCLIENT --rdma"
 
@@ -293,11 +329,11 @@ for cfg in "${CONFIGS[@]}"; do
     echo "[SERVER] Filtering images..."
     t3a=$(date +%s.%N)
 
-    sudo rm -rf ~/"$APP"/images/
-    cp -r ~/"$APP"/backup/ ~/"$APP"/images/
+    sudo rm -rf $DIRECTORY/"$APP"/images/
+    cp -r $DIRECTORY/"$APP"/backup/ $DIRECTORY/"$APP"/images/
 
-    cd ~/"$APP"/images
-    python3 "$THREAD_FILTER" "$MAIN_RANGE"
+    cd $DIRECTORY/"$APP"/images
+    "$PYTHON_FILE" "$THREAD_FILTER" "$MAIN_RANGE"
 
     t3b=$(date +%s.%N)
     filter_time=$(echo "$t3b - $t3a" | bc -l)
@@ -330,10 +366,13 @@ for cfg in "${CONFIGS[@]}"; do
     touch /tmp/.restore_flag
     touch /tmp/haltcode
     
-    RESTORE_CMD="sudo ~/criu/criu/criu restore --shell-job --dsm_server $N_CLIENTS"
+    RESTORE_CMD="sudo $DIRECTORY/criu/criu/criu restore --shell-job --dsm_server $N_CLIENTS"
     [[ "$MODE" == "rdma" ]] && RESTORE_CMD+=" --dsm-rdma-enable"
+    [[ "$SERVER_VERBOSE"  -eq 1 ]] && RESTORE_CMD+=" -v"
+    [[ "$CLIENT_VERBOSE"  -eq 1 ]] && FLAGCLIENT=" --verbose"
+
+
     echo "Restore command: $RESTORE_CMD"
-    #RESTORE_CMD+=" -v"
     t4=$(date +%s.%N)
     script -q -c "$RESTORE_CMD" /dev/null &
     RESTORE_PID=$!
@@ -342,21 +381,34 @@ for cfg in "${CONFIGS[@]}"; do
     ##############################################
     ### 3) LAUNCH CLIENT SIDE IF NEEDED
     ##############################################
+
+
     PIDS=()
     
-    if (( N_CLIENTS > 0 )); then
+    
+    if [[ "$DO_RESTORE_CLIENTS" -eq 1 ]] && (( N_CLIENTS > 0 )); then
         for (( cid=0; cid<N_CLIENTS; cid++ )); do
             CLIENT_HOST="${CLIENTS[$cid]}"
-            echo "[CLIENT-$cid] Starting restore on $CLIENT_HOST..., $FLAGCLIENT"
-        
-            ssh -tt "$CLIENT_HOST" "
-                cd ~/criu/dsm/scripts || exit 1
-                source ~/venv-criu/bin/activate || true
-                taskset -c $CPU_LIST ./restorer.sh $APP ${C_RANGE[$cid]} $FLAGCLIENT
-            " &
+            echo "[CLIENT-$cid] Starting restore on $CLIENT_HOST, ${C_RANGE[$cid]}, $FLAGCLIENT"
 
+            if [[ "$CLIENT_OUTPUT_FILE" -eq 1 ]]; then
+                ssh "$CLIENT_HOST" "
+                    cd $DIRECTORY/criu/dsm/scripts || exit 1
+                    source $DIRECTORY/venv-criu/bin/activate || true
+                    taskset -c $CPU_LIST sudo ./restorer.sh $APP ${C_RANGE[$cid]} $FLAGCLIENT
+                " 2>&1 | tr -d '\r' > /tmp/client_${cid}_${CONF_NAME}.log &
+            else
+                ssh "$CLIENT_HOST" "
+                    cd $DIRECTORY/criu/dsm/scripts || exit 1
+                    source $DIRECTORY/venv-criu/bin/activate || true
+                    taskset -c $CPU_LIST sudo ./restorer.sh $APP ${C_RANGE[$cid]} $FLAGCLIENT
+                " 2>&1 | tr -d '\r' &
+            fi
             PIDS+=($!)
+
         done
+    else
+        echo "=== [SKIP] RESTORE_CLIENTS ==="
     fi
 
 

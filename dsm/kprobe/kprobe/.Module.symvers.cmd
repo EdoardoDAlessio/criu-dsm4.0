@@ -1,0 +1,1 @@
+cmd_/proj/popcornlinux-PG0/edo/kprobe/Module.symvers := sed 's/\.ko$$/\.o/' /proj/popcornlinux-PG0/edo/kprobe/modules.order | scripts/mod/modpost -m -a  -o /proj/popcornlinux-PG0/edo/kprobe/Module.symvers -e -i Module.symvers   -T -

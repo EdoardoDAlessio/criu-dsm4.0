@@ -1,0 +1,1 @@
+savedcmd_/home/vagrant/kprobe/pmadvise_swap_kprobe.mod := printf '%s\n'   pmadvise_swap_kprobe.o | awk '!x[$$0]++ { print("/home/vagrant/kprobe/"$$0) }' > /home/vagrant/kprobe/pmadvise_swap_kprobe.mod

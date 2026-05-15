@@ -1,0 +1,1 @@
+cmd_/proj/popcornlinux-PG0/edo/kprobe/pmadvise_swap_kprobe.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /proj/popcornlinux-PG0/edo/kprobe/pmadvise_swap_kprobe.ko /proj/popcornlinux-PG0/edo/kprobe/pmadvise_swap_kprobe.o /proj/popcornlinux-PG0/edo/kprobe/pmadvise_swap_kprobe.mod.o;  true

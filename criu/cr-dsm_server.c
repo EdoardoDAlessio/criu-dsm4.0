@@ -1245,8 +1245,12 @@ void dsm_command_main_loop_RDMA(command_thread_args *a){
 					//AND invalidate the page
 					page_list_data[msg.msg_id].owner_mask &= ~(1ULL << 0);  //removing server as owner
 					PRINT("Message is GET_PAGE_INVALIDATE → SERVER Drops the page to INVALIDATE\n\r");
-					if (run_proc_MADVISE(pidfd, restored_pid, (void*)msg.page_addr, PAGE_SIZE) == 0)
+					if (run_proc_MADVISE(pidfd, restored_pid, (void*)msg.page_addr, PAGE_SIZE) == 0){
 						PRINT("process_madvise to invalidate page %p\n\r", (void*)msg.page_addr);
+						PRINT("Re-REGISTERING IT for future faults\n");
+						register_page(uffd, (void*)msg.page_addr);
+						PRINT("Re-REGISTERING success\n");
+					}
 					else{
 						PRINT("❌ MADV_DONTNEED failed: %s\n\r", strerror(errno));
 						kill_and_exit(restored_pid);
@@ -1775,9 +1779,8 @@ void dsm_command_main_loop_RDMA(command_thread_args *a){
 					if (page_list_data[msg.msg_id].owner_mask & (1ULL << 0)) {
 						DSM_EVENT_SERVER("→ Receiver:%d, Handling TCP invalidation request on server. Madvise(MADV_DONTNEED) on page at %p\n\r", client_id,  (void *)msg.page_addr);
 						//pthread_mutex_lock(&pagefaults_mutex);
-						if (run_proc_MADVISE(pidfd, restored_pid, (void *)msg.page_addr, 4096) == 0) {
+						if (runMADVISE( restored_pid, (void *)msg.page_addr, 4096) == 0) {
 							DSM_EVENT_SERVER("Successfully ran madvise on page at %p\n\r", (void *)msg.page_addr);
-
 							ack = MSG_INVALIDATE_ACK;
 							if (send_all(fd_command, &ack, 1) != 0) {
 								perror("send MSG_INVALIDATE_ACK");
@@ -1892,6 +1895,9 @@ void start_dsm_server(int n_clients, int rdma_enable)
 	(void) custom_fd_local; //avoiding unused variable warning WERROR
 	(void) bin; //avoiding unused variable warning WERROR
 	(void) i;
+	(void) args;
+	(void) command_threads;
+	(void) attr;
 
 #if 1
 	remote_threads_barrier_arrived = 0;
@@ -2308,7 +2314,7 @@ void start_dsm_server(int n_clients, int rdma_enable)
 	
 
 
-#if 1
+#if !COMMAND_LOOP
 
 	if( n_clients == 0 ){
 		PRINT("[DSM Server] No clients connected. Running in single-node mode.\n\r");

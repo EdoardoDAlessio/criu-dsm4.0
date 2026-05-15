@@ -1647,11 +1647,12 @@ kill_and_exit(restored_pid);
 	if( rdma_on )   dsm_client_main_loop_RDMA(conn.fd_command);
 	else
 	#endif
-    	dsm_client_main_loop(conn.fd_command);
+    dsm_client_main_loop(conn.fd_command);
 
-#elif COMMAND_LOOP
-	PRINT("[DSM Client] Connections established. Entering command loop\n\r");
-	command_loop(restored_pid, uffd, &conn);
+	#if COMMAND_LOOP
+		PRINT("[DSM Client] Connections established. Entering command loop\n\r");
+		command_loop(restored_pid, uffd, &conn);
+	#endif
 #elif 0
 	PRINT("[DSM Client] Connection established. Entering main loop...\n\r");
     dsm_client_main_loop(conn.fd_command);

@@ -743,7 +743,6 @@ int register_region_with_uffd(int uffd, void *addr, size_t length) {
     reg.range.start = (unsigned long)addr;
     reg.range.len = length;
     reg.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
-    //reg.mode = UFFDIO_REGISTER_MODE_WP;
     
     if (ioctl(uffd, UFFDIO_REGISTER, &reg) == -1) {
         PRINT("Failing to register %p \n", addr);
@@ -2429,7 +2428,9 @@ int run_proc_MADVISE(int pidfd, int restored_pid, void *addr, size_t len) {
     PRINT("✅ process_madvise succeeded (ret=%ld)\n", ret);
     return 0;
 }
+#endif
 
+#if 1
 int runMADVISE(int restored_pid, void *addr, size_t len) {
     int pidfd;
     struct iovec iov;

@@ -1,10 +1,15 @@
 #!/bin/bash
 
+
 if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
   echo "Usage: $0 <app name> <thread range e.g. 1-6> [--verbose] [--rdma]"
   exit 1
 fi
-
+SERVER_IP="192.168.56.10"
+DIRECTORY="/home/vagrant"
+SCRIPTS="$DIRECTORY/criu/dsm/scripts"
+THREAD_FILTER="$SCRIPTS/thread_filter_ranged.py"
+PYTHON_FILE="$DIRECTORY/venv-criu/bin/python3"
 app=$1
 range=$2
 first=$(echo "$range" | cut -d'-' -f1)
@@ -25,7 +30,7 @@ done
 
 sudo pkill -9 -f "criu"
 
-cd ~/${app}
+cd $DIRECTORY/${app}
 readelf -s ./$app | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > /tmp/readelf.txt
 
 
@@ -33,7 +38,7 @@ readelf -s ./$app | awk '$4 == "OBJECT" && $5 == "GLOBAL" && $6 == "DEFAULT"' > 
 sudo rm -r images
 cp -r backup images
 
-cd ~/${app}/images || { echo "Image directory not found"; exit 1; }
+cd $DIRECTORY/${app}/images || { echo "Image directory not found"; exit 1; }
 sudo rm -f /tmp/ranges.txt
 sudo rm -f /tmp/dsm_barrier_pages.txt
 sudo rm -f /tmp/dsm_mutex.txt
@@ -42,9 +47,9 @@ cp dsm_barrier_pages.txt /tmp/dsm_barrier_pages.txt > /dev/null 2>&1 || true
 cp dsm_mutex.txt  /tmp/dsm_mutex.txt > /dev/null 2>&1 || true
 # Apply thread filtering
 if [ "$verbose_flag" == "-v" ]; then
-  python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" 
+  "$PYTHON_FILE" $DIRECTORY/criu/dsm/scripts/thread_filter_ranged.py "$range" 
 else
-  python3 ~/criu/dsm/scripts/thread_filter_ranged.py "$range" > /dev/null 2>&1
+  "$PYTHON_FILE" $DIRECTORY/criu/dsm/scripts/thread_filter_ranged.py "$range" > /dev/null 2>&1
 fi
 
 
@@ -67,6 +72,6 @@ if [ -n "$defunct_pid" ]; then
   sudo kill -9 $(ps -o ppid= -p "$defunct_pid" 2>/dev/null) 2>/dev/null || true
 fi
 
-
-sudo ~/criu/criu/criu restore --shell-job --dsm_client 128.110.219.21 $verbose_flag $rdma_flag
+sudo script -q -c "$DIRECTORY/criu/criu/criu restore --shell-job --dsm_client $SERVER_IP $verbose_flag $rdma_flag" /dev/null
+#sudo $DIRECTORY/criu/criu/criu restore --shell-job --dsm_client $SERVER_IP $verbose_flag $rdma_flag
 rm -f /tmp/.restore_flag 

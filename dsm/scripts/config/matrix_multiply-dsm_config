@@ -1,7 +1,13 @@
 ########## PATHS ##########
+########## SCRIPT PATHS ##########
+DIRECTORY="/home/vagrant"
+SCRIPTS="$DIRECTORY/criu/dsm/scripts"
+THREAD_FILTER="$SCRIPTS/thread_filter_ranged.py"
+PYTHON_FILE="$DIRECTORY/venv-criu/bin/python3"
+
 
 # Location of the source benchmark
-APP_SOURCE_DIR="$HOME/phoenix/phoenix-2.0/tests/matrix_multiply"
+APP_SOURCE_DIR="$DIRECTORY/phoenix/phoenix-2.0/tests/matrix_multiply"
 
 # Executable (must exist inside APP_SOURCE_DIR)
 APP_EXEC="matrix_multiply-dsm"
@@ -9,27 +15,30 @@ APP_EXEC="matrix_multiply-dsm"
 ########## RUN PARAMS ##########
 
 # Arguments passed to the binary
-APP_ARGS="6000"
+APP_ARGS="4000"
 
 ########## EXTRA FILES REQUIRED ##########
 APP_EXTRA_FILES=(
-    "matrix_file_A.txt"
-    "matrix_file_B.txt"
+    "matrix_file_A_$APP_ARGS.txt"
+    "matrix_file_B_$APP_ARGS.txt"
 )
 
 # Warm up time before CRIU dump
 APP_WARMUP=5
 
 ########## CLIENT MACHINES ##########
-CLIENTS=("dsm_client" "dsm_client2" "dsm_client3")
+CLIENTS=("vagrant@node2")
 
 # Number of threads for DSM (main thread count)
-APP_THREADS=64
+APP_THREADS=16
 
 ########## RESTORE / SPLIT CONFIGS ##########
 
-    
 CONFIGS=(
+    "vagrant_local 1 0-7 8-15  tcp"
+)
+
+CONFIGSS=(
     "22+21+21  2 0-21  22-42 43-63      tcp"
     "22+21+21 2 0-21  22-42 43-63      rdma"
     "16+16+16+16  3 0-15 16-31 32-47 48-63   tcp"
@@ -43,8 +52,3 @@ CONFIGS=(
     "32+16+16 2 0-31  32-47 48-63      rdma"
 )
 
-
-
-########## SCRIPT PATHS ##########
-SCRIPTS="$HOME/criu/dsm/scripts"
-THREAD_FILTER="$SCRIPTS/thread_filter_ranged.py"
